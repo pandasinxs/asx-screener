@@ -31,7 +31,9 @@ jobs:
         run: |
           git config user.name "ASX Bot"
           git config user.email "bot@asx.bot"
+          git stash
           git pull --rebase origin main
+          git stash pop
           git add watchlist.json alerted.json
           git diff --cached --quiet || git commit -m "Watchlist $(date +%Y-%m-%d)"
           git push
