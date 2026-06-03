@@ -1,0 +1,37 @@
+name: First Pullback Morning Scanner
+
+on:
+  schedule:
+    - cron: '30 0 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install yfinance requests pandas openpyxl
+
+      - name: Run morning scanner
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python morning_scanner.py
+
+      - name: Save watchlist to repo
+        run: |
+          git config user.name "ASX Bot"
+          git config user.email "bot@asx.bot"
+          git pull --rebase origin main
+          git add watchlist.json alerted.json
+          git diff --cached --quiet || git commit -m "Watchlist $(date +%Y-%m-%d)"
+          git push
