@@ -1,30 +1,23 @@
 # ============================================================
-# ASX SWING TRADE SCREENER v7
-# 批量下载（速度快10倍）+ 8级分级筛选
+# ASX SWING TRADE SCREENER v8
+# 新增：EOD信号带公告检查 + Gemini简要分析
+# 批量下载 + 8级分级筛选
 # ============================================================
-
-# Cell 1 (Colab only): !pip install yfinance requests -q
 
 import os, time
 import yfinance as yf
 import pandas as pd
 import requests
-from datetime import datetime
+from datetime import datetime, date
+from google import genai
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "你的TOKEN")
 CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID", "7553937057")
+GEMINI_KEY     = os.environ.get("GEMINI_API_KEY", "")
+
+gemini_client  = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
 # ── 8个筛选等级 ───────────────────────────────────────────────
-# vol_mult      : 成交量须达均量的倍数
-# close_pos     : 收盘位置须在当日波幅的比例以上（过滤长上影线）
-# obv_pct       : OBV须达近30日高点的比例
-# rsi_lo/hi     : RSI范围
-# consol        : 近15日整理幅度上限
-# vol_decline   : 是否要求整理期间量能萎缩
-# near_breakout : 是否要求接近20日最高点
-# use_obv       : 是否启用OBV条件
-# use_mfi       : 是否启用MFI条件
-
 TIERS = [
     {"level":"T1","label":"🔴 精英",
      "vol_mult":2.0,"close_pos":0.90,"obv_pct":0.95,
@@ -68,16 +61,55 @@ TIERS = [
      "note":"最低门槛：仅需在均线上方且有基本成交量"},
 ]
 
-# ── 获取ASX全部股票代码 ───────────────────────────────────────
+# ── 工具函数 ──────────────────────────────────────────────────
+def ask_gemini(prompt: str) -> str:
+    if not gemini_client:
+        return ""
+    try:
+        r = gemini_client.models.generate_content(
+            model='gemini-2.0-flash-lite',
+            contents=prompt
+        )
+        return r.text.strip()
+    except:
+        return ""
+
+def get_today_announcement(code: str):
+    """检查是否有今日ASX公告，返回(title, is_sensitive)"""
+    today = date.today().strftime('%Y-%m-%d')
+    url = (f"https://www.asx.com.au/asx/1/company/{code}"
+           f"/announcements?count=5&market_sensitive=false")
+    try:
+        r = requests.get(url, timeout=6,
+                         headers={'User-Agent': 'Mozilla/5.0'})
+        for ann in r.json().get('data', []):
+            if str(ann.get('document_release_date', ''))[:10] == today:
+                return ann.get('header', '')[:70], ann.get('market_sensitive', False)
+        return None, False
+    except:
+        return None, False
+
+def analyze_eod_signal(s: dict, ann_title: str) -> str:
+    """为EOD信号生成Gemini简要分析"""
+    prompt = f"""你是一位严谨的ASX股票分析师。
+
+EOD波段信号：{s['ticker']}
+昨收：${s['price']}  RSI：{s['rsi']}  MFI：{s['mfi']}
+成交量：{s['vol_ratio']}x均量  收盘位置：{s['close_pos']}%
+今日公告：{ann_title or '无'}
+
+请用1-2句中文分析这个技术形态的有效性和主要风险。
+要求：只陈述可判断的内容，不确定的直接说"需进一步核查"。"""
+    return ask_gemini(prompt)
+
 def get_asx_universe():
     url = "https://www.asx.com.au/asx/research/ASXListedCompanies.csv"
     try:
         df = pd.read_csv(url, skiprows=1, encoding='latin1')
-        code_col = next((c for c in df.columns if 'code' in c.lower()), None)
-        if not code_col:
-            return []
-        codes  = df[code_col].dropna().astype(str).str.strip()
-        valid  = codes[codes.str.match(r'^[A-Z]{1,5}$')]
+        col = next((c for c in df.columns if 'code' in c.lower()), None)
+        if not col: return []
+        codes = df[col].dropna().astype(str).str.strip()
+        valid = codes[codes.str.match(r'^[A-Z]{1,5}$')]
         tickers = [f"{c}.AX" for c in valid]
         print(f"ASX股票池：{len(tickers)} 只")
         return tickers
@@ -85,19 +117,14 @@ def get_asx_universe():
         print(f"获取列表失败: {e}")
         return []
 
-# ── 批量下载（核心加速）────────────────────────────────────────
 def batch_download_all(tickers, batch_size=50):
-    """一次下载50只，比逐只快10倍，并规避限速"""
-    all_data    = {}
-    n_batches   = (len(tickers) + batch_size - 1) // batch_size
-
+    all_data  = {}
+    n_batches = (len(tickers) + batch_size - 1) // batch_size
     for i in range(0, len(tickers), batch_size):
-        batch     = tickers[i : i + batch_size]
+        batch     = tickers[i:i+batch_size]
         batch_num = i // batch_size + 1
-
         if batch_num % 5 == 0 or batch_num == 1:
             print(f"  下载 {batch_num}/{n_batches} 批...")
-
         try:
             if len(batch) == 1:
                 df = yf.download(batch[0], period="6mo",
@@ -112,25 +139,19 @@ def batch_download_all(tickers, batch_size=50):
                         tdf = raw[t].dropna(how='all')
                         if not tdf.empty and len(tdf) >= 60:
                             all_data[t] = tdf
-                    except:
-                        pass
+                    except: pass
         except:
-            # 批量失败时逐只重试
             for t in batch:
                 try:
                     df = yf.download(t, period="6mo", interval="1d",
                                      progress=False)
                     if not df.empty and len(df) >= 60:
                         all_data[t] = df
-                except:
-                    pass
-
-        time.sleep(0.5)   # 每批间隔0.5秒，避免触发限速
-
+                except: pass
+        time.sleep(0.5)
     print(f"  下载完成：{len(all_data)}/{len(tickers)} 只有效数据")
     return all_data
 
-# ── 指标计算 ──────────────────────────────────────────────────
 def calc_rsi(series, period=14):
     delta = series.diff()
     gain  = delta.clip(lower=0).rolling(period).mean()
@@ -149,7 +170,6 @@ def calc_mfi(high, low, close, volume, period=14):
     neg    = raw_mf.where(tp < tp.shift(1), 0).rolling(period).sum()
     return 100 - (100 / (1 + pos / neg.replace(0, 1e-10)))
 
-# ── 大盘状态 ──────────────────────────────────────────────────
 def check_market_status():
     try:
         xjo   = yf.download("^AXJO", period="3mo", interval="1d",
@@ -167,94 +187,60 @@ def check_market_status():
     except:
         return "green"
 
-# ── 单股分析（使用预下载数据）────────────────────────────────
 def analyze_stock(ticker, df, tier):
     try:
         close  = df['Close'].squeeze()
         high   = df['High'].squeeze()
         low    = df['Low'].squeeze()
         volume = df['Volume'].squeeze()
-
-        if len(close) < 60:
-            return None
-
+        if len(close) < 60: return None
         lc   = float(close.iloc[-1])
         lh   = float(high.iloc[-1])
         ll   = float(low.iloc[-1])
         lvol = float(volume.iloc[-1])
-
-        # 流动性（固定门槛，不随tier放宽）
         avg_vol_20 = float(volume.iloc[-20:].mean())
-        if avg_vol_20 * lc < 300_000:
-            return None
-
-        # 技术指标
+        if avg_vol_20 * lc < 300_000: return None
         ma50     = close.rolling(50).mean()
         vol_ma20 = volume.rolling(20).mean()
         rsi      = calc_rsi(close)
         obv      = calc_obv(close, volume)
         mfi      = calc_mfi(high, low, close, volume)
-
         lm50       = float(ma50.iloc[-1])
         lm50_prev  = float(ma50.iloc[-11])
         lvm20      = float(vol_ma20.iloc[-1])
         lrsi       = float(rsi.iloc[-1])
         lobv       = float(obv.iloc[-1])
         lmfi       = float(mfi.iloc[-1])
-
-        # ── 固定条件（所有tier均需满足）──────────────────────
-        if lc < lm50:          return None   # 在50日均线以上
-        if lm50 <= lm50_prev:  return None   # 均线向上
-
-        # ── tier控制的条件 ────────────────────────────────────
-
-        # 整理幅度
-        r15  = df.iloc[-15:]
-        pr   = (float(r15['High'].max()) - float(r15['Low'].min())) / lc
-        if pr > tier["consol"]:  return None
-
-        # 量能萎缩（可选）
+        if lc < lm50:         return None
+        if lm50 <= lm50_prev: return None
+        r15 = df.iloc[-15:]
+        pr  = (float(r15['High'].max()) - float(r15['Low'].min())) / lc
+        if pr > tier["consol"]: return None
         if tier["vol_decline"]:
             if float(volume.iloc[-10:].mean()) >= float(volume.iloc[-30:-10].mean()):
                 return None
-
-        # 接近20日高点（可选）
         if tier["near_breakout"]:
             high_20 = float(high.iloc[-20:].max())
-            if lc < high_20 * 0.97:  return None
-
-        # 成交量倍数
-        if lvol < lvm20 * tier["vol_mult"]:  return None
-
-        # 收盘位置
+            if lc < high_20 * 0.97: return None
+        if lvol < lvm20 * tier["vol_mult"]: return None
         day_range = lh - ll
         if day_range > 0:
             close_pos = (lc - ll) / day_range
-            if close_pos < tier["close_pos"]:  return None
+            if close_pos < tier["close_pos"]: return None
         else:
             close_pos = 0.5
-
-        # RSI
-        if not (tier["rsi_lo"] <= lrsi <= tier["rsi_hi"]):  return None
-
-        # OBV（可选）
+        if not (tier["rsi_lo"] <= lrsi <= tier["rsi_hi"]): return None
         if tier["use_obv"]:
             obv_high = float(obv.iloc[-30:].max())
-            if lobv < obv_high * tier["obv_pct"]:  return None
-
-        # MFI（可选）
+            if lobv < obv_high * tier["obv_pct"]: return None
         if tier["use_mfi"]:
-            if not (40 <= lmfi <= 70):  return None
-
-        # 市值下限（通过技术条件后才查，节省API）
+            if not (40 <= lmfi <= 70): return None
         try:
             info = yf.Ticker(ticker).info
-            if info.get('marketCap', 0) < 50_000_000:
-                return None
+            if info.get('marketCap', 0) < 50_000_000: return None
             market_cap_m = round(info.get('marketCap', 0) / 1_000_000)
         except:
             market_cap_m = 0
-
         return {
             'ticker'      : ticker,
             'price'       : round(lc, 3),
@@ -270,7 +256,6 @@ def analyze_stock(ticker, df, tier):
     except:
         return None
 
-# ── Telegram ─────────────────────────────────────────────────
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -279,15 +264,11 @@ def send_telegram(msg):
     except Exception as e:
         print(f"Telegram失败: {e}")
 
-# ── 主程序 ───────────────────────────────────────────────────
 def run_screener():
-    today = datetime.now().strftime('%Y-%m-%d')
-    start = time.time()
-
-    # 大盘检查
+    today   = datetime.now().strftime('%Y-%m-%d')
+    start   = time.time()
     market_status = check_market_status()
     print(f"大盘状态: {market_status.upper()}")
-
     if market_status == "red":
         send_telegram(
             f"🔴 <b>大盘警告 {today}</b>\n\n"
@@ -295,61 +276,41 @@ def run_screener():
             "今日<b>不建议开新仓</b>，收紧止损至5%。"
         )
         return
-
     market_label = "⚠️ " if market_status == "yellow" else ""
     market_note  = (
         "\n\n⚠️ <b>大盘提示</b>：ASX200轻微跌破50日均线，建议适当缩减仓位。"
     ) if market_status == "yellow" else ""
-
-    # 获取股票池
     universe = get_asx_universe()
-    if not universe:
-        return
-
-    # 批量下载所有数据（核心加速）
+    if not universe: return
     print(f"\n[{today}] 开始批量下载 {len(universe)} 只股票数据...")
     all_data = batch_download_all(universe)
     print(f"下载耗时：{round(time.time()-start)}秒")
-
-    # 分级筛选
     print("\n开始分级筛选...")
     found_tier = None
     signals    = []
-
     for tier in TIERS:
         print(f"  {tier['level']} ({tier['label']})...", end=" ")
         tier_signals = []
-
         for ticker, df in all_data.items():
             result = analyze_stock(ticker, df, tier)
             if result:
                 tier_signals.append(result)
-
         print(f"{len(tier_signals)} 个信号")
-
         if tier_signals:
             found_tier = tier
             signals    = tier_signals
             break
-
-    # 结果处理
     elapsed = round((time.time() - start) / 60, 1)
-
     if not signals:
         send_telegram(
             f"📊 <b>{market_label}ASX扫描完成 {today}</b>\n\n"
-            f"扫描：{len(all_data)} 只\n"
-            f"T1–T8 全部无信号\n"
+            f"扫描：{len(all_data)} 只\nT1–T8 全部无信号\n"
             f"市场整体处于下行趋势，建议观望。\n"
             f"耗时：{elapsed}分钟{market_note}"
         )
-        print(f"\n全部无信号。耗时{elapsed}分钟")
         return
-
-    # 按成交量比例排序，最多发20个信号
     signals.sort(key=lambda x: x['vol_ratio'], reverse=True)
     signals = signals[:20]
-
     tier_label = found_tier["label"]
     tier_level = found_tier["level"]
     tier_note  = found_tier["note"]
@@ -365,9 +326,25 @@ def run_screener():
         + market_note
     )
 
-    # 逐一发详情（T6-T8只发汇总，不发详情，避免刷屏）
+    # T1-T6 发详情（T7/T8只发汇总）
     if tier_level not in ("T7", "T8"):
         for s in signals:
+            code = s['ticker'].replace('.AX', '')
+
+            # 检查今日公告
+            ann_title, is_sensitive = get_today_announcement(code)
+            ann_line = ""
+            if ann_title:
+                flag = "⭐ 市场敏感公告" if is_sensitive else "📋 今日公告"
+                ann_line = f"\n{flag}：{ann_title}"
+
+            # Gemini分析（T1-T4才调用，避免T5/T6过多调用）
+            ai_line = ""
+            if tier_level in ("T1","T2","T3","T4") and gemini_client:
+                analysis = analyze_eod_signal(s, ann_title)
+                if analysis:
+                    ai_line = f"\n🤖 {analysis}"
+
             msg = (
                 f"{tier_label} <b>策略信号 — {s['ticker']}</b>\n"
                 f"📅 {today}\n\n"
@@ -380,20 +357,18 @@ def run_screener():
                 f"  • MFI：{s['mfi']}\n"
                 f"  • 成交量：均量的 {s['vol_ratio']}×\n"
                 f"  • 收盘位置：{s['close_pos']}%\n"
-                f"  • 市值：${s['market_cap_m']}M AUD\n\n"
+                f"  • 市值：${s['market_cap_m']}M AUD"
+                f"{ann_line}{ai_line}\n\n"
                 f"⚠️ 核对图表再决定入场\n"
                 f"📌 确认本周无重大公告{market_note}"
             )
             send_telegram(msg)
-            time.sleep(0.3)
+            time.sleep(0.5)
     else:
         send_telegram(
             f"{tier_label} <b>{tier_level} 等级说明</b>\n\n"
-            f"当前为最宽松筛选，以上股票仅满足基本趋势条件。\n"
-            f"建议：\n"
-            f"• 自行查看图表确认形态\n"
-            f"• 等待更明确的入场信号\n"
-            f"• 降低仓位，严格止损"
+            "当前为最宽松筛选，以上股票仅满足基本趋势条件。\n"
+            "建议：自行查看图表，等待更明确信号，严格止损。"
         )
 
     print(f"\n完成：{tier_level} 级，{len(signals)} 个信号，耗时{elapsed}分钟")
