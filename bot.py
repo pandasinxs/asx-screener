@@ -150,7 +150,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/logs      — 查看最近日志\n\n"
         "💬 直接用中文问我，例：\n"
         "   \"BHP最近有什么公告？\"\n"
-        "   "今天first pullback有什么值得关注的?""
+        "   \"今天first pullback有什么值得关注的？\"\n"
     )
 
 async def run_script(update, script, label):
