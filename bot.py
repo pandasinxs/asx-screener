@@ -141,16 +141,18 @@ def format_stock_info(code: str, anns: list, news: list, price: dict) -> str:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
     await update.message.reply_text(
-        "👋 ASX交易助手已就绪\n\n"
-        "📌 命令：\n"
-        "/morning   — 立刻运行早盘扫描\n"
-        "/eod       — 立刻运行EOD扫描\n"
-        "/news BHP  — 查看公告、新闻和AI分析\n"
-        "/status    — 查看系统状态\n"
-        "/logs      — 查看最近日志\n\n"
-        "💬 直接用中文问我，例：\n"
-        "   \"BHP最近有什么公告？\"\n"
-        "   \"今天first pullback有什么值得关注的？\"\n"
+        """👋 ASX交易助手已就绪
+
+           📌 命令：
+              /morning   — 立刻运行早盘扫描
+              /eod       — 立刻运行EOD扫描
+              /news BHP  — 查看公告、新闻和AI分析
+              /status    — 查看系统状态
+              /logs      — 查看最近日志
+
+           💬 直接用中文问我，例：
+              "BHP最近有什么公告？"
+              "今天first pullback有什么值得关注的?" """
     )
 
 async def run_script(update, script, label):
