@@ -1,7 +1,7 @@
 # ============================================================
-# FIRST PULLBACK — MORNING SCANNER v2
-# 新增：每个候选股的Gemini AI简要分析
-# 每日 10:30am AEST (00:30 UTC) 运行
+# FIRST PULLBACK — MORNING SCANNER v3
+# 新API：asx.api.markitdigital.com（一次拉取今日全部公告）
+# 修复：yfinance新闻字段 content.title
 # ============================================================
 
 import os, json, time
@@ -11,13 +11,77 @@ import requests
 from datetime import datetime, date
 from google import genai
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "你的TOKEN")
-CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID", "7553937057")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID", "")
 GEMINI_KEY     = os.environ.get("GEMINI_API_KEY", "")
 WATCHLIST_FILE = "watchlist.json"
 ALERTED_FILE   = "alerted.json"
 
 gemini_client  = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
+
+ASX_ANN_URL = "https://asx.api.markitdigital.com/asx-research/1.0/markets/announcements"
+ASX_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
+    'Accept': 'application/json',
+    'Referer': 'https://www.asx.com.au'
+}
+
+# ── 今日公告（一次性批量拉取）────────────────────────────────
+def get_today_announcements() -> dict:
+    """返回 {symbol: {'headline': str, 'sensitive': bool}}"""
+    today  = date.today().isoformat()
+    result = {}
+    page   = 0
+    while True:
+        try:
+            r = requests.get(ASX_ANN_URL,
+                             params={'itemsPerPage': 100, 'page': page},
+                             headers=ASX_HEADERS, timeout=10)
+            items = r.json().get('data', {}).get('items', [])
+            if not items:
+                break
+            got_old = False
+            for item in items:
+                if item.get('date', '')[:10] < today:
+                    got_old = True
+                    break
+                sym = item.get('symbol', '')
+                if sym and sym not in result:
+                    result[sym] = {
+                        'headline' : item.get('headline', '')[:70],
+                        'sensitive': item.get('isPriceSensitive', False)
+                    }
+            if got_old or len(items) < 100:
+                break
+            page += 1
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"公告API错误: {e}")
+            break
+    print(f"今日公告：{len(result)} 只股票有公告")
+    return result
+
+# ── yfinance新闻（修复content.title）────────────────────────
+def get_yf_news(code: str) -> list:
+    try:
+        stock = yf.Ticker(f"{code}.AX")
+        today = date.today().isoformat()
+        results = []
+        for n in (stock.news or [])[:8]:
+            content = n.get('content', {})
+            title   = content.get('title', '')
+            pub     = content.get('pubDate', '')[:10]
+            if title:
+                results.append({
+                    'title'  : title,
+                    'date'   : pub,
+                    'today'  : pub == today,
+                    'source' : content.get('provider', {}).get('displayName', '')
+                })
+        results.sort(key=lambda x: x['today'], reverse=True)
+        return results
+    except:
+        return []
 
 # ── Gemini分析 ────────────────────────────────────────────────
 def ask_gemini(prompt: str) -> str:
@@ -25,39 +89,34 @@ def ask_gemini(prompt: str) -> str:
         return ""
     try:
         r = gemini_client.models.generate_content(
-            model='gemini-2.0-flash-lite',
-            contents=prompt
-        )
+            model='gemini-2.0-flash-lite', contents=prompt)
         return r.text.strip()
     except:
         return ""
 
-def analyze_candidate(c: dict) -> str:
-    """为候选股生成简短AI分析"""
+def analyze_candidate(c: dict, ann_info: dict) -> str:
+    headline = ann_info.get('headline', '未确认') if ann_info else '未确认'
     prompt = f"""你是一位严谨的ASX股票分析师。
 
 候选股：{c['ticker']}
 今日涨幅：+{c['change_pct']}%
 成交量：{c['vol_ratio']}x日均量
-今日公告：{c.get('ann_title') or '未确认'}
-当前价格：${c['price']}
-今日最高：${c['today_high']}
-VWAP：${c['vwap']}
+公告标题：{headline}
+现价：${c['price']}  今日最高：${c['today_high']}  VWAP：${c['vwap']}
 
-请用1-2句中文简要说明：
-1. 这个公告对股价的驱动逻辑是否成立
+请用1-2句中文分析：
+1. 公告催化逻辑是否成立
 2. 主要风险点
-
-要求：只陈述可判断的内容，不确定的直接说"需进一步核查"。"""
+只陈述可判断的内容，不确定的直接说"需进一步核查"。"""
     return ask_gemini(prompt)
 
-# ── 获取ASX股票池 ─────────────────────────────────────────────
+# ── ASX股票池 ─────────────────────────────────────────────────
 def get_asx_universe():
-    url = "https://www.asx.com.au/asx/research/ASXListedCompanies.csv"
     try:
-        df = pd.read_csv(url, skiprows=1, encoding='latin1')
+        df = pd.read_csv(
+            "https://www.asx.com.au/asx/research/ASXListedCompanies.csv",
+            skiprows=1, encoding='latin1')
         col = next((c for c in df.columns if 'code' in c.lower()), None)
-        if not col: return []
         codes = df[col].dropna().astype(str).str.strip()
         valid = codes[codes.str.match(r'^[A-Z]{1,5}$')]
         return [f"{c}.AX" for c in valid]
@@ -65,7 +124,7 @@ def get_asx_universe():
         print(f"获取列表失败: {e}")
         return []
 
-# ── 批量下载日线数据 ──────────────────────────────────────────
+# ── 批量下载 ──────────────────────────────────────────────────
 def batch_daily(tickers, batch_size=100):
     all_data = {}
     for i in range(0, len(tickers), batch_size):
@@ -88,14 +147,14 @@ def batch_daily(tickers, batch_size=100):
         time.sleep(0.5)
     return all_data
 
-# ── 批量下载盘中5分钟数据 ─────────────────────────────────────
 def batch_intraday(tickers, batch_size=50):
     all_data = {}
     n = (len(tickers) + batch_size - 1) // batch_size
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i+batch_size]
         bn = i // batch_size + 1
-        if bn % 5 == 1: print(f"  盘中数据 {bn}/{n}批...")
+        if bn % 5 == 1:
+            print(f"  盘中数据 {bn}/{n}批...")
         try:
             if len(batch) == 1:
                 df = yf.download(batch[0], period="1d", interval="5m", progress=False)
@@ -112,26 +171,6 @@ def batch_intraday(tickers, batch_size=50):
         time.sleep(0.5)
     return all_data
 
-# ── 检查ASX公告 ───────────────────────────────────────────────
-def check_announcement(code):
-    today = date.today().strftime('%Y-%m-%d')
-    url = (f"https://www.asx.com.au/asx/1/company/{code}"
-           f"/announcements?count=10&market_sensitive=false")
-    try:
-        r = requests.get(url, timeout=8,
-                         headers={'User-Agent': 'Mozilla/5.0'})
-        if r.status_code != 200:
-            return None, None
-        for ann in r.json().get('data', []):
-            if str(ann.get('document_release_date', ''))[:10] == today:
-                sensitive = ann.get('market_sensitive', False)
-                title = ann.get('header', '')[:70]
-                return True, f"{'⭐ 市场敏感 ' if sensitive else ''}{title}"
-        return False, None
-    except:
-        return None, None
-
-# ── 计算VWAP ──────────────────────────────────────────────────
 def calc_vwap(df):
     c = df['Close'].squeeze()
     h = df['High'].squeeze()
@@ -140,7 +179,6 @@ def calc_vwap(df):
     tp = (h + l + c) / 3
     return (tp * v).cumsum() / v.cumsum()
 
-# ── Telegram ─────────────────────────────────────────────────
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -153,6 +191,10 @@ def run_morning_scan():
     today = datetime.now().strftime('%Y-%m-%d')
     print(f"\n[{today}] First Pullback 早盘扫描开始...")
 
+    # 一次性拉取今日全部公告
+    print("拉取今日ASX公告...")
+    ann_map = get_today_announcements()
+
     universe = get_asx_universe()
     if not universe: return
     print(f"股票池：{len(universe)} 只")
@@ -163,9 +205,7 @@ def run_morning_scan():
     liquid = []
     for t, df in daily_data.items():
         try:
-            avg_vol = float(df['Volume'].iloc[-20:].mean())
-            price   = float(df['Close'].iloc[-1])
-            if avg_vol * price >= 300_000:
+            if float(df['Volume'].iloc[-20:].mean()) * float(df['Close'].iloc[-1]) >= 300_000:
                 liquid.append(t)
         except: pass
     print(f"流动性过滤后：{len(liquid)} 只")
@@ -173,7 +213,7 @@ def run_morning_scan():
     print("下载盘中数据...")
     intra_data = batch_intraday(liquid, batch_size=50)
 
-    # 价格和量条件过滤
+    # 过滤候选股
     pre_candidates = []
     for t in liquid:
         try:
@@ -193,17 +233,17 @@ def run_morning_scan():
 
             closes = daily['Close'].squeeze()
             if len(closes) >= 4:
-                d1, d2, d3 = float(closes.iloc[-2]), float(closes.iloc[-3]), float(closes.iloc[-4])
+                d1, d2, d3 = (float(closes.iloc[-2]),
+                              float(closes.iloc[-3]),
+                              float(closes.iloc[-4]))
                 if d1 > d2 * 1.05 and d2 > d3 * 1.02:
                     continue
 
-            vwap_series = calc_vwap(intra)
-            vwap        = float(vwap_series.iloc[-1])
-            today_high  = float(intra['High'].squeeze().max())
-            today_low   = float(intra['Low'].squeeze().min())
-            launch_pt   = float(intra['Low'].squeeze().iloc[0])
-            pullback_d  = (today_high - curr_price) / today_high if today_high > 0 else 0
-            is_straight = pullback_d < 0.02
+            vwap       = float(calc_vwap(intra).iloc[-1])
+            today_high = float(intra['High'].squeeze().max())
+            today_low  = float(intra['Low'].squeeze().min())
+            launch_pt  = float(intra['Low'].squeeze().iloc[0])
+            is_straight = (today_high - curr_price) / today_high < 0.02 if today_high > 0 else True
 
             pre_candidates.append({
                 'ticker'     : t,
@@ -216,33 +256,40 @@ def run_morning_scan():
                 'today_low'  : round(today_low, 3),
                 'launch_pt'  : round(launch_pt, 3),
                 'is_straight': is_straight,
-                'ann_has'    : None,
-                'ann_title'  : None,
-                'ai_analysis': None,
             })
         except: pass
 
-    print(f"价格/量条件通过：{len(pre_candidates)} 只，核查公告...")
+    print(f"价格/量条件通过：{len(pre_candidates)} 只，检查公告...")
 
-    # 公告核查 + AI分析
+    # 用ann_map做本地查找（无需逐只调API）
     final = []
     for c in pre_candidates:
-        code = c['ticker'].replace('.AX', '')
-        has, title = check_announcement(code)
-        c['ann_has']   = has
-        c['ann_title'] = title
-        time.sleep(0.2)
+        code     = c['ticker'].replace('.AX', '')
+        ann_info = ann_map.get(code)
 
-        if has is False:
-            print(f"  ❌ {c['ticker']}: 今日无公告")
-            continue
+        if ann_info is None:
+            # 没有今日公告：用yfinance今日新闻作为备选
+            news = get_yf_news(code)
+            today_news = [n for n in news if n['today']]
+            if not today_news:
+                print(f"  ❌ {c['ticker']}: 无今日公告/新闻")
+                continue
+            ann_info = {'headline': today_news[0]['title'], 'sensitive': False}
+            c['ann_source'] = 'yfinance'
+        else:
+            c['ann_source'] = 'asx'
 
-        # Gemini分析（技术指标first，然后结合公告）
+        c['ann_headline']  = ann_info['headline']
+        c['ann_sensitive'] = ann_info['sensitive']
+
+        # Gemini分析
         if gemini_client:
             print(f"  🤖 {c['ticker']}: 生成AI分析...")
-            c['ai_analysis'] = analyze_candidate(c)
+            c['ai_analysis'] = analyze_candidate(c, ann_info)
+        else:
+            c['ai_analysis'] = ""
 
-        flag = "✅" if has else "⚠️"
+        flag = "✅" if c['ann_source'] == 'asx' else "⚠️"
         print(f"  {flag} {c['ticker']}: +{c['change_pct']}% vol:{c['vol_ratio']}x")
         final.append(c)
 
@@ -258,34 +305,31 @@ def run_morning_scan():
             "今日无候选股票。\n"
             "（未发现：有公告 + 涨幅≥10% + 放量 的组合）"
         )
-        print("无候选股票。")
         return
 
     final.sort(key=lambda x: x['change_pct'], reverse=True)
 
-    # 发送汇总 + 逐股详情
     lines = [f"⚡ <b>First Pullback 候选 {today}</b>\n"]
     for c in final:
-        ann_flag = "⭐" if c['ann_has'] else "⚠️"
-        sl_flag  = "⚠️ 一字拉升未回调" if c['is_straight'] else "✅ 已出现回调空间"
+        src_flag = "📋 ASX" if c['ann_source'] == 'asx' else "📰 新闻"
+        sen_flag = "⭐ " if c.get('ann_sensitive') else ""
+        sl_flag  = "⚠️ 一字拉升" if c['is_straight'] else "✅ 已出现回调空间"
         lines.append(
-            f"{ann_flag} <b>{c['ticker']}</b>  "
-            f"+{c['change_pct']}%  量:{c['vol_ratio']}x\n"
+            f"<b>{c['ticker']}</b>  +{c['change_pct']}%  量:{c['vol_ratio']}x\n"
             f"   现价:{c['price']}  VWAP:{c['vwap']}  高:{c['today_high']}\n"
             f"   {sl_flag}\n"
-            f"   📋 {c.get('ann_title') or '请手动核查公告'}\n"
+            f"   {src_flag} {sen_flag}{c['ann_headline']}\n"
         )
         if c.get('ai_analysis'):
             lines.append(f"   🤖 {c['ai_analysis']}\n")
 
     lines.append(
-        "\n等待价格回踩VWAP后再入场\n"
+        "\n等待回踩VWAP后再入场\n"
         "止盈：+10%锁半仓，+20%清仓\n"
         "止损：跌破启动低点或 -8%"
     )
-
     send_telegram("\n".join(lines))
-    print(f"✅ 完成，{len(final)} 个候选已发送Telegram")
+    print(f"✅ 完成，{len(final)} 个候选")
 
 if __name__ == '__main__':
     run_morning_scan()
