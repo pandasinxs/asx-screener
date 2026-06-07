@@ -126,7 +126,7 @@ def ask_gemini(prompt: str) -> str:
     if not gemini_client: return ""
     try:
         r = gemini_client.models.generate_content(
-            model='gemini-2.0-flash-lite', contents=prompt)
+            model='gemini-2.0-flash', contents=prompt)
         return r.text.strip()
     except:
         return ""
