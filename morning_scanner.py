@@ -27,9 +27,10 @@ ASX_HEADERS = {
 }
 
 # ── 今日公告（一次性批量拉取）────────────────────────────────
-def get_today_announcements() -> dict:
-    """返回 {symbol: {'headline': str, 'sensitive': bool}}"""
-    today  = date.today().isoformat()
+def get_recent_announcements(hours_back=72) -> dict:
+    from datetime import timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)
+              ).strftime('%Y-%m-%dT%H:%M:%S.000Z')
     result = {}
     page   = 0
     while True:
@@ -38,27 +39,26 @@ def get_today_announcements() -> dict:
                              params={'itemsPerPage': 100, 'page': page},
                              headers=ASX_HEADERS, timeout=10)
             items = r.json().get('data', {}).get('items', [])
-            if not items:
-                break
+            if not items: break
             got_old = False
             for item in items:
-                if item.get('date', '')[:10] < today:
+                if item.get('date', '') < cutoff:
                     got_old = True
                     break
                 sym = item.get('symbol', '')
                 if sym and sym not in result:
                     result[sym] = {
                         'headline' : item.get('headline', '')[:70],
-                        'sensitive': item.get('isPriceSensitive', False)
+                        'sensitive': item.get('isPriceSensitive', False),
+                        'date'     : item.get('date', '')[:10]
                     }
-            if got_old or len(items) < 100:
-                break
+            if got_old or len(items) < 100: break
             page += 1
             time.sleep(0.3)
         except Exception as e:
             print(f"公告API错误: {e}")
             break
-    print(f"今日公告：{len(result)} 只股票有公告")
+    print(f"最近{hours_back}小时公告：{len(result)} 只股票")
     return result
 
 # ── yfinance新闻（修复content.title）────────────────────────
@@ -193,7 +193,7 @@ def run_morning_scan():
 
     # 一次性拉取今日全部公告
     print("拉取今日ASX公告...")
-    ann_map = get_today_announcements()
+    ann_map = get_recent_announcements()
 
     universe = get_asx_universe()
     if not universe: return
