@@ -52,7 +52,7 @@ def ask_gemini(prompt: str) -> str:
     if not gemini_client: return "AI未配置"
     try:
         r = gemini_client.models.generate_content(
-            model='gemini-2.0-flash-lite', contents=prompt)
+            model='gemini-2.0-flash', contents=prompt)
         return r.text.strip()
     except Exception as e:
         return f"AI分析失败：{e}"
