@@ -48,14 +48,31 @@ SYSTEM = """你是一位严谨的ASX专业股票分析师助手。
 def auth(update: Update) -> bool:
     return update.effective_chat.id == CHAT_ID
 
+import time as _time
+
+_last_gemini_call = 0
+
 def ask_gemini(prompt: str) -> str:
-    if not gemini_client: return "AI未配置"
+    global _last_gemini_call
+    if not gemini_client:
+        return ""
+    # 强制每次调用间隔至少5秒（避免触发RPM限制）
+    elapsed = _time.time() - _last_gemini_call
+    if elapsed < 5:
+        _time.sleep(5 - elapsed)
     try:
         r = gemini_client.models.generate_content(
-            model='gemini-2.0-flash', contents=prompt)
+            model='gemini-2.0-flash',
+            contents=prompt
+        )
+        _last_gemini_call = _time.time()
         return r.text.strip()
     except Exception as e:
-        return f"AI分析失败：{e}"
+        _last_gemini_call = _time.time()
+        if '429' in str(e):
+            print("Gemini限速，跳过AI分析")
+            return ""   # 静默跳过，不报错给用户
+        return ""
 
 def get_stock_announcements(code: str) -> list:
     """获取某只股票的最近公告（从今日全量公告中筛选）"""
