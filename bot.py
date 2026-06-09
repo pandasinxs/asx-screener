@@ -249,7 +249,7 @@ async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
     msg   = update.message.text
-    codes = list(set(re.findall(r'\b([A-Z]{2,5})(?:\.AX)?\b', msg)))
+    codes = list(set(re.findall(r'\b([A-Z]{3,4})\.AX\b', msg.upper())))
     context_data = ""
     if codes:
         await update.message.reply_text("🔍 正在查找相关数据...")
