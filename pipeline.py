@@ -42,25 +42,29 @@ async def run_pipeline_for_stock(ticker):
     print(f"🧠 [AI端] 正在调用 gemini-2.5-flash 为 {ticker} 进行专有全矩阵内容生成...")
     ai_report = None
     
-    # 3次自动重试防 503 拥堵
-    for attempt in range(1, 4):
+    # 🌟 疯狗流抗压升级：每 30 秒轰炸一次，连续死磕 10 分钟（共 20 次）
+    max_retries = 20
+    retry_delay = 30
+    
+    for attempt in range(1, max_retries + 1):
         try:
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=final_prompt,
                 config={
-                    'max_output_tokens': 3000, # 单只股票独享 3000 Token，极其宽裕！
+                    'max_output_tokens': 3000,
                     'temperature': 0.3
                 }
             )
             ai_report = response.text
-            break
+            break # 只要抓到一次成功，立刻 break 终止循环，绝不多发一次请求！
         except Exception as e:
-            if "503" in str(e) and attempt < 3:
-                print(f"⚠️ Google 付费节点临时拥堵 (503)，5秒后进行第 {attempt} 次自动重试...")
-                time.sleep(5)
+            if "503" in str(e) and attempt < max_retries:
+                print(f"⚠️ 警告：Google 付费机房持续大塞车 (503)。")
+                print(f"   ⚔️ 开启高频死磕：已等待 {retry_delay} 秒，即将进行第 {attempt}/{max_retries} 次冲锋...")
+                time.sleep(retry_delay)
             else:
-                print(f"❌ {ticker} Gemini 最终调用失败: {e}")
+                print(f"❌ {ticker} 历经 {attempt} 次疯狂死磕后依然遭遇致命错误: {e}")
                 return
 
     if not ai_report:
