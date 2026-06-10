@@ -7,7 +7,7 @@ from google.genai import types
 from dotenv import load_dotenv
 
 # 确保能正确导入你刚刚重构的动态数据收集器
-sys.path.append(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import data_collector
 
 # 加载环境变量
