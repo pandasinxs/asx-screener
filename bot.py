@@ -62,7 +62,7 @@ def ask_gemini(prompt: str) -> str:
         _time.sleep(5 - elapsed)
     try:
         r = gemini_client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=prompt
         )
         _last_gemini_call = _time.time()
