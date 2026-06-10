@@ -5,25 +5,28 @@ from google.genai import types
 from telegram import Bot
 from data_collector import get_stock_comprehensive_data, serialize_to_prompt
 
-# 1. 严格对接你现有的环境变量命名（在 Oracle 系统环境或 .env 中加载）
+# 1. 完美复刻你原本能成功读取的系统变量逻辑
 GEMINI_KEY     = os.environ.get("GEMINI_API_KEY", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID_RAW    = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# 2. 智能转换：把字符串的 CHAT_ID 安全转成 Telegram 要求的数字格式
 try:
-    CHAT_ID    = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
+    CHAT_ID    = int(CHAT_ID_RAW) if CHAT_ID_RAW else 0
 except ValueError:
     CHAT_ID    = 0
 
-# 2. 安全检查：如果密钥没配对，立刻熔断报错，防止后续报错难以排查
+# 3. 安全熔断提示
 if not GEMINI_KEY or not TELEGRAM_TOKEN or CHAT_ID == 0:
-    print("❌ 错误：环境变量读取失败，请检查系统的环境变量配置！")
-    print(f"  - GEMINI_API_KEY: {'已加载' if GEMINI_KEY else '缺失'}")
-    print(f"  - TELEGRAM_TOKEN: {'已加载' if TELEGRAM_TOKEN else '缺失'}")
-    print(f"  - TELEGRAM_CHAT_ID: {CHAT_ID if CHAT_ID != 0 else '缺失或格式错误'}")
+    print("❌ 错误：检测到系统环境变量有缺失！")
+    print(f"  - GEMINI_API_KEY: {'✅ 正常' if GEMINI_KEY else '❌ 缺失'}")
+    print(f"  - TELEGRAM_TOKEN: {'✅ 正常' if TELEGRAM_TOKEN else '❌ 缺失'}")
+    print(f"  - TELEGRAM_CHAT_ID: {'✅ 正常' if CHAT_ID != 0 else '❌ 缺失或非纯数字'}")
+    print("\n💡 提示：如果依然显示缺失，请在服务器终端运行一次你的系统变量载入指令（如 source ~/.bashrc）。")
     exit(1)
 
-# 3. 初始化全新一代 Gemini 客户端（2026年标准 SDK）
-client = genai.Client(api_key=GEMINI_KEY)
+# 后面的初始化客户端和 main() 保持不变...
+
 
 # 4. 初始化 Telegram Bot 客户端
 tg_bot = Bot(token=TELEGRAM_TOKEN)
