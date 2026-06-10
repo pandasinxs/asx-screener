@@ -5,55 +5,41 @@ from datetime import datetime
 
 def get_top_asx_movers(limit=3):
     """
-    🏛️ 纯净数据版：全盘新鲜异动股捕获器
-    拒绝任何写死的明星股保底！完全根据当天全市场的【一手重大公告】与【真实涨跌幅】动态锁定标的。
+    🏛️ 终极安全版：全盘新鲜异动股捕获器（带时间戳死锁）
     """
-    print("📡 正在启动 ASX 全盘雷达，扫描今日全市场发布重大公告的股票...")
+    # 🌟 【死锁核心】拿到今天服务器真实的日期字符串，例如 "2026-06-10"
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    print(f"📡 正在启动 ASX 全盘雷达，今日基准时间戳: {today_str}")
     
     url = "https://asx.api.markitdigital.com/asx-research/1.0/markets/announcements"
-    payload = {
-        "itemsPerPage": 100, # 动态拉取今日大厅最新的 100 条合规公告
-        "page": 0,
-        "dateRange": "All"
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
+    payload = {"itemsPerPage": 100, "page": 0, "dateRange": "All"}
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Content-Type": "application/json"}
     
     hot_tickers = set()
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=15)
         if response.status_code == 200:
             items = response.json().get("data", {}).get("items", [])
-            print(f"📋 成功捕获全市场今日大厅 {len(items)} 条一手公告，正在筛选敏感公告...")
-            
             for item in items:
-                # 漏斗核心：锁定今日发布重大敏感公告的正股
-                if item.get("marketSensitive", False):
+                # 检查最新敏感公告的时间，必须是今天发的！如果是昨天发的，直接过滤掉
+                pub_time = item.get("dateAndTime", "")[:10]
+                if item.get("marketSensitive", False) and pub_time == today_str:
                     raw_ticker = item.get("tickers", [{}])[0].get("ticker", "")
                     if raw_ticker and len(raw_ticker) == 3:
                         hot_tickers.add(f"{raw_ticker}.AX")
-                        if len(hot_tickers) >= 15: break # 限制种子数量，保护接口
+                        if len(hot_tickers) >= 15: break
     except Exception as e:
         print(f"⚠️ 全盘公告扫描遭遇异常: {e}")
 
-    # 🌟 核心改变：如果今天全盘没有任何突发敏感公告，绝对不搞“明星股保底”
-    # 我们直接去全市场最活跃的常见高波板块中，在线抓取今天【真实涨跌幅最大】的新鲜标的
+    # 如果今天没有任何重磅敏感公告，切入全盘量化池进行实时成交量/时间戳双重清洗
     if not hot_tickers:
-        print("ℹ️ 今日全盘未发布突发敏感公告。立刻切入【全盘量化雷达】，捕捉纯资金面暴动标的...")
-        # 这是一个覆盖资源、科技、消费、医药等核心暴动频发区的50只全盘大范围采样池
+        print("ℹ️ 今日全盘未发布突发敏感公告，切入【全盘量化雷达】并开启时间戳校验...")
         dynamic_scan_pool = [
             "ZIP.AX", "PLS.AX", "CXO.AX", "LTR.AX", "WTC.AX", "FMG.AX", "BHP.AX", "RIO.AX", "MIN.AX", "AKE.AX",
-            "SGM.AX", "XRO.AX", "CPU.AX", "NEXT.AX", "TNE.AX", "TLG.AX", "LYC.AX", "A2M.AX", "TRE.AX", "SYR.AX",
-            "BOQ.AX", "BEN.AX", "PPT.AX", "MFG.AX", "PDN.AX", "DYL.AX", "BOE.AX", "LOT.AX", "PEN.AX", "AGL.AX",
-            "ORG.AX", "APA.AX", "AST.AX", "KAR.AX", "WDS.AX", "STO.AX", "AMP.AX", "IAG.AX", "SUN.AX", "QAN.AX"
+            "XRO.AX", "CPU.AX", "NEXT.AX", "LYC.AX", "A2M.AX", "PDN.AX", "WDS.AX", "STO.AX", "AMP.AX", "QAN.AX"
         ]
         hot_tickers = dynamic_scan_pool
 
-    print(f"🎯 正在对全盘捕捉到的新鲜候选标的进行【盘后真实量化清洗】...")
-    
     final_movers = []
     for ticker in hot_tickers:
         try:
@@ -61,11 +47,17 @@ def get_top_asx_movers(limit=3):
             hist = stock.history(period="2d")
             if len(hist) < 2: continue
             
-            # 提取当天的收盘价和成交量
+            # 🌟 【防穿越大杀器】提取雅虎返回的数据表里最新一行的日期
+            # hist.index[-1] 拿到的是 Timestamp 对象，用 str() 裁剪出前面的 "YYYY-MM-DD"
+            latest_data_date = str(hist.index[-1])[:10]
+            
+            # 💡 如果这一行的日期和今天对不上，说明雅虎今天没开盘、没更新，拿的是历史僵尸数据！
+            if latest_data_date != today_str:
+                continue # 毫不留情，直接扔掉这只股票
+            
             pct_change = ((hist['Close'].iloc[-1] - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100
             current_vol = hist['Volume'].iloc[-1]
             
-            # 过滤掉几乎没有成交量的僵尸股，确保推荐的都是今天有人在疯狂博弈的鲜活标的
             if current_vol > 10000: 
                 final_movers.append({
                     "ticker": ticker,
@@ -75,13 +67,11 @@ def get_top_asx_movers(limit=3):
                 })
         except: continue
         
-    # 按照今日绝对涨跌幅剧烈程度进行总排名，剔除波动小的股票，只要前 limit 名
     final_movers.sort(key=lambda x: abs(x['pct_change']), reverse=True)
     top_selected = final_movers[:limit]
     
-    # 如果全盘都没有波动（比如休市或极端平淡），系统直接熔断，拒绝制造垃圾假新闻
     if not top_selected:
-        print("🛑 [系统熔断] 今日全盘市场数据极其平淡，未达到异动捕获标准。")
+        print(f"🛑 [安全熔断] 侦测到今日（{today_str}）非交易日或市场无实质新鲜交易数据，拒绝使用历史僵尸数据。")
         return []
         
     print(f"🏆 【全盘筛选大功告成】今日新鲜出炉的 3 只异动之王: {[m['ticker'] for m in top_selected]}")
