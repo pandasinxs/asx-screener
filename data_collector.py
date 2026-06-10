@@ -5,80 +5,95 @@ from datetime import datetime
 
 def get_top_asx_movers(limit=3):
     """
-    🏛️ 终极安全版：全盘新鲜异动股捕获器（带时间戳死锁）
+    🏛️ 修正版：针对 ASX 本土生态的全盘雷达 (优化微盘黑马过滤)
     """
-    # 🌟 【死锁核心】拿到今天服务器真实的日期字符串，例如 "2026-06-10"
     today_str = datetime.now().strftime("%Y-%m-%d")
-    print(f"📡 正在启动 ASX 全盘雷达，今日基准时间戳: {today_str}")
+    print(f"📡 [ASX天网 5.0] 启动全盘扫描，基准日期: {today_str}")
     
-    url = "https://asx.api.markitdigital.com/asx-research/1.0/markets/announcements"
-    payload = {"itemsPerPage": 100, "page": 0, "dateRange": "All"}
+    url_ann = "https://asx.api.markitdigital.com/asx-research/1.0/markets/announcements"
+    payload_ann = {"itemsPerPage": 100, "page": 0, "dateRange": "All"}
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Content-Type": "application/json"}
     
     hot_tickers = set()
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        response = requests.post(url_ann, json=payload_ann, headers=headers, timeout=12)
         if response.status_code == 200:
             items = response.json().get("data", {}).get("items", [])
             for item in items:
-                # 检查最新敏感公告的时间，必须是今天发的！如果是昨天发的，直接过滤掉
                 pub_time = item.get("dateAndTime", "")[:10]
+                # 漏斗 1：精准捕捉今日发布的敏感合规披露
                 if item.get("marketSensitive", False) and pub_time == today_str:
                     raw_ticker = item.get("tickers", [{}])[0].get("ticker", "")
                     if raw_ticker and len(raw_ticker) == 3:
                         hot_tickers.add(f"{raw_ticker}.AX")
-                        if len(hot_tickers) >= 15: break
     except Exception as e:
-        print(f"⚠️ 全盘公告扫描遭遇异常: {e}")
+        print(f"⚠️ 公告大厅扫描异常: {e}")
 
-    # 如果今天没有任何重磅敏感公告，切入全盘量化池进行实时成交量/时间戳双重清洗
+    # 如果今日没有敏感公告，拦截官方涨幅排行榜总榜
     if not hot_tickers:
-        print("ℹ️ 今日全盘未发布突发敏感公告，切入【全盘量化雷达】并开启时间戳校验...")
-        dynamic_scan_pool = [
-            "ZIP.AX", "PLS.AX", "CXO.AX", "LTR.AX", "WTC.AX", "FMG.AX", "BHP.AX", "RIO.AX", "MIN.AX", "AKE.AX",
-            "XRO.AX", "CPU.AX", "NEXT.AX", "LYC.AX", "A2M.AX", "PDN.AX", "WDS.AX", "STO.AX", "AMP.AX", "QAN.AX"
-        ]
-        hot_tickers = dynamic_scan_pool
+        print("ℹ️ 今日无突发敏感公告。立刻拦截 ASX 官方全盘【今日涨幅排行榜】...")
+        url_movers = "https://asx.api.markitdigital.com/asx-research/1.0/markets/movers"
+        payload_movers = {"itemsPerPage": 40, "page": 0, "sort": "PricePercentChange", "direction": "Descending"}
+        try:
+            response = requests.post(url_movers, json=payload_movers, headers=headers, timeout=12)
+            if response.status_code == 200:
+                movers_items = response.json().get("data", {}).get("items", [])
+                for item in movers_items:
+                    raw_ticker = item.get("ticker", "")
+                    if raw_ticker and len(raw_ticker) == 3:
+                        hot_tickers.add(f"{raw_ticker}.AX")
+        except Exception as e:
+            print(f"⚠️ 拦截官方排行榜失败: {e}")
 
+    print(f"🎯 正在对候选群 {list(hot_tickers)} 执行【修正版 ASX 本土量化清洗】...")
+    
     final_movers = []
     for ticker in hot_tickers:
         try:
             stock = yf.Ticker(ticker)
+            info = stock.info
+            market_cap = info.get("marketCap", 0)
+            
+            # 💡 【ASX 修正门槛 1】：市值由 30M 降至 10M（保留高增长潜力微盘资源与科技股）
+            if market_cap < 10000000: continue
+            
             hist = stock.history(period="2d")
             if len(hist) < 2: continue
             
-            # 🌟 【防穿越大杀器】提取雅虎返回的数据表里最新一行的日期
-            # hist.index[-1] 拿到的是 Timestamp 对象，用 str() 裁剪出前面的 "YYYY-MM-DD"
+            # 漏斗 2：死锁今天的新鲜数据日期
             latest_data_date = str(hist.index[-1])[:10]
-            
-            # 💡 如果这一行的日期和今天对不上，说明雅虎今天没开盘、没更新，拿的是历史僵尸数据！
-            if latest_data_date != today_str:
-                continue # 毫不留情，直接扔掉这只股票
+            if latest_data_date != today_str: continue
             
             pct_change = ((hist['Close'].iloc[-1] - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100
             current_vol = hist['Volume'].iloc[-1]
+            current_close = hist['Close'].iloc[-1]
+            turnover = current_close * current_vol
             
-            if current_vol > 10000: 
-                final_movers.append({
-                    "ticker": ticker,
-                    "pct_change": pct_change,
-                    "volume": current_vol,
-                    "last_close": hist['Close'].iloc[-1]
-                })
+            # 💡 【ASX 修正门槛 2】：降低绝对成交额限制到 \$5万 AUD（允许微盘股在有资金关注时入围）
+            if turnover < 50000: continue
+            
+            final_movers.append({
+                "ticker": ticker,
+                "pct_change": pct_change,
+                "volume": current_vol,
+                "turnover": turnover,
+                "market_cap": market_cap,
+                "last_close": current_close
+            })
         except: continue
         
     final_movers.sort(key=lambda x: abs(x['pct_change']), reverse=True)
     top_selected = final_movers[:limit]
     
     if not top_selected:
-        print(f"🛑 [安全熔断] 侦测到今日（{today_str}）非交易日或市场无实质新鲜交易数据，拒绝使用历史僵尸数据。")
+        print(f"🛑 [量化熔断] 今日未筛选出符合 ASX 生态标准的实质性新鲜异动标的。")
         return []
         
-    print(f"🏆 【全盘筛选大功告成】今日新鲜出炉的 3 只异动之王: {[m['ticker'] for m in top_selected]}")
+    print(f"🏆 [雷达锁定] 今日最符合 ASX 资金运作的前 {len(top_selected)} 只鲜活标的: {[m['ticker'] for m in top_selected]}")
     return top_selected
 
 def get_asx_official_announcements(ticker_short):
-    """直连 ASX 官网，提取该股票真实的最新 3 条公告"""
+    """提取该股票真实的最新 3 条公告，带具体时间戳"""
     url = "https://asx.api.markitdigital.com/asx-research/1.0/markets/announcements"
     payload = {"itemsPerPage": 5, "page": 0, "searchText": ticker_short, "dateRange": "All"}
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Content-Type": "application/json"}
@@ -92,17 +107,18 @@ def get_asx_official_announcements(ticker_short):
                 official_news.append({
                     "title": item.get("headline", ""),
                     "is_sensitive": "Yes" if item.get("marketSensitive", False) else "No",
-                    "date": item.get("dateAndTime", "")[:10]
+                    "date": item.get("dateAndTime", "")[:10],
+                    "time": item.get("dateAndTime", "")[11:16]
                 })
     except: pass
     return official_news
 
 def get_stock_comprehensive_data(ticker):
-    """【多维数据闭环】官方真实公告 + 雅虎量化均线公式"""
+    """整合完整的基本面、财务面、量化指标和一手公告线"""
     ticker_short = ticker.replace(".AX", "")
     official_announcements = get_asx_official_announcements(ticker_short)
     if not official_announcements:
-        official_announcements = [{"title": "Regular trade volatility", "is_sensitive": "No", "date": "2026-06-10"}]
+        official_announcements = [{"title": "Regular trade volatility", "is_sensitive": "No", "date": "2026-06-10", "time": "16:00"}]
 
     stock = yf.Ticker(ticker)
     hist = stock.history(period="6mo")
@@ -120,57 +136,73 @@ def get_stock_comprehensive_data(ticker):
     elif current_close < current_ma5 < current_ma20:
         ma_status = "空头下行排列（股价 < MA5 < MA20）"
     else:
-        ma_status = "均线缠绕震荡（筹码正在密集换手纠缠）"
+        ma_status = "均线缠绕震荡"
 
-    price_metrics = {
+    info = stock.info
+    metrics = {
         "current_price": current_close,
         "10d_high": last_10_days['High'].max(),
         "10d_low": last_10_days['Low'].min(),
         "current_ma5": current_ma5,
         "current_ma20": current_ma20,
-        "ma_status": ma_status
+        "ma_status": ma_status,
+        "market_cap_formatted": f"${info.get('marketCap', 0)/1000000:.2f}M AUD",
+        "today_turnover": f"${current_close * last_10_days['Volume'].iloc[-1]/1000:.2f}K AUD",
+        "pe_ratio": info.get("trailingPE", "N/A"),
+        "inst_owned": f"{info.get('heldPercentInstitutions', 0)*100:.2f}%"
     }
     
     return {
         "ticker": ticker,
-        "price_metrics": price_metrics,
+        "price_metrics": metrics,
         "official_news": official_announcements
     }
 
 def serialize_to_prompt(raw_data):
     ticker = raw_data['ticker']
     metrics = raw_data['price_metrics']
+    
     prompt = f"""
-你现在是全球顶尖的跨平台财经自媒体矩阵主理人。请根据以下来自【ASX官方交易所】和【雅虎财经量化中心】的交叉验证真实数据，为澳洲股票 {ticker} 撰写三份完全不同平台风格的复盘分析。
+你现在是全球顶尖的跨平台量化财经专家。请根据以下来自【ASX官方交易所】和【雅虎财经量化中心】交叉验证的硬核真实数据集，为 {ticker} 撰写精炼、无废话、纯数据驱动的复盘报告。
 
----【📡 交叉验证权威数据集】---
+---【📡 交叉验证硬核数据集】---
 股票代码: {ticker}
-当前最新收盘价: ${metrics['current_price']:.3f}
-过去10日最高价: ${metrics['10d_high']:.3f}
-过去10日最低价: ${metrics['10d_low']:.3f}
+市值: {metrics['market_cap_formatted']} | 今日换手额: {metrics['today_turnover']} | 机构持股比: {metrics['inst_owned']} | 滚动市盈率 P/E: {metrics['pe_ratio']}
+最新收盘价: ${metrics['current_price']:.3f} | 10日高/低点: ${metrics['10d_high']:.3f} / ${metrics['10d_low']:.3f}
+量化指标: MA5攻击线 ${metrics['current_ma5']:.3f} | MA20生命线 ${metrics['current_ma20']:.3f} | 均线形态: {metrics['ma_status']}
 
-📊 技术面量化指标 (精确至0.001):
-- 5日均线 (MA5攻击线): ${metrics['current_ma5']:.3f}
-- 20日均线 (MA20生命线): ${metrics['current_ma20']:.3f}
-- 当前技术形态形态: {metrics['ma_status']}
-
-🔴 ASX官方一手披露公告 (权威源): {raw_data['official_news']}
+🔴 ASX官方公告历史线 (按时间倒序): {raw_data['official_news']}
 --------------------------------
 
-🎯 请严格按照以下格式输出，不要带任何多余的开头和废话：
+🎯 必须严格执行以下输出格式，不准带有任何引导废话和多余客套，直切主题：
 
 #### 🔴 PLATFORM_TELEGRAM
-**{ticker} 机构内参：官方催化剂与技术面交叉解构**
-- 🏛️ 官方公告解构：深度透视 ASX 官方披露的最新公告《{raw_data['official_news'][0]['title']}》（市场敏感度: {raw_data['official_news'][0]['is_sensitive']}），用专业机构视角翻译这篇公告对公司估值的核心影响。
-- 📈 技术面与量化位置推演：必须结合当前收盘价、10日高低点、以及当前 MA5 (${metrics['current_ma5']:.3f}) 和 MA20 (${metrics['current_ma20']:.3f}) 的位置，给出具体的、可用于交易参考的价格数字（如：跌破/企稳于MAxx上方，强支撑位关注xx.xx，强压力位看向xx.xx）。
-- 资金洗盘逻辑：结合当前均线形态【{metrics['ma_status']}】，分析多空博弈主力今天在借官方利好出货，还是在恐慌盘中暴力洗盘。
+**⚖️ {ticker} 核心交易评估报告**
+
+【核心结论与展望】
+明确判定：[给出明确指引：建议买入 / 保持观望 / 建议减持]，当前技术面及资金逻辑表明，[上涨/震荡/下跌] 走势预计将持续至[给出明确预测时间线，如未来x个交易日内 / 本周五收盘]。下一个核心催化剂事件预测发生在[明确预估一个日期段或核心事件，如：7月下旬探矿复检报告披露 / 8月年度财报]，该催化剂研判的核心逻辑在于[用1行字说清关键原因]。
+
+【📜 今日官方披露时间线与摘要分析】
+（请以具体日期时间为骨架，用 dot points 精简概括披露细节与背后动机，拒绝任何长篇大论的形容词）
+* {raw_data['official_news'][0]['date']} {raw_data['official_news'][0]['time']} - 最新合规披露：发行公告《{raw_data['official_news'][0]['title']}》（市场敏感度: {raw_data['official_news'][0]['is_sensitive']}）。核心摘要与分析：[2行字大白话指出该公告披露的核心财报数字/勘探深度/业务进展，并直接点明这代表主力在借利好出货还是机构合力吃饱]。
+* [若数据集里有第二条公告，按照上述格式列出‘日期 时间 - 公告标题 + 摘要分析’。若今天只有一条公告，则在此列出该股票近期的历史重大事件线，并点明对今天盘面情绪的累积影响]。
+
+【📊 核心量化指标硬核验证】
+（直接罗列硬性指标，并给出基于该指标的交易可行度支撑，拒绝无数据支撑的废话）
+* 市值与流动性验证：当前总市值 {metrics['market_cap_formatted']}，今日真实换手金额达 {metrics['today_turnover']}。[分析：说明该流动性水平是否具备散户及游资的短线换手承接力]。
+* 均线生命线与价格位置：最新收盘价 ${metrics['current_price']:.3f} 相比于 MA5 攻击线 (${metrics['current_ma5']:.3f}) 和 MA20 生命线 (${metrics['current_ma20']:.3f}) 呈现【{metrics['ma_status']}】状态。[分析：基于此位置直接给出明确的交易防御数字：下方强支撑位精确看至 $xx.xx，上方强阻力位精确看向 $xx.xx]。
+* 筹码结构：机构持股比例为 {metrics['inst_owned']}，滚动市盈率为 {metrics['pe_ratio']}。[分析：一句话判定该股属于高度控盘股、还是散户游资混战股，进一步增强上述结论的可信度]。
 
 #### 🔴 PLATFORM_X
-（风格：短小精悍、犀利。字数200字内。带3个热门标签。例如：今天 {ticker} 这一脚油门...）
+（风格：数据流。首句直接给出【结论：买入/观望】和预测持续时间，随后列出最硬核的2条公告/均线数字证据。150字内，带3个标签。）
 
 #### 🔴 PLATFORM_XIAOHONGSHU
-【震惊！今日ASX官方紧急披露，{ticker} 搞大事了...】
-宝子们！澳洲股市今天这只股票绝对要加入自选！🔥
-（多用Emoji，段落短，结合技术面通俗易懂地告诉大家能不能赚钱，最后带5个小红书标签）
+【全盘扫描：今日ASX数据之王 {ticker} 应该买还是等？】
+别看大道理，直接看官方一手真凭实据！
+- 核心建议：[买入/观望]（预计行情持续至xx）
+- 关键时间线：{raw_data['official_news'][0]['date']} 官方突发公告《{raw_data['official_news'][0]['title']}》！这意味着：[用 dot point 给出大白话数据解释]
+- 硬核指标：市值 {metrics['market_cap_formatted']}，今天主力砸了 {metrics['today_turnover']}！均线处于{metrics['ma_status']}。
+支撑位看 $xx.xx，阻力位看 $xx.xx！
+（用数据说话，段落极短，最后带5个标签）
 """
     return prompt
