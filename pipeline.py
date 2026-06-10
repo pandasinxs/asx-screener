@@ -1,120 +1,125 @@
 import os
+import sys
 import time
 import asyncio
 from google import genai
-from telegram import Bot
-from data_collector import get_top_asx_movers, get_stock_comprehensive_data, serialize_to_prompt
+from google.genai import types
+from dotenv import load_dotenv
 
-# 1. 载入系统环境变量
-GEMINI_KEY     = os.environ.get("GEMINI_API_KEY", "")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-try: 
-    CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
-except: 
-    CHAT_ID = 0
+# 确保能正确导入你刚刚重构的动态数据收集器
+sys.path.append(os.path.dirname(os.path.abspath(__file__))))
+import data_collector
 
-# 2. 初始化全新一代生产级付费网关客户端
-client = genai.Client(api_key=GEMINI_KEY, http_options={'api_version': 'v1'})
-tg_bot = Bot(token=TELEGRAM_TOKEN)
+# 加载环境变量
+load_dotenv(os.path.expanduser("~/.asx_env"))
 
-async def send_to_telegram(text):
-    """安全推送 Telegram 消息"""
-    if CHAT_ID == 0: 
-        print("ℹ️ 提示：未配置有效的 CHAT_ID，跳过 TG 发送。")
-        return
-    try:
-        # Telegram 单条消息上限是 4096 字符，这里加一层安全裁剪，防止塞爆
-        await tg_bot.send_message(chat_id=CHAT_ID, text=text[:4000])
-        print("✅ Telegram 消息推送成功！")
-    except Exception as e: 
-        print(f"❌ TG 发送失败: {e}")
+# 初始化 Gemini 客户端
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    print("❌ 错误：未在环境变量中找到 GEMINI_API_KEY")
+    sys.exit(1)
+
+client = genai.Client(api_key=api_key)
 
 async def run_pipeline_for_stock(ticker):
-    """
-    🌟 核心整改：每只股票独立享有完整的 Gemini 算力和 Token 额度，彻底杜绝截断
-    """
-    print(f"🔄 [数据端] 正在提取 {ticker} 的真实K线指标与实时新闻...")
-    raw_data = get_stock_comprehensive_data(ticker)
+    """为单只异动股运行完整的‘提取-生成-切割’流水线，带 10 分钟疯狗重试机制"""
+    print(f"\n🚀 开始处理股票: {ticker} ...")
     
-    print(f"🔄 [结构端] 正在为 {ticker} 拼装独立黄金 Prompt...")
-    final_prompt = serialize_to_prompt(raw_data)
-    
-    print(f"🧠 [AI端] 正在调用 gemini-2.5-flash 为 {ticker} 进行专有全矩阵内容生成...")
+    # 1. 提取最新的全盘精细化量化与公告数据
+    try:
+        raw_data = data_collector.get_stock_comprehensive_data(ticker)
+        # 将数据组装成量化专家级 Prompt
+        prompt = data_collector.serialize_to_prompt(raw_data)
+    except Exception as e:
+        print(f"❌ 提取 {ticker} 数据失败: {e}")
+        return
+
+    # 配置高稳定性模型参数
+    config = types.GenerateContentConfig(
+        temperature=0.2,  # 调低随机性，逼迫 Gemini 严谨对齐数据
+        max_output_tokens=2500
+    )
+
+    # 2. 呼叫 Gemini 生产硬核报告（带抗拥堵重试）
     ai_report = None
-    
-    # 🌟 疯狗流抗压升级：每 30 秒轰炸一次，连续死磕 10 分钟（共 20 次）
-    max_retries = 20
-    retry_delay = 30
-    
-    for attempt in range(1, max_retries + 1):
+    max_duration = 600  # 极限抗死磕 10 分钟
+    retry_interval = 30  # 每 30 秒冲锋一次
+    start_time = time.time()
+    attempt = 1
+
+    print("🤖 正在呼叫 Gemini 量化专家大脑生产精炼评估报告...")
+    while time.time() - start_time < max_duration:
         try:
+            # 统一使用官方推荐的旗舰主力模型
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
-                contents=final_prompt,
-                config={
-                    'max_output_tokens': 3000,
-                    'temperature': 0.3
-                }
+                contents=prompt,
+                config=config
             )
-            ai_report = response.text
-            break # 只要抓到一次成功，立刻 break 终止循环，绝不多发一次请求！
+            if response.text:
+                ai_report = response.text
+                print(f"✅ Gemini 成功在第 {attempt} 次尝试中交卷！")
+                break
         except Exception as e:
-            if "503" in str(e) and attempt < max_retries:
-                print(f"⚠️ 警告：Google 付费机房持续大塞车 (503)。")
-                print(f"   ⚔️ 开启高频死磕：已等待 {retry_delay} 秒，即将进行第 {attempt}/{max_retries} 次冲锋...")
-                time.sleep(retry_delay)
+            error_msg = str(e)
+            print(f"⚠️ 🧠 Gemini 接口发生拥堵 (尝试 {attempt}): {error_msg}")
+            
+            # 触发 503 核心熔断自愈：如果是谷歌服务器波动，立刻无脑重试
+            if "503" in error_msg or "ResourceExhausted" in error_msg or "Overloaded" in error_msg:
+                print(f"🔄 触发抗拥堵机制：系统将在 {retry_interval} 秒后再次疯狂冲锋...")
+                await asyncio.sleep(retry_interval)
+                attempt += 1
+                continue
             else:
-                print(f"❌ {ticker} 历经 {attempt} 次疯狂死磕后依然遭遇致命错误: {e}")
-                return
+                # 遇到非服务器波动的硬性错误（如 Prompt 语法错误），直接终止，防止浪费 Token
+                print("❌ 触发硬性错误，放弃重试。")
+                break
 
     if not ai_report:
-        print(f"⚠️ {ticker} 未能生成有效的 AI 报告，跳过分发。")
+        print(f"❌ 轰炸 10 分钟结束，Gemini 依旧瘫痪，放弃处理 {ticker}。")
         return
 
-    # 🌟 文本切分安全阀：确保即使格式微调也能正确抓取
+    # 3. 精密切割文本手术
+    print("✂️ 正在对 AI 原始长文进行多矩阵渠道切割分发...")
     parts = ai_report.split("#### 🔴 ")
     
-    tg_text, x_text, xhs_text = "", "", ""
+    platforms_data = {}
     for part in parts:
-        part = part.strip()
-        if not part: continue
-        
-        if part.startswith("PLATFORM_TELEGRAM"):
-            tg_text = part.replace("PLATFORM_TELEGRAM", "").strip()
-        elif part.startswith("PLATFORM_X"):
-            x_text = part.replace("PLATFORM_X", "").strip()
-        elif part.startswith("PLATFORM_XIAOHONGSHU"):
-            xhs_text = part.replace("PLATFORM_XIAOHONGSHU", "").strip()
+        if not part.strip(): continue
+        lines = part.split("\n")
+        header = lines[0].strip() # 提取 PLATFORM_TELEGRAM / PLATFORM_X 等标签
+        content = "\n".join(lines[1:]).strip()
+        platforms_data[header] = content
 
-    # 🚀 精准单独分发
-    if tg_text:
-        await send_to_telegram(f"【{ticker} 机构内参】\n\n" + tg_text)
-    else:
-        print(f"⚠️ 警告：未能成功解析出 {ticker} 的 Telegram 文案")
-
-    if x_text:
-        print(f"🖨️ [X 文案已就绪] 长度: {len(x_text)} 字")
-    if xhs_text:
-        print(f"🖨️ [小红书文案已就绪] 长度: {len(xhs_text)} 字")
+    # 4. 打印最终干净利落的硬核分发文本
+    print(f"\n================ 🏆 {ticker} 分渠道成品展示 ================")
+    if "PLATFORM_TELEGRAM" in platforms_data:
+        print(f"\n📬 [准备发往 Telegram 机构频道]:\n{platforms_data['PLATFORM_TELEGRAM']}\n")
+    if "PLATFORM_X" in platforms_data:
+        print(f"📬 [准备发往 X 推特短讯]:\n{platforms_data['PLATFORM_X']}\n")
+    if "PLATFORM_XIAOHONGSHU" in platforms_data:
+        print(f"📬 [准备发往 小红书 爆款池]:\n{platforms_data['PLATFORM_XIAOHONGSHU']}\n")
+    print("========================================================\n")
 
 async def main():
-    print("====== ASX 自动多矩阵自媒体生产线启动 ======")
+    print("🏁 动态量化天网流水线总闸开启...")
     
-    # 1. 自动筛选今日最具增值、暴动潜力的 3 只股票
-    top_stocks = get_top_asx_movers(limit=3)
+    # 从全新重构的 ASX 漏斗中捞出当天真正的野生前 3 名异动股
+    top_stocks = data_collector.get_top_asx_movers(limit=3)
     
+    # 🌟 核心防御：如果今天遇上公众假期或大盘没有任何异动，这里拿到的 top_stocks 就是 []
+    # 循环不会执行，直接优雅退场，不浪费一丁点 Token！
     if not top_stocks:
-        print("ℹ️ 今日市场平静，未扫描到满足异动条件的标的。")
+        print("🏁 全盘无异动数据，流水线安全打卡当下班，未触发任何 AI 计费。")
         return
-        
-    # 2. 依次灌入管道处理（单件流，1只处理完再进下1只）
+
     for stock in top_stocks:
-        print(f"\n🚀 === 开始独立处理标的: {stock['ticker']} ===")
+        # 顺次安全处理每只被锁定的野生黑马
         await run_pipeline_for_stock(stock['ticker'])
-        print(f"🏁 === 标的 {stock['ticker']} 处理完毕 ===")
-        time.sleep(3) # 留出 3 秒给服务器喘息，防止触发高频风控
+        # 渠道间适当休眠，保护服务器
+        await asyncio.sleep(2)
         
-    print("\n====== 今日全矩阵内容全自动化生产完毕！====== ")
+    print("🎉 今日所有黑马股量化内参全部生产完毕！")
 
 if __name__ == "__main__":
     asyncio.run(main())
