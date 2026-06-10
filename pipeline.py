@@ -26,7 +26,8 @@ if not GEMINI_KEY or not TELEGRAM_TOKEN or CHAT_ID == 0:
     exit(1)
 
 # 后面的初始化客户端和 main() 保持不变...
-
+# 3. 初始化全新一代 Gemini 客户端（2026年标准 SDK）
+client = genai.Client(api_key=GEMINI_KEY)
 
 # 4. 初始化 Telegram Bot 客户端
 tg_bot = Bot(token=TELEGRAM_TOKEN)
