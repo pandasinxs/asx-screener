@@ -55,14 +55,14 @@ async def main():
     print(f"🧠 [Step 3] 正在调用 gemini-2.5-flash 启动思维链推理（Thinking）...")
         try:
     # 使用 2026 SDK 推荐的更健壮的 config 字典传参法，彻底避开 types 属性冲突
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=final_prompt,
-        config={
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=final_prompt,
+            config={
             'max_output_tokens': 1200,
             'temperature': 0.3
-            }
-        )
+                    }
+                )
 
         ai_report = response.text
         
