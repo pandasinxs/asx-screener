@@ -48,7 +48,7 @@ def get_top_asx_movers(limit=3):
 def get_stock_comprehensive_data(ticker):
     """（保持原有的 yfinance 历史K线和数据抓取逻辑，无需修改）"""
     stock = yf.Ticker(ticker)
-    hist = stock.history(period="6m")
+    hist = stock.history(period="6mo")
     
     financials = {}
     try: financials['income_stmt'] = stock.income_stmt.to_dict()
