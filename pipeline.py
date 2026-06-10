@@ -25,9 +25,12 @@ if not GEMINI_KEY or not TELEGRAM_TOKEN or CHAT_ID == 0:
     print("\n💡 提示：如果依然显示缺失，请在服务器终端运行一次你的系统变量载入指令（如 source ~/.bashrc）。")
     exit(1)
 
-# 后面的初始化客户端和 main() 保持不变...
 # 3. 初始化全新一代 Gemini 客户端（2026年标准 SDK）
-client = genai.Client(api_key=GEMINI_KEY)
+# 🌟 核心：通过 http_options 彻底切换到全球付费独享节点的生产级网络（v1beta 生产网关）
+client = genai.Client(
+    api_key=GEMINI_KEY,
+    http_options={'api_version': 'v1'}
+)
 
 # 4. 初始化 Telegram Bot 客户端
 tg_bot = Bot(token=TELEGRAM_TOKEN)
