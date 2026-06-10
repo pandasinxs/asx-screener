@@ -52,19 +52,18 @@ async def main():
     print(f"🔄 [Step 2] 正在拼装黄金推理 Prompt...")
     final_prompt = serialize_to_prompt(raw_data)
     
-    # 设置防说死安全熔断，降低温度（0.3）确保财务推理高度严谨
-    config = types.GenerationConfig(
-        max_output_tokens=1200,
-        temperature=0.3,
-    )
-    
     print(f"🧠 [Step 3] 正在调用 gemini-2.5-flash 启动思维链推理（Thinking）...")
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=final_prompt,
-            config=config
+        try:
+    # 使用 2026 SDK 推荐的更健壮的 config 字典传参法，彻底避开 types 属性冲突
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=final_prompt,
+        config={
+            'max_output_tokens': 1200,
+            'temperature': 0.3
+            }
         )
+
         ai_report = response.text
         
         print("\n" + "="*20 + " AI 交易内参产出 " + "="*20)
