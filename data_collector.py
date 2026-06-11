@@ -7,17 +7,23 @@ import yfinance as yf
 
 def get_top_asx_movers(limit=3):
     """
-    📡 【1. 选股发动机：全盘量化扫描雷达】
-    拦截全交易所前60名涨幅榜与60条最新敏感公告，通过 5M 市值死穴与 3万 换手线，
-    利用 [绝对涨跌幅 * log10(真实成交额)] 复合评分机制筛选出最具持续性的前 3 只黑马。
+    📡 【1. 选股发动机：全盘量化扫描雷达 - 强力防封防漏版】
+    拦截全交易所前60名涨幅榜与60条最新敏感公告，通过 5M 市值死穴与 3万 换手线。
     """
     today_str = datetime.now().strftime("%Y-%m-%d")
     print(f"📡 [ASX资金动能网关] 基准日期: {today_str} | 正在读取官方实时排行榜...")
     
     url_movers = "https://www.asx.com.au/asx/research/v1/movers"
     url_ann = "https://www.asx.com.au/asx/research/v1/announcements"
+    
+    # 🛡️ 升级为全套高拟真浏览器指纹（增加 Referer & 语言包，大幅降低 403 概率）
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+        "Referer": "https://www.asx.com.au/",
+        "Origin": "https://www.asx.com.au",
+        "Connection": "keep-alive"
     }
     raw_candidates = {}
 
@@ -25,6 +31,7 @@ def get_top_asx_movers(limit=3):
     try:
         params_movers = {"itemsPerPage": 60, "sort": "PricePercentChange", "direction": "Descending"}
         response = requests.get(url_movers, params=params_movers, headers=headers, timeout=12)
+        
         if response.status_code == 200:
             movers_items = response.json().get("data", {}).get("items", [])
             print(f"📋 成功捕获 {len(movers_items)} 只 ASX 官方榜单高动能股票...")
@@ -39,15 +46,20 @@ def get_top_asx_movers(limit=3):
                         "volume": int(item.get("volume", 0)),
                         "market_cap": float(item.get("marketCap", 0) or item.get("marketCapitalisation", 0))
                     }
+        else:
+            # 🚨 核心改动：如果是403或其他，直接在日志里咆哮，不让它装死
+            print(f"❌ 警告：ASX 排行榜接口请求失败！状态码: [{response.status_code}]。如果是403，说明云服务器机房IP被官网防火墙无情拉黑了！")
+            
     except Exception as e:
-        print(f"⚠️ 拦截官方排行榜失败: {e}")
+        print(f"⚠️ 拦截官方排行榜异常炸裂: {e}")
 
-    # Step 2. 扫描官网敏感公告大厅前 60 条（补充当天突发重磅但尚未挤进涨幅榜的股票）
+    # Step 2. 扫描官网敏感公告大厅前 60 条
     try:
         params_ann = {"itemsPerPage": 60, "page": 0, "marketSensitive": "true"}
         response = requests.get(url_ann, params=params_ann, headers=headers, timeout=12)
         if response.status_code == 200:
             items = response.json().get("data", {}).get("items", [])
+            print(f"📋 成功捕获 {len(items)} 条突发敏感公告大厅快讯...")
             for item in items:
                 pub_time = item.get("dateAndTime", "")[:10]
                 if pub_time == today_str:
@@ -58,8 +70,10 @@ def get_top_asx_movers(limit=3):
                             raw_candidates[full_ticker] = {
                                 "ticker": full_ticker, "last_close": 0, "pct_change": 0, "volume": 0, "market_cap": 0
                             }
+        else:
+            print(f"❌ 警告：ASX 敏感公告接口请求失败！状态码: [{response.status_code}]")
     except Exception as e:
-        print(f"⚠️ 敏感公告雷达接入异常: {e}")
+        print(f"⚠️ 敏感公告雷达接入异常炸裂: {e}")
 
     print(f"🎯 正在执行基于资金与动能双因子的量化过滤与清洗...")
     final_movers = []
@@ -71,7 +85,6 @@ def get_top_asx_movers(limit=3):
             vol = asx_data["volume"]
             pct = asx_data["pct_change"]
             
-            # 补全缺失指标
             if m_cap == 0 or price == 0 or vol == 0:
                 stock = yf.Ticker(ticker)
                 info = stock.info
@@ -83,12 +96,10 @@ def get_top_asx_movers(limit=3):
                 if len(hist_2d) >= 2 and pct == 0:
                     pct = ((hist_2d['Close'].iloc[-1] - hist_2d['Close'].iloc[-2]) / hist_2d['Close'].iloc[-2]) * 100
 
-            # 🛠️ 铁血准入双滤网
             if m_cap < 5000000: continue    # 门槛 1：微盘仙股生死线放宽至 5M AUD
             turnover = price * vol
             if turnover < 30000: continue    # 门槛 2：单日成交换手活跃度放宽至 3万 AUD
             
-            # 🌟 对数资金加权评分机制
             score = abs(pct) * math.log10(turnover)
             
             final_movers.append({
@@ -101,11 +112,12 @@ def get_top_asx_movers(limit=3):
     top_selected = final_movers[:limit]
     
     if not top_selected:
-        print(f"🛑 [量化熔断] 今日市场上无任何股票满足双因子准入逻辑。")
+        print(f"🛑 [量化熔断] 今日市场上无任何股票满足双因子准入逻辑（当前捕获池候选股数量: {len(raw_candidates)} 只）。")
         return []
         
     print(f"🏆 [动能王座锁定] 今日锁定高质量异动目标: {[m['ticker'] for m in top_selected]}")
     return top_selected
+
 
 def get_asx_official_announcements(ticker_short):
     """
