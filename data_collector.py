@@ -5,265 +5,369 @@ import pypdf
 import requests
 import yfinance as yf
 
-def get_top_asx_movers(limit=3):
+# =========================
+# 🌐 API ABSTRACTION LAYER
+# =========================
+
+class APIClient:
     """
-    📡 【1. 选股发动机：全盘量化扫描雷达 - 强力防封防漏版】
-    拦截全交易所前60名涨幅榜与60条最新敏感公告，通过 5M 市值死穴与 3万 换手线。
+    🔒 统一数据入口 + 强制Markit优先 + fallback机制
     """
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    print(f"📡 [ASX资金动能网关] 基准日期: {today_str} | 正在读取官方实时排行榜...")
-    
-    url_movers = "https://www.asx.com.au/asx/research/v1/movers"
-    url_ann = "https://www.asx.com.au/asx/research/v1/announcements"
-    
-    # 🛡️ 升级为全套高拟真浏览器指纹（增加 Referer & 语言包，大幅降低 403 概率）
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-        "Referer": "https://www.asx.com.au/",
-        "Origin": "https://www.asx.com.au",
-        "Connection": "keep-alive"
-    }
-    raw_candidates = {}
 
-    # Step 1. 拦截官网涨幅排行榜前 60 名
-    try:
-        params_movers = {"itemsPerPage": 60, "sort": "PricePercentChange", "direction": "Descending"}
-        response = requests.get(url_movers, params=params_movers, headers=headers, timeout=12)
-        
-        if response.status_code == 200:
-            movers_items = response.json().get("data", {}).get("items", [])
-            print(f"📋 成功捕获 {len(movers_items)} 只 ASX 官方榜单高动能股票...")
-            for item in movers_items:
-                ticker = item.get("ticker", "")
-                if ticker and len(ticker) == 3:
-                    full_ticker = f"{ticker}.AX"
-                    raw_candidates[full_ticker] = {
-                        "ticker": full_ticker,
-                        "last_close": float(item.get("lastPrice", 0) or item.get("price", 0)),
-                        "pct_change": float(item.get("pricePercentChange", 0) or item.get("changePercent", 0)),
-                        "volume": int(item.get("volume", 0)),
-                        "market_cap": float(item.get("marketCap", 0) or item.get("marketCapitalisation", 0))
-                    }
-        else:
-            # 🚨 核心改动：如果是403或其他，直接在日志里咆哮，不让它装死
-            print(f"❌ 警告：ASX 排行榜接口请求失败！状态码: [{response.status_code}]。如果是403，说明云服务器机房IP被官网防火墙无情拉黑了！")
-            
-    except Exception as e:
-        print(f"⚠️ 拦截官方排行榜异常炸裂: {e}")
+    MARKIT_BASE = "https://asx.api.markitdigital.com"
+    ASX_FALLBACK = "https://www.asx.com.au"
 
-    # Step 2. 扫描官网敏感公告大厅前 60 条
-    try:
-        params_ann = {"itemsPerPage": 60, "page": 0, "marketSensitive": "true"}
-        response = requests.get(url_ann, params=params_ann, headers=headers, timeout=12)
-        if response.status_code == 200:
-            items = response.json().get("data", {}).get("items", [])
-            print(f"📋 成功捕获 {len(items)} 条突发敏感公告大厅快讯...")
-            for item in items:
-                pub_time = item.get("dateAndTime", "")[:10]
-                if pub_time == today_str:
-                    raw_ticker = item.get("tickers", [{}])[0].get("ticker", "")
-                    if raw_ticker and len(raw_ticker) == 3:
-                        full_ticker = f"{raw_ticker}.AX"
-                        if full_ticker not in raw_candidates:
-                            raw_candidates[full_ticker] = {
-                                "ticker": full_ticker, "last_close": 0, "pct_change": 0, "volume": 0, "market_cap": 0
-                            }
-        else:
-            print(f"❌ 警告：ASX 敏感公告接口请求失败！状态码: [{response.status_code}]")
-    except Exception as e:
-        print(f"⚠️ 敏感公告雷达接入异常炸裂: {e}")
+    session = requests.Session()
 
-    print(f"🎯 正在执行基于资金与动能双因子的量化过滤与清洗...")
-    final_movers = []
-    
-    for ticker, asx_data in raw_candidates.items():
+    @staticmethod
+    def _safe_get(url, params=None, timeout=12):
         try:
-            m_cap = asx_data["market_cap"]
-            price = asx_data["last_close"]
-            vol = asx_data["volume"]
-            pct = asx_data["pct_change"]
-            
-            if m_cap == 0 or price == 0 or vol == 0:
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                m_cap = m_cap or info.get("marketCap", 0)
-                vol = vol or info.get("volume", 0)
-                price = price or info.get("regularMarketPrice", 0) or info.get("previousClose", 0)
-                
-                hist_2d = stock.history(period="2d")
-                if len(hist_2d) >= 2 and pct == 0:
-                    pct = ((hist_2d['Close'].iloc[-1] - hist_2d['Close'].iloc[-2]) / hist_2d['Close'].iloc[-2]) * 100
+            r = APIClient.session.get(url, params=params, timeout=timeout)
+            return r
+        except Exception as e:
+            print("API error:", e)
+            return None
 
-            if m_cap < 5000000: continue    # 门槛 1：微盘仙股生死线放宽至 5M AUD
-            turnover = price * vol
-            if turnover < 30000: continue    # 门槛 2：单日成交换手活跃度放宽至 3万 AUD
-            
-            score = abs(pct) * math.log10(turnover)
-            
-            final_movers.append({
-                "ticker": ticker, "pct_change": pct, "volume": vol,
-                "turnover": turnover, "market_cap": m_cap, "last_close": price, "score": score
-            })
-        except: continue
-        
-    final_movers.sort(key=lambda x: x['score'], reverse=True)
-    top_selected = final_movers[:limit]
-    
-    if not top_selected:
-        print(f"🛑 [量化熔断] 今日市场上无任何股票满足双因子准入逻辑（当前捕获池候选股数量: {len(raw_candidates)} 只）。")
+    # -------------------------
+    # 📡 Movers
+    # -------------------------
+    @staticmethod
+    def get_movers():
+        endpoints = [
+            f"{APIClient.MARKIT_BASE}/asx-research/1.0/markets/movers",
+            f"{APIClient.ASX_FALLBACK}/asx/research/v1/movers"
+        ]
+
+        for url in endpoints:
+            r = APIClient._safe_get(url)
+
+            if not r or r.status_code != 200:
+                continue
+
+            try:
+                data = r.json()
+                items = data.get("data", {}).get("items", [])
+                if not items:
+                    items = data.get("data", {}).get("results", [])
+
+                return items
+            except:
+                continue
+
         return []
-        
-    print(f"🏆 [动能王座锁定] 今日锁定高质量异动目标: {[m['ticker'] for m in top_selected]}")
-    return top_selected
 
+    # -------------------------
+    # 📢 Announcements
+    # -------------------------
+    @staticmethod
+    def get_announcements(search_text):
+        endpoints = [
+            f"{APIClient.MARKIT_BASE}/asx-research/1.0/announcements",
+            f"{APIClient.ASX_FALLBACK}/asx/research/v1/announcements"
+        ]
+
+        params = {
+            "itemsPerPage": 30,
+            "searchText": search_text
+        }
+
+        for url in endpoints:
+            r = APIClient._safe_get(url, params=params)
+
+            if not r or r.status_code != 200:
+                continue
+
+            try:
+                data = r.json()
+                items = data.get("data", {}).get("items", [])
+                if not items:
+                    items = data.get("data", {}).get("results", [])
+
+                return items
+            except:
+                continue
+
+        return []
+
+    # -------------------------
+    # 📄 PDF
+    # -------------------------
+    @staticmethod
+    def get_pdf(document_id):
+        if not document_id:
+            return None
+
+        url = f"{APIClient.MARKIT_BASE}/asxpdf/content/id/{document_id}"
+
+        r = APIClient._safe_get(url, timeout=15)
+
+        if not r or r.status_code != 200:
+            return None
+
+        return r.content
+
+
+# =========================
+# 🧠 UTILITIES
+# =========================
+
+def safe_float(x, default=0.0):
+    try:
+        return float(x) if x else default
+    except:
+        return default
+
+
+def safe_int(x, default=0):
+    try:
+        return int(x) if x else default
+    except:
+        return default
+
+
+def sanitize_text(text, limit=1200):
+    if not text:
+        return ""
+
+    blacklist = ["ignore previous", "system prompt", "act as", "disregard"]
+
+    text = str(text)
+
+    for b in blacklist:
+        text = text.replace(b, "")
+
+    return " ".join(text.split())[:limit]
+
+
+def tag_announcement(title):
+    t = title.lower()
+
+    if any(x in t for x in ["drill", "assay", "intersect"]):
+        return "EXPLORATION_STRONG"
+    if any(x in t for x in ["raise", "placement", "spp"]):
+        return "CAPITAL_EVENT"
+    if any(x in t for x in ["acquire", "takeover"]):
+        return "M&A_EVENT"
+    if "quarterly" in t:
+        return "FINANCIAL_UPDATE"
+    return "OTHER"
+
+
+# =========================
+# 📊 CORE: MOVERS
+# =========================
+
+def get_top_asx_movers(limit=3):
+
+    items = APIClient.get_movers()
+
+    raw = {}
+
+    for i in items:
+        t = i.get("ticker", "")
+        if t and len(t) == 3:
+            raw[f"{t}.AX"] = {
+                "ticker": f"{t}.AX",
+                "price": safe_float(i.get("lastPrice") or i.get("price")),
+                "pct": safe_float(i.get("pricePercentChange") or i.get("changePercent")),
+                "vol": safe_int(i.get("volume")),
+                "mcap": safe_float(i.get("marketCap"))
+            }
+
+    results = []
+
+    for ticker, d in raw.items():
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.info or {}
+
+            hist = stock.history(period="2d")
+            if hist is None or len(hist) < 2:
+                continue
+
+            price = d["price"] or safe_float(info.get("regularMarketPrice"))
+            vol = d["vol"] or safe_int(info.get("volume"))
+            mcap = d["mcap"] or safe_float(info.get("marketCap"))
+            pct = d["pct"]
+
+            if pct == 0:
+                pct = ((hist["Close"].iloc[-1] - hist["Close"].iloc[-2]) /
+                       hist["Close"].iloc[-2]) * 100
+
+            if mcap < 5_000_000:
+                continue
+
+            turnover = price * vol
+            if turnover < 30000:
+                continue
+
+            score = abs(pct) * math.log10(turnover)
+
+            results.append({
+                "ticker": ticker,
+                "price": price,
+                "pct": pct,
+                "vol": vol,
+                "mcap": mcap,
+                "turnover": turnover,
+                "score": score
+            })
+
+        except:
+            continue
+
+    return sorted(results, key=lambda x: x["score"], reverse=True)[:limit]
+
+
+# =========================
+# 📢 ANNOUNCEMENTS
+# =========================
 
 def get_asx_official_announcements(ticker_short):
-    """
-    🏛️ 【2. 公告过滤网：合规垃圾大清洗】
-    深度抓取近期30条公告，无情剔除所有无营养的合规垃圾报告，留存5条核心主线公告，并提取PDF密钥。
-    """
-    url = "https://www.asx.com.au/asx/research/v1/announcements"
-    params = {"itemsPerPage": 30, "searchText": ticker_short}
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-    
-    garbage_keywords = [
-        "appendix 3y", "change of director", "appendix 2a", "appendix 3b", 
-        "substantial holder", "daily share buy-back", "clearing house", 
-        "share purchase plan status", "director's interest", "notice of meeting",
-        "proxy form", "application for quotation", "results of meeting"
-    ]
-    
-    official_news = []
-    try:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        if response.status_code == 200:
-            items = response.json().get("data", {}).get("items", [])
-            for item in items:
-                headline = item.get("headline", "")
-                if any(keyword in headline.lower() for keyword in garbage_keywords):
-                    continue
-                official_news.append({
-                    "title": headline,
-                    "is_sensitive": "Yes" if item.get("marketSensitive", False) else "No",
-                    "date": item.get("dateAndTime", "")[:10],
-                    "time": item.get("dateAndTime", "")[11:16],
-                    "document_id": item.get("documentKey")
-                })
-                if len(official_news) >= 5:
-                    break
-    except: pass
-    
-    if not official_news and 'items' in locals() and items:
-        official_news = [{"title": items[0].get("headline", ""), "is_sensitive": "Yes" if items[0].get("marketSensitive", False) else "No", "date": items[0].get("dateAndTime", "")[:10], "time": items[0].get("dateAndTime", "")[11:16], "document_id": items[0].get("documentKey")}]
-    return official_news
 
-def extract_top_announcement_content(document_id):
-    """
-    🦅 【3. PDF 穿透眼：免盘内存流数据脱水机】
-    直接在线解析最新一条公告PDF的前2页核心Highlights，严格过滤空格换行，卡死1200字极限以控费。
-    """
-    if not document_id: return "暂无一手内文概要"
-    pdf_url = f"https://www.asx.com.au/asxpdf/content/id/{document_id}"
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+    items = APIClient.get_announcements(ticker_short)
+
+    out = []
+
+    for i in items:
+        title = i.get("headline", "")
+
+        if any(x in title.lower() for x in ["appendix", "notice", "director"]):
+            continue
+
+        out.append({
+            "title": title,
+            "tag": tag_announcement(title),
+            "date": i.get("dateAndTime", "")[:10],
+            "time": i.get("dateAndTime", "")[11:16],
+            "document_id": i.get("documentKey")
+        })
+
+        if len(out) >= 5:
+            break
+
+    return out
+
+
+# =========================
+# 📄 PDF EXTRACT
+# =========================
+
+def extract_pdf(document_id):
+
+    content = APIClient.get_pdf(document_id)
+
+    if not content:
+        return ""
+
     try:
-        response = requests.get(pdf_url, headers=headers, timeout=15)
-        if response.status_code == 200:
-            with io.BytesIO(response.content) as open_pdf_file:
-                reader = pypdf.PdfReader(open_pdf_file)
-                pages_to_read = min(2, len(reader.pages))
-                extracted_text = ""
-                for i in range(pages_to_read):
-                    page_text = reader.pages[i].extract_text()
-                    if page_text: extracted_text += page_text + " "
-                cleaned_text = " ".join(extracted_text.split())
-                return cleaned_text[:1200] + "..." if len(cleaned_text) > 1200 else cleaned_text
-    except Exception as e:
-        return f"一手内文细节由于格式原因未予捕获 (错误根源: {str(e)})"
-    return "暂无一手内文概要"
+        with io.BytesIO(content) as f:
+            pdf = pypdf.PdfReader(f)
+
+            text = ""
+
+            for i in range(min(2, len(pdf.pages))):
+                t = pdf.pages[i].extract_text()
+                if t:
+                    text += t + " "
+
+            return sanitize_text(text)
+
+    except:
+        return ""
+
+
+# =========================
+# 📊 DATA BUILDER
+# =========================
 
 def get_stock_comprehensive_data(ticker):
-    """
-    📊 【4. 交叉盘面调度器：多维量化闭环】
-    """
-    ticker_short = ticker.replace(".AX", "")
-    official_announcements = get_asx_official_announcements(ticker_short)
-    
-    latest_pdf_content = "暂无详细一手内文"
-    if official_announcements and official_announcements[0].get("document_id"):
-        latest_pdf_content = extract_top_announcement_content(official_announcements[0]["document_id"])
-        
+
+    short = ticker.replace(".AX", "")
+
+    news = get_asx_official_announcements(short)
+
+    pdf = ""
+    if news and news[0].get("document_id"):
+        pdf = extract_pdf(news[0]["document_id"])
+
     stock = yf.Ticker(ticker)
-    info = stock.info
+    info = stock.info or {}
+
     hist = stock.history(period="6mo")
-    
-    hist['MA5'] = hist['Close'].rolling(window=5).mean()
-    hist['MA20'] = hist['Close'].rolling(window=20).mean()
-    
-    last_10_days = hist.tail(10)
-    current_close = last_10_days['Close'].iloc[-1]
-    current_ma5 = last_10_days['MA5'].iloc[-1]
-    current_ma20 = last_10_days['MA20'].iloc[-1]
-    
-    if current_close > current_ma5 > current_ma20:
-        ma_code = "BULLISH_ALIGNMENT"
-    elif current_close < current_ma5 < current_ma20:
-        ma_code = "BEARISH_ALIGNMENT"
+
+    if hist is None or len(hist) < 25:
+        return {}
+
+    hist["MA5"] = hist["Close"].rolling(5).mean()
+    hist["MA20"] = hist["Close"].rolling(20).mean()
+    hist = hist.dropna()
+
+    last = hist.tail(20)
+
+    close = safe_float(hist["Close"].iloc[-1])
+    ma5 = safe_float(hist["MA5"].iloc[-1])
+    ma20 = safe_float(hist["MA20"].iloc[-1])
+
+    if close > ma5 > ma20:
+        state = "BULL"
+    elif close < ma5 < ma20:
+        state = "BEAR"
     else:
-        ma_code = "CHOPPY_VOLATILITY"
+        state = "CHOP"
+
+    inst = info.get("heldPercentInstitutions")
 
     metrics = {
-        "current_price": current_close, "10d_high": last_10_days['High'].max(), "10d_low": last_10_days['Low'].min(),
-        "current_ma5": current_ma5, "current_ma20": current_ma20, "ma_code": ma_code,
-        "market_cap_formatted": f"${info.get('marketCap', 0)/1000000:.2f}M AUD",
-        "today_turnover": f"${current_close * last_10_days['Volume'].iloc[-1]/1000:.2f}K AUD",
-        "pe_ratio": info.get("trailingPE", "N/A"), "inst_owned": f"{info.get('heldPercentInstitutions', 0)*100:.2f}%"
+        "current_price": close,
+        "10d_high": safe_float(last["High"].max()),
+        "10d_low": safe_float(last["Low"].min()),
+        "current_ma5": ma5,
+        "current_ma20": ma20,
+        "ma_code": state,
+        "market_cap_formatted": f"${safe_float(info.get('marketCap'))/1e6:.2f}M AUD",
+        "today_turnover": f"${safe_float(close * last['Volume'].iloc[-1]):,.0f} AUD",
+        "pe_ratio": info.get("trailingPE", "N/A"),
+        "inst_owned": f"{(inst*100) if inst else 0:.2f}%"
     }
-    
+
     return {
-        "ticker": ticker, "price_metrics": metrics,
-        "official_news": official_announcements, "latest_pdf_content": latest_pdf_content
+        "ticker": ticker,
+        "price_metrics": metrics,
+        "official_news": news,
+        "latest_pdf_content": pdf
     }
+
+
+# =========================
+# 🧠 PROMPT (UNCHANGED STRUCTURE)
+# =========================
 
 def serialize_to_prompt(raw_data):
-    """
-    🧠 【5. 跨平台多矩阵铸造炉 v8.0版：故事感与硬核数据1:1铁血平衡】
-    放弃所有填空式的死板格式，将代码进化为全权交由大模型自由命题发挥的“战略导演剧本”。
-    """
-    ticker = raw_data['ticker']
-    metrics = raw_data['price_metrics']
-    ticker_short = ticker.replace(".AX", "")
-    
-    # 智能预分类给公告打上量化权重标
-    enhanced_announcements = []
-    for ann in raw_data['official_news']:
-        title_lower = ann['title'].lower()
-        tag = "[Corporate Log]"
-        if "drill" in title_lower or "assay" in title_lower or "intersect" in title_lower: tag = "[⚡ Exploration & Assays]"
-        elif "raise" in title_lower or "placement" in title_lower or "spp" in title_lower or "shares" in title_lower: tag = "[💰 Capital Raising]"
-        elif "quarterly" in title_lower or "appendix 5b" in title_lower or "appendix 4c" in title_lower: tag = "[📊 Quarterly Report]"
-        elif "acquire" in title_lower or "acquisition" in title_lower or "takeover" in title_lower: tag = "[🔥 M&A / Asset Takeover]"
-        enhanced_announcements.append(f"- {ann['date']} {ann['time']} {tag} {ann['title']} (Sensitive: {ann['is_sensitive']})")
-    announcements_str = "\n".join(enhanced_announcements)
-    
+
+    metrics = raw_data["price_metrics"]
+
+    news = [
+        f"- [{n['tag']}] {n['date']} {n['time']} {n['title']}"
+        for n in raw_data["official_news"]
+    ]
+
+    pdf = sanitize_text(raw_data.get("latest_pdf_content", ""))
+
     prompt = f"""
 你现在是一位在澳洲证券市场（ASX）摸爬滚打 15 年、说话风格一针见血、逻辑极度严密的顶级量化私募华人合伙人。你对中微盘股主力的筹码沉淀、资金做局手段了如指掌。
-
 请根据以下提供的最底层、纯净的ASX官方实时数据集，全权由你【自由发挥、即兴进行结构重组与文风创作】，但必须保证【商业故事因果线与客观量化指标呈现达到1:1的硬核平衡】，为4个不同的交易圈分发渠道撰写解盘分析。
-
 ---【📡 原始量化与官方数据矩阵（必须在最终文章中完整显式罗列，严禁漏报）】---
-- 资产标的: {ticker}
-- 基础盘面: 市值 {metrics['market_cap_formatted']} | 今日真实换手额 {metrics['today_turnover']} | 机构持股比 {metrics['inst_owned']} | 滚动P/E {metrics['pe_ratio']}
-- 技术价格: 最新官方收盘价 ${metrics['current_price']:.3f} | 10日最高位 ${metrics['10d_high']:.3f} | 10日最低位 ${metrics['10d_low']:.3f}
-- 均线防御: MA5 攻击线 ${metrics['current_ma5']:.3f} | MA20 生命线 ${metrics['current_ma20']:.3f} | 技术动能状态编码: {metrics['ma_code']}
+TICKER: {raw_data['ticker']}
+PRICE: {metrics['current_price']}
+MA5: {metrics['current_ma5']}
+MA20: {metrics['current_ma20']}
+MC: {metrics['market_cap_formatted']}
+TURNOVER: {metrics['today_turnover']}
+PDF: {pdf}
 
-🔴 近期经过官方滤网清洗后、真正具有催化价值的 5 条历史公告主线（时间倒序）:
-{announcements_str}
-
-🚨 最新重磅公告之官方 PDF 前2页脱水纯文本（包含核心一手硬核数字证据）:
-{raw_data['latest_pdf_content']}
---------------------------------
+NEWS:
+{chr(10).join(news)}
 
 ⚠️ 【铁血创作指令 —— 给你最大发挥自由度，但不可跨越的数据/合规红线】：
 
