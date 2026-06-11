@@ -184,6 +184,7 @@ def get_stock_comprehensive_data(ticker):
 def serialize_to_prompt(raw_data):
     ticker = raw_data['ticker']
     metrics = raw_data['price_metrics']
+    ticker_short = ticker.replace(".AX", "")
     
     prompt = f"""
 你现在是全球顶尖的量化私募机构首席分析师。请根据以下来自【ASX官方交易所】核心主导和【雅虎财经量化中心】辅助计算的交叉验证真实数据集，为 {ticker} 撰写精炼、无废话、纯数据驱动的复盘报告。
@@ -210,7 +211,7 @@ def serialize_to_prompt(raw_data):
 【📜 今日官方披露时间线与摘要分析】
 （请以具体日期时间为骨架，用 dot points 精简概括披露细节与背后动机，拒绝任何长篇大论的形容词）
 * {raw_data['official_news'][0]['date']} {raw_data['official_news'][0]['time']} - 最新合规披露：发行公告《{raw_data['official_news'][0]['title']}》（市场敏感度: {raw_data['official_news'][0]['is_sensitive']}）。核心摘要与分析：[2行字大白话指出该公告披露的核心财报数字/勘探深度/业务进展，并直接点明这代表主力在借利好出货还是机构合力吃饱]。
-* [若数据集里有第二条公告，按照述格式列出‘日期 时间 - 公告标题 + 摘要分析’。若今天只有一条公告，则在此列出该股票近期的历史重大事件线，并点明对今天盘面情绪的累积影响]。
+* [若数据集里有第二条公告，按照上述格式列出‘日期 时间 - 公告标题 + 摘要分析’。若今天只有一条公告，则在此列出该股票近期的历史重大事件线，并点明对今天盘面情绪的累积影响]。
 
 【📊 核心量化指标硬核验证】
 （直接罗列硬性指标，并给出基于该指标的交易可行度支撑，拒绝无数据支撑的废话）
@@ -219,15 +220,30 @@ def serialize_to_prompt(raw_data):
 * 筹码结构：机构持股比例为 {metrics['inst_owned']}，滚动市盈率为 {metrics['pe_ratio']}。[分析：一句话判定该股属于高度控盘股、还是散户游资混战股，进一步增强上述结论的可信度]。
 
 #### 🔴 PLATFORM_X
-（风格：数据流。首句直接给出【结论：买入/观望】和预测持续时间，随后列出最硬核的2条公告/均线数字证据。150字内，带3个标签。）
+📊 #{ticker_short} Quant Flow: [明确写出 建议买入 或 保持观望]
+🎯 Target Timeline: [精确预测持续几天或到本周末]
+📡 Catalyst: [15字内极简概括今日最新公告，如“突发高品位金矿重大发现”]
+💰 Money Flow: 今天真实换手金额飙升至 {metrics['today_turnover']}，主力资金[写明：强力吸筹 / 借利好出货]！
+📈 Metrics: Close ${metrics['current_price']:.3f} | {metrics['ma_status']}
+#ASX #AusShares #{ticker_short}
 
 #### 🔴 PLATFORM_XIAOHONGSHU
-【全盘扫描：今日ASX数据之王 {ticker} 应该买还是等？】
-别看大道理，直接看官方一手真凭实据！
-- 核心建议：[买入/观望]（预计行情持续至xx）
-- 关键时间线：{raw_data['official_news'][0]['date']} 官方突发公告《{raw_data['official_news'][0]['title']}》！这意味着：[用 dot point 给出大白话数据解释]
-- 硬核指标：市值 {metrics['market_cap_formatted']}，今天主力砸了 {metrics['today_turnover']}！均线处于{metrics['ma_status']}。
-  支撑位看 $xx.xx，阻力位看 $xx.xx！
-（用数据说话，段落极短，最后带5个标签）
+【📌 今日ASX异动暴风眼 {ticker}：究竟是主力陷阱还是躺赚密码？】
+
+🔥 搞钱第一步，先看官方一手真凭实据！拒绝小道消息，直接上私募级双因子量化拆解：
+
+🔹 核心动作指引：【建议买入 / 保持观望 / 坚决避雷】
+🔹 预期吃肉行情持续至：[给出明确预测时间线]
+
+📢【主力动作大曝光】
+{raw_data['official_news'][0]['date']} 官方最新敏感公告《{raw_data['official_news'][0]['title']}》！
+🤯 翻译成大白话就是：[用1行字直接撕开主力底牌，点明这是主力在借利好出货还是机构合力在吃饱]
+
+📊【硬核数据照妖镜】
+- 💰 资金肉搏：今天市场上真金白银砸了 {metrics['today_turnover']}！大资金换手承接力[极强/一般/较弱]。
+- 📈 筹码防线：当前股价 ${metrics['current_price']:.3f}，技术面处于【{metrics['ma_status']}】。
+- 🎯 防守看死：下方铁底支撑位精确看 **$xx.xx**，上方强阻力位精确看向 **$xx.xx**！
+
+#澳洲股票 #ASX #澳洲搞钱 #量化交易 #澳洲生活
 """
     return prompt
