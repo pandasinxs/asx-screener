@@ -1,148 +1,114 @@
-import yfinance as yf
-import pandas as pd
-import requests
-import math
+import io
+import os
 from datetime import datetime
-
-def get_top_asx_movers(limit=3):
-    """
-    🏛️ 私募级双因子版：全盘雷达 (扩容初筛+资金动能复合评分排序)
-    """
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    print(f"📡 [ASX资金动能网关 v5.5] 基准日期: {today_str} | 正在读取 1 手官方实时数据...")
-    
-    url_movers = "https://www.asx.com.au/asx/research/v1/movers"
-    url_ann = "https://www.asx.com.au/asx/research/v1/announcements"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-    }
-    
-    raw_candidates = {}
-
-    # 1. 拦截官网排行榜前 60 名
-    try:
-        params_movers = {"itemsPerPage": 60, "sort": "PricePercentChange", "direction": "Descending"}
-        response = requests.get(url_movers, params=params_movers, headers=headers, timeout=12)
-        if response.status_code == 200:
-            movers_items = response.json().get("data", {}).get("items", [])
-            print(f"📋 成功捕获 {len(movers_items)} 只 ASX 官方榜单高动能股票...")
-            for item in movers_items:
-                ticker = item.get("ticker", "")
-                if ticker and len(ticker) == 3:
-                    full_ticker = f"{ticker}.AX"
-                    raw_candidates[full_ticker] = {
-                        "ticker": full_ticker,
-                        "last_close": float(item.get("lastPrice", 0) or item.get("price", 0)),
-                        "pct_change": float(item.get("pricePercentChange", 0) or item.get("changePercent", 0)),
-                        "volume": int(item.get("volume", 0)),
-                        "market_cap": float(item.get("marketCap", 0) or item.get("marketCapitalisation", 0))
-                    }
-    except Exception as e:
-        print(f"⚠️ 拦截官方排行榜失败: {e}")
-
-    # 2. 扫描官网敏感公告大厅前 60 条
-    try:
-        params_ann = {"itemsPerPage": 60, "page": 0, "marketSensitive": "true"}
-        response = requests.get(url_ann, params=params_ann, headers=headers, timeout=12)
-        if response.status_code == 200:
-            items = response.json().get("data", {}).get("items", [])
-            for item in items:
-                pub_time = item.get("dateAndTime", "")[:10]
-                if pub_time == today_str:
-                    raw_ticker = item.get("tickers", [{}])[0].get("ticker", "")
-                    if raw_ticker and len(raw_ticker) == 3:
-                        full_ticker = f"{raw_ticker}.AX"
-                        if full_ticker not in raw_candidates:
-                            raw_candidates[full_ticker] = {
-                                "ticker": full_ticker, "last_close": 0, "pct_change": 0, "volume": 0, "market_cap": 0
-                            }
-    except Exception as e:
-        print(f"⚠️ 敏感公告雷达接入异常: {e}")
-
-    print(f"🎯 正在执行基于资金与动能双因子的量化过滤与清洗...")
-    final_movers = []
-    
-    for ticker, asx_data in raw_candidates.items():
-        try:
-            m_cap = asx_data["market_cap"]
-            price = asx_data["last_close"]
-            vol = asx_data["volume"]
-            pct = asx_data["pct_change"]
-            
-            if m_cap == 0 or price == 0 or vol == 0:
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                m_cap = m_cap or info.get("marketCap", 0)
-                vol = vol or info.get("volume", 0)
-                price = price or info.get("regularMarketPrice", 0) or info.get("previousClose", 0)
-                
-                hist_2d = stock.history(period="2d")
-                if len(hist_2d) >= 2 and pct == 0:
-                    pct = ((hist_2d['Close'].iloc[-1] - hist_2d['Close'].iloc[-2]) / hist_2d['Close'].iloc[-2]) * 100
-
-            # 🛠️ ASX 本土硬性双滤网
-            if m_cap < 5000000: continue  # 门槛 1：微盘生死线放宽至 5M AUD
-            
-            turnover = price * vol
-            if turnover < 30000: continue   # 门槛 2：换手活跃度放宽至 3万 AUD
-            
-            # 🌟 核心算法升级：引入对数资金加权评分 (防止纯刷单小微股或无动能超级大盘股霸榜)
-            # score = 绝对涨跌幅 * log10(真实成交额)
-            score = abs(pct) * math.log10(turnover)
-            
-            final_movers.append({
-                "ticker": ticker,
-                "pct_change": pct,
-                "volume": vol,
-                "turnover": turnover,
-                "market_cap": m_cap,
-                "last_close": price,
-                "score": score
-            })
-        except: continue
-        
-    # 🌟 核心升级：按照全新的“机构资金动能复合评分”进行降序大排名
-    final_movers.sort(key=lambda x: x['score'], reverse=True)
-    top_selected = final_movers[:limit]
-    
-    if not top_selected:
-        print(f"🛑 [量化熔断] 今日市场上无任何高含金量的股票满足双因子准入逻辑。")
-        return []
-        
-    print(f"🏆 [资金动能王座锁定] 今日最具爆发持续性的前 {len(top_selected)} 只高质量异动股: {[m['ticker'] for m in top_selected]}")
-    return top_selected
+import requests
+import yfinance as yf
+import pypdf  # 💡 确保已运行: pip install pypdf
 
 def get_asx_official_announcements(ticker_short):
-    """🏛️ 绝对核心：直连 ASX 官网提取最新 3 条权威合规公告"""
+    """
+    🏛️ 【公告控制塔】30条深度抓取 + 垃圾公告硬核清洗过滤网
+    """
     url = "https://www.asx.com.au/asx/research/v1/announcements"
-    params = {"itemsPerPage": 5, "searchText": ticker_short}
-    headers = {"User-Agent": "Mozilla/5.0"}
+    params = {"itemsPerPage": 30, "searchText": ticker_short}
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+    
+    # ❌ 铁血黑名单：只要标题包含这些无营养的合规垃圾词，直接就地过滤
+    garbage_keywords = [
+        "appendix 3y", "change of director", "appendix 2a", "appendix 3b", 
+        "substantial holder", "daily share buy-back", "clearing house", 
+        "share purchase plan status", "director's interest", "notice of meeting",
+        "proxy form", "application for quotation", "results of meeting"
+    ]
     
     official_news = []
     try:
         response = requests.get(url, params=params, headers=headers, timeout=10)
         if response.status_code == 200:
             items = response.json().get("data", {}).get("items", [])
-            for item in items[:3]:
+            
+            for item in items:
+                headline = item.get("headline", "")
+                headline_lower = headline.lower()
+                
+                # 执行黑名单洗网
+                if any(keyword in headline_lower for keyword in garbage_keywords):
+                    continue
+                
                 official_news.append({
-                    "title": item.get("headline", ""),
+                    "title": headline,
                     "is_sensitive": "Yes" if item.get("marketSensitive", False) else "No",
                     "date": item.get("dateAndTime", "")[:10],
-                    "time": item.get("dateAndTime", "")[11:16]
+                    "time": item.get("dateAndTime", "")[11:16],
+                    "document_id": item.get("documentKey")  # 用于下载PDF的唯一密钥
                 })
-    except: pass
+                
+                # 🎯 积攒够 5 条高含金量硬核主线公告即收网，防止塞爆 Prompt
+                if len(official_news) >= 5:
+                    break
+    except Exception as e:
+        print(f"[-] ASX公告抓取网络异常: {str(e)}")
+    
+    # 🪹 兜底机制：如果洗完发现一条硬核的都没有，说明这票近期确实在躺平，直接返回最近的 1 条
+    if not official_news and 'items' in locals() and items:
+        official_news = [{
+            "title": items[0].get("headline", ""),
+            "is_sensitive": "Yes" if items[0].get("marketSensitive", False) else "No",
+            "date": items[0].get("dateAndTime", "")[:10],
+            "time": items[0].get("dateAndTime", "")[11:16],
+            "document_id": items[0].get("documentKey")
+        }]
+        
     return official_news
 
-def get_stock_comprehensive_data(ticker):
-    """📊 多维数据闭环"""
-    ticker_short = ticker.replace(".AX", "")
-    official_announcements = get_asx_official_announcements(ticker_short)
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    if not official_announcements:
-        official_announcements = [{"title": "Regular trade volatility / Volume rebalancing", "is_sensitive": "No", "date": today_str, "time": "16:15"}]
+def extract_top_announcement_content(document_id):
+    """
+    🦅 【PDF 穿透眼】直接潜入ASX底层，免盘下载最新PDF并强行提取前2页核心Highlights
+    """
+    if not document_id:
+        return "暂无一手内文概要"
+        
+    pdf_url = f"https://www.asx.com.au/asxpdf/content/id/{document_id}"
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+    
+    try:
+        response = requests.get(pdf_url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            # 💡 直接在内存中以流的形式打开PDF，0磁盘IO，速度极快
+            with io.BytesIO(response.content) as open_pdf_file:
+                reader = pypdf.PdfReader(open_pdf_file)
+                
+                # 铁血防御：只读前 2 页（Highlights密集区），卡死 Token 成本
+                pages_to_read = min(2, len(reader.pages))
+                extracted_text = ""
+                for i in range(pages_to_read):
+                    page_text = reader.pages[i].extract_text()
+                    if page_text:
+                        extracted_text += page_text + " "
+                
+                # 粗暴清洗：压缩无用换行与空格
+                cleaned_text = " ".join(extracted_text.split())
+                # 最终安全截取前 1200 个字符（约 200 英文单词），双保险控费
+                return cleaned_text[:1200] + "..." if len(cleaned_text) > 1200 else cleaned_text
+    except Exception as e:
+        return f"一手内文细节由于格式或底层网络原因未予捕获 (错误根源: {str(e)})"
+    return "暂无一手内文概要"
 
+def get_stock_comprehensive_data(ticker):
+    """
+    📊 【量化多维闭环】ASX原生数据主导，状态编码化，挂载PDF脱水内文
+    """
+    ticker_short = ticker.replace(".AX", "")
+    
+    # 1. 拦截并处理公告数据链
+    official_announcements = get_asx_official_announcements(ticker_short)
+    
+    latest_pdf_content = "暂无详细一手内文"
+    if official_announcements and official_announcements[0].get("document_id"):
+        # ⚡ 核心质变：穿透提取最新一条核心公告的 PDF 前两页干货内文
+        latest_pdf_content = extract_top_announcement_content(official_announcements[0]["document_id"])
+
+    # 2. 调度 Yahoo Finance 补充计算量化因子
     stock = yf.Ticker(ticker)
     info = stock.info
     hist = stock.history(period="6mo")
@@ -155,12 +121,13 @@ def get_stock_comprehensive_data(ticker):
     current_ma5 = last_10_days['MA5'].iloc[-1]
     current_ma20 = last_10_days['MA20'].iloc[-1]
     
+    # 技术状态代码化，严禁AI主观判定
     if current_close > current_ma5 > current_ma20:
-        ma_status = "多头强攻排列（股价 > MA5 > MA20）"
+        ma_code = "BULLISH_ALIGNMENT"
     elif current_close < current_ma5 < current_ma20:
-        ma_status = "空头下行排列（股价 < MA5 < MA20）"
+        ma_code = "BEARISH_ALIGNMENT"
     else:
-        ma_status = "均线缠绕震荡"
+        ma_code = "CHOPPY_VOLATILITY"
 
     metrics = {
         "current_price": current_close,
@@ -168,7 +135,7 @@ def get_stock_comprehensive_data(ticker):
         "10d_low": last_10_days['Low'].min(),
         "current_ma5": current_ma5,
         "current_ma20": current_ma20,
-        "ma_status": ma_status,
+        "ma_code": ma_code,
         "market_cap_formatted": f"${info.get('marketCap', 0)/1000000:.2f}M AUD",
         "today_turnover": f"${current_close * last_10_days['Volume'].iloc[-1]/1000:.2f}K AUD",
         "pe_ratio": info.get("trailingPE", "N/A"),
@@ -178,72 +145,110 @@ def get_stock_comprehensive_data(ticker):
     return {
         "ticker": ticker,
         "price_metrics": metrics,
-        "official_news": official_announcements
+        "official_news": official_announcements,
+        "latest_pdf_content": latest_pdf_content
     }
 
 def serialize_to_prompt(raw_data):
+    """
+    🧠 【多矩阵内容铸造炉】精准对接4大终端，注入PDF核心前瞻，铁血防脑补与合规盾牌
+    """
     ticker = raw_data['ticker']
     metrics = raw_data['price_metrics']
     ticker_short = ticker.replace(".AX", "")
     
+    # 构建带量化预分类标签的公告简易路线图
+    enhanced_announcements = []
+    for ann in raw_data['official_news']:
+        title_lower = ann['title'].lower()
+        tag = "【经营动态】"
+        if "drill" in title_lower or "assay" in title_lower or "intersect" in title_lower:
+            tag = "【⚡ 核心勘探/技术重大进展】"
+        elif "raise" in title_lower or "placement" in title_lower or "spp" in title_lower or "shares" in title_lower:
+            tag = "【💰 资本运作/定向增发融资】"
+        elif "quarterly" in title_lower or "appendix 5b" in title_lower or "appendix 4c" in title_lower:
+            tag = "【📊 季度法定财报/现金流汇报】"
+        elif "acquire" in title_lower or "acquisition" in title_lower or "takeover" in title_lower:
+            tag = "【🔥 战略兼并/重大资产收购】"
+            
+        enhanced_announcements.append(f"- {ann['date']} {ann['time']} {tag} 《{ann['title']}》(市场敏感度: {ann['is_sensitive']})")
+        
+    announcements_str = "\n".join(enhanced_announcements)
+    
     prompt = f"""
-你现在是全球顶尖的量化私募机构首席分析师。请根据以下来自【ASX官方交易所】核心主导和【雅虎财经量化中心】辅助计算的交叉验证真实数据集，为 {ticker} 撰写精炼、无废话、纯数据驱动的复盘报告。
+你现在是拥有顶级法律合规与数据严谨意识的跨国量化私募机构首席分析师。请根据以下来自【ASX官方交易所】核心主导的真实硬核数据集，为 {ticker} 撰写4个不同渠道平台的复盘报告。
 
 ---【📡 ASX主导量化数据集】---
 股票代码: {ticker}
-原始基础面数据（源自ASX/Yahoo联合提供）：
 - 市值: {metrics['market_cap_formatted']} | 今日真实换手额: {metrics['today_turnover']} | 机构持股比: {metrics['inst_owned']} | 滚动市盈率 P/E: {metrics['pe_ratio']}
 - 官方收盘价: ${metrics['current_price']:.3f} | 10日最高/最低位: ${metrics['10d_high']:.3f} / ${metrics['10d_low']:.3f}
-技术面切片数据（源自Yahoo辅助均线计算）：
-- MA5 攻击线: ${metrics['current_ma5']:.3f} | MA20 生命线: ${metrics['current_ma20']:.3f} | 当前均线形态: {metrics['ma_status']}
+- MA5 攻击线: ${metrics['current_ma5']:.3f} | MA20 生命线: ${metrics['current_ma20']:.3f} | 均线编码: {metrics['ma_code']}
 
-🔴 ASX 交易所官网一手合规披露公告历史线 (按时间倒序): {raw_data['official_news']}
+🔴 ASX 交易所官网经过【量化滤网清洗】后、真正具有核心资讯价值的 5 条历史公告主线 (按时间倒序): 
+{announcements_str}
+
+🚨【核心突发】最新第一条敏感公告之官方PDF前2页脱水提炼内文（包含关键数字证据，若显示暂无则仅依标题推理）:
+{raw_data['latest_pdf_content']}
 --------------------------------
+
+⚠️ 铁血防脑补与 ASIC 澳洲证监会合规约束：
+1. 🛡️【使用防御性语言】：严禁无端联想因果。对无法百分之百确定的资本动机，必须使用“迹象表明”、“可能旨在”、“通常意味着”等中性专业词汇，严禁编造阴果故事。必须结合 PDF 提炼内文里的真实数据，禁止捏造财务或勘探数字。
+2. ❌【法律合规红线】：严禁给出目标价格（Target Price）及具体的推荐买入/卖出（Buy/Sell Recommendation）等主观投资建议。所有价格预测转化为“技术性阻力位”或“数据支撑位”。
 
 🎯 必须严格按照以下格式直接输出成品，严禁带有任何客套、总结或前言废话：
 
-#### 🔴 PLATFORM_TELEGRAM
-**⚖️ {ticker} 核心交易评估报告**
+#### 🔴 PLATFORM_TELEGRAM_CN
+**⚖️ {ticker} 核心交易评估报告 (中文版)**
 
-【核心结论与展望】
-明确判定：[给出明确指引：建议买入 / 保持观望 / 建议减持]，当前技术面及资金逻辑表明，[上涨/震荡/下跌] 走势预计将持续至[给出明确预测时间线，如未来x个交易日内 / 本周五收盘]。下一个核心催化剂事件预测发生在[明确预估一个日期段或核心事件，如：7月下旬探矿复检报告披露 / 8月年度财报]，该催化剂研判的核心逻辑在于[用1行字说清关键原因]。
+【核心动能研判】
+资金趋势：[研判当前是 强力多头攻势 / 资金流出防御 / 窄幅区间震荡]，当前技术形态预示此动能有望延续至[给出明确预测时间线，如：未来3个交易日内 / 本周五收盘]。下一个核心催化剂事件预计聚焦于[结合公告预估下一个大事件]，其量化核心传导逻辑在于[用1行字说清关键原因]。
 
-【📜 今日官方披露时间线与摘要分析】
-（请以具体日期时间为骨架，用 dot points 精简概括披露细节与背后动机，拒绝任何长篇大论的形容词）
-* {raw_data['official_news'][0]['date']} {raw_data['official_news'][0]['time']} - 最新合规披露：发行公告《{raw_data['official_news'][0]['title']}》（市场敏感度: {raw_data['official_news'][0]['is_sensitive']}）。核心摘要与分析：[2行字大白话指出该公告披露的核心财报数字/勘探深度/业务进展，并直接点明这代表主力在借利好出货还是机构合力吃饱]。
-* [若数据集里有第二条公告，按照上述格式列出‘日期 时间 - 公告标题 + 摘要分析’。若今天只有一条公告，则在此列出该股票近期的历史重大事件线，并点明对今天盘面情绪的累积影响]。
+【📜 官方披露时间线与量化演进】
+* 历史主线复盘：纵观该股近期的一系列合规披露，其核心脉络由以下节点构成：从早前的《[提及列表中较早的核心公告标题]》展现出的动作，到后续在《[提及中间的关键公告标题]》中的态势发展，最终延伸至今日的最新敏感披露《{raw_data['official_news'][0]['title']}》。这表明在客观层面上，资金近期正在围绕[结合打标分类与PDF提取的Highlights细节，用两句话客观解构这一系列事件是在推进主营业务，还是在进行资本层面的筹码洗牌，严禁瞎编故事]。
 
 【📊 核心量化指标硬核验证】
-（直接罗列硬性指标，并给出基于该指标的交易可行度支撑，拒绝无数据支撑的废话）
-* 市值与流动性验证：当前总市值 {metrics['market_cap_formatted']}，今日真实换手金额达 {metrics['today_turnover']}。[分析：说明该流动性水平是否具备散户及游资的短线换手承接力]。
-* 均线生命线与价格位置：最新收盘价 ${metrics['current_price']:.3f} 相比于 MA5 攻击线 (${metrics['current_ma5']:.3f}) 和 MA20 生命线 (${metrics['current_ma20']:.3f}) 呈现【{metrics['ma_status']}】状态。[分析：基于此位置直接给出明确的交易防御数字：下方强支撑位精确看至 $xx.xx，上方强阻力位精确看向 $xx.xx]。
-* 筹码结构：机构持股比例为 {metrics['inst_owned']}，滚动市盈率为 {metrics['pe_ratio']}。[分析：一句话判定该股属于高度控盘股、还是散户游资混战股，进一步增强上述结论的可信度]。
+* 流动性承接：总市值 {metrics['market_cap_formatted']}，今日真实成交换手达 {metrics['today_turnover']}。[客观分析此换手率是否具备游资和机构的短线换手承接力]。
+* 均线防御防线：当前官方收盘价为 ${metrics['current_price']:.3f}。上方近期技术阻力位对齐10日高点 **${metrics['10d_high']:.3f}**，下方关键技术支撑位看死 MA20 生命线 **${metrics['current_ma20']:.3f}**。
+* 筹码结构：机构持股比例 {metrics['inst_owned']}，滚动市盈率 {metrics['pe_ratio']}。[一句话判定该股属于高度控盘股还是散户游资混战股]。
+
+#### 🔴 PLATFORM_TELEGRAM_EN
+**⚖️ {ticker} Quantitative Assessment Report (English Edition)**
+
+[Momentum & Trend Outlook]
+Market Stance: [State clearly: Strong Bullish Momentum / Bearish Risk Management / Sideways Consolidation] until [Timeframe]. The next pivotal catalyst is projected around [Core event based on news].
+
+[📜 ASX Official Disclosure Timeline & Narrative Arc]
+* Historical Trajectory: Reviewing the sequence of the 5 filtered official disclosures leading up to today's market-sensitive release "{raw_data['official_news'][0]['title']}" combined with its official first-hand text snippet, the company has built a clear operational milestone. This demonstrates a transition from early foundational steps to the current release, revealing that smart money is currently executing a strategic [Explain the macro story: institutional re-rating / operational expansion / near-term capital cycling based on the data provided].
+
+[📊 Quantitative Metrics Verification]
+* Liquidity Cap: Market Cap at {metrics['market_cap_formatted']} with today's turnover at {metrics['today_turnover']}.
+* Technical Boundaries: Last close at ${metrics['current_price']:.3f}. Resistance is aligned with the 10-day high at **${metrics['10d_high']:.3f}**, while the defensive support rests on the MA20 line at **${metrics['current_ma20']:.3f}**.
+* Structure: Institutional ownership stands at {metrics['inst_owned']} with a trailing P/E of {metrics['pe_ratio']}.
 
 #### 🔴 PLATFORM_X
-📊 #{ticker_short} Quant Flow: [明确写出 建议买入 或 保持观望]
-🎯 Target Timeline: [精确预测持续几天或到本周末]
-📡 Catalyst: [15字内极简概括今日最新公告，如“突发高品位金矿重大发现”]
-💰 Money Flow: 今天真实换手金额飙升至 {metrics['today_turnover']}，主力资金[写明：强力吸筹 / 借利好出货]！
-📈 Metrics: Close ${metrics['current_price']:.3f} | {metrics['ma_status']}
+📊 #{ticker_short} Quant Flow Update (Pure English)
+Trend: [Strong Bullish / Capital Defense] till [Timeline]
+📡 Catalyst Arc: Today's sensitive release "{raw_data['official_news'][0]['title']}" concludes a multi-week operational milestone. 
+💰 Turnover: {metrics['today_turnover']} with clear [Institutional Accumulation / Distribution] indicators.
+📈 Tech Levels: Close ${metrics['current_price']:.3f}. Objective resistance at ${metrics['10d_high']:.3f} | Support at ${metrics['current_ma20']:.3f}.
 #ASX #AusShares #{ticker_short}
 
 #### 🔴 PLATFORM_XIAOHONGSHU
-【📌 今日ASX异动暴风眼 {ticker}：究竟是主力陷阱还是躺赚密码？】
+【📌 今日ASX异动暴风眼 {ticker}：串联官方前因后果，看清主力底牌！】
 
-🔥 搞钱第一步，先看官方一手真凭实据！拒绝小道消息，直接上私募级双因子量化拆解：
+🔥 拒绝单看一天数据断章取义！今天直接用量化滤网清洗掉所有毫无营养的例行公事报告，揪出了 {ticker} 近期真正具有核弹级资讯价值的 5 条官方历史合规公告！更绝的是，我们已经穿透了今天最新公告的官方PDF内文！带你像看连环画一样，过瘾地把这个商业故事链娓娓道来：
 
-🔹 核心动作指引：【建议买入 / 保持观望 / 坚决避雷】
-🔹 预期吃肉行情持续至：[给出明确预测时间线]
+📖【回溯：连环拼图拼出真实轨迹】
+1️⃣ 起风了：{raw_data['official_news'][-1]['date']} 官方披露《{raw_data['official_news'][-1]['title']}》，项目底层逻辑开始悄悄发生质变。
+2️⃣ 蓄势中：随后紧接着跟进动态，整个市场的资金情绪开始大面积发酵。
+3️⃣ 进展线：就在今天，官方突发重磅敏感公告《{raw_data['official_news'][0]['title']}》彻底引爆市场！
+🤯 这一套行云流水的组合拳打下来，结合官方PDF里透露的硬核细节来看，背后的真实剧本【专业推演】是：[结合公告前面的预打标分类以及最新PDF提炼内文里的真实字眼，用3行字讲出你的独到见解。注意：如果前后公告属于同一个项目，说明这是一次连贯的战略推进；如果属于不同事件，则指出这是多条战线并行的结果。多用“迹象表明/可能意味着”，展现严谨私募大牛的逼格！]
 
-📢【主力动作大曝光】
-{raw_data['official_news'][0]['date']} 官方最新敏感公告《{raw_data['official_news'][0]['title']}》！
-🤯 翻译成大白话就是：[用1行字直接撕开主力底牌，点明这是主力在借利好出货还是机构合力在吃饱]
+📊【硬核合规数据照妖镜】
+- 💰 资金肉搏：今天大资金真真切切砸了 {metrics['today_turnover']}！大资金换手承接力十分瞩目。
+- 📈 筹码防御：当前收盘价 ${metrics['current_price']:.3f}，技术面对应编码【{metrics['ma_code']}】。
+- 🎯 客观防线：**根据10日动能和均线测算，上方近期技术阻力位看死 **${metrics['10d_high']:.3f}**，下方关键技术支撑防线看死 **${metrics['current_ma20']:.3f}**。**（数据源自官方客观记录，注意防御风险！）
 
-📊【硬核数据照妖镜】
-- 💰 资金肉搏：今天市场上真金白银砸了 {metrics['today_turnover']}！大资金换手承接力[极强/一般/较弱]。
-- 📈 筹码防线：当前股价 ${metrics['current_price']:.3f}，技术面处于【{metrics['ma_status']}】。
-- 🎯 防守看死：下方铁底支撑位精确看 **$xx.xx**，上方强阻力位精确看向 **$xx.xx**！
-
-#澳洲股票 #ASX #澳洲搞钱 #量化交易 #澳洲生活
+#澳洲股票 #ASX #澳洲搞钱 #量化交易 #商业故事
 """
     return prompt
