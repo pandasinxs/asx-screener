@@ -235,7 +235,7 @@ def serialize_to_prompt(raw_data):
         enhanced_announcements.append(f"- {ann['date']} {ann['time']} {tag} {ann['title']} (Sensitive: {ann['is_sensitive']})")
     announcements_str = "\n".join(enhanced_announcements)
     
-    prompt = f\"\"\"
+    prompt = f"""
 你现在是一位在澳洲证券市场（ASX）摸爬滚打 15 年、说话风格一针见血、逻辑极度严密的顶级量化私募华人合伙人。你对中微盘股主力的筹码沉淀、资金做局手段了如指掌。
 
 请根据以下提供的最底层、纯净的ASX官方实时数据集，全权由你【自由发挥、即兴进行结构重组与文风创作】，但必须保证【商业故事因果线与客观量化指标呈现达到1:1的硬核平衡】，为4个不同的交易圈分发渠道撰写解盘分析。
@@ -272,6 +272,6 @@ def serialize_to_prompt(raw_data):
 (Requirements: Punchy alpha update for active traders. Synthesize today's specific PDF revelation and technical layout. You must explicitly present the core quantitative metrics: Close ${metrics['current_price']:.3f}, Turnover {metrics['today_turnover']}, Resistance ${metrics['10d_high']:.3f}, and Support ${metrics['current_ma20']:.3f}. Make it highly data-dense, leverage financial slang, yet strictly objective.)
 
 #### 🔴 PLATFORM_XIAOHONGSHU
-（要求：爆款引流文。多用Emoji。彻底废除所有死板段落标题。开篇由你自由撰写极具悬念的连环画式商业解密故事（必须引用最新PDF里的硬核细节）。但紧接着故事后面，必须强制插入一个独立的【📊 核心量化数据照妖镜】列表板块，精细罗列出今日真实成交额、机构持股比例、当前收盘价。并针对上方技术死穴 ${metrics['10d_high']:.3f} 和下方多头生命线 ${metrics['current_ma20']:.3f} 进行极其毒舌、大白话的客观防线分析。结尾自然附带客观风险免责声明。）
-\"\"\"
+（要求：爆款引流文。多用Emoji。彻底废除所有死板段落标题。开篇由你自由撰写极极具悬念的连环画式商业解密故事（必须引用最新PDF里的硬核细节）。但紧接着故事后面，必须强制插入一个独立的【📊 核心量化数据照妖镜】列表板块，精细罗列出今日真实成交额、机构持股比例、当前收盘价。并针对上方技术死穴 ${metrics['10d_high']:.3f} 和下方多头生命线 ${metrics['current_ma20']:.3f} 进行极其毒舌、大白话的客观防线分析。结尾自然附带客观风险免责声明。）
+"""
     return prompt
