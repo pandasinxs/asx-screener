@@ -31,6 +31,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# yfinance 会把 "possibly delisted" 这类正常的数据缺失打成 ERROR 级别输出到
+# 根 logger，在我们的日志里产生大量噪音。把它压制到 WARNING 以下即可。
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("peewee").setLevel(logging.CRITICAL)
+
 # ── 环境变量 ─────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -75,6 +80,27 @@ RETRYABLE_EXCEPTIONS = (
 )
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def safe_series(df: pd.DataFrame, col: str) -> pd.Series:
+    """
+    安全地从 DataFrame 中提取一列并确保返回 pd.Series。
+
+    问题根因：yfinance 在批量下载后，如果 batch 内只有 1 只股票，
+    raw[ticker][col].squeeze() 会把单行 DataFrame 挤压成 numpy 标量，
+    导致后续的 .iloc / .mean() / .sum() 等调用全部 AttributeError。
+
+    解决方案：统一通过此函数提取列，保证返回类型始终是 pd.Series。
+    """
+    s = df[col]
+    # 如果已经是 Series，直接返回
+    if isinstance(s, pd.Series):
+        return s
+    # DataFrame（多列同名的极端情况），取第一列
+    if isinstance(s, pd.DataFrame):
+        return s.iloc[:, 0]
+    # 标量（单行被 squeeze 的情况）：包装成长度为1的 Series
+    return pd.Series([s])
 
 
 def gemini_call_with_retry(
@@ -339,10 +365,10 @@ def batch_intraday(tickers: list[str], batch_size: int = 50) -> dict[str, pd.Dat
 # ============================================================
 
 def calc_vwap(df: pd.DataFrame) -> pd.Series:
-    c  = df["Close"].squeeze()
-    h  = df["High"].squeeze()
-    l  = df["Low"].squeeze()
-    v  = df["Volume"].squeeze()
+    c  = safe_series(df, "Close")
+    h  = safe_series(df, "High")
+    l  = safe_series(df, "Low")
+    v  = safe_series(df, "Volume")
     tp = (h + l + c) / 3
     return (tp * v).cumsum() / v.cumsum()
 
@@ -352,10 +378,10 @@ def compute_historical_metrics(daily: pd.DataFrame) -> dict:
     将180天日线数据压缩为关键指标字典，供Gemini消费。
     避免原始数据直接传入造成token浪费。
     """
-    closes  = daily["Close"].squeeze().dropna()
-    volumes = daily["Volume"].squeeze().dropna()
-    highs   = daily["High"].squeeze().dropna()
-    lows    = daily["Low"].squeeze().dropna()
+    closes  = safe_series(daily, "Close").dropna()
+    volumes = safe_series(daily, "Volume").dropna()
+    highs   = safe_series(daily, "High").dropna()
+    lows    = safe_series(daily, "Low").dropna()
 
     if len(closes) < 5:
         return {}
@@ -434,9 +460,9 @@ def apply_filters(
     - 排除已连涨：避免在多日加速拉升末端追高
     """
     try:
-        closes     = daily["Close"].squeeze()
+        closes     = safe_series(daily, "Close")
         prev_close = float(closes.iloc[-2])
-        curr_price = float(intra["Close"].squeeze().iloc[-1])
+        curr_price = float(safe_series(intra, "Close").iloc[-1])
 
         # 1. 价格区间过滤（最基础的仙股过滤）
         if not (FILTER["min_price"] <= curr_price <= FILTER["max_price"]):
@@ -450,8 +476,8 @@ def apply_filters(
             return None
 
         # 3. 量比（今日量 / 20日均量）
-        today_vol   = float(intra["Volume"].squeeze().sum())
-        avg_day_vol = float(daily["Volume"].squeeze().iloc[-20:].mean())
+        today_vol   = float(safe_series(intra, "Volume").sum())
+        avg_day_vol = float(safe_series(daily, "Volume").iloc[-20:].mean())
         vol_ratio   = today_vol / avg_day_vol if avg_day_vol > 0 else 0
         if vol_ratio < FILTER["min_vol_ratio"]:
             log.debug(f"  SKIP {t}: 量比{vol_ratio:.2f}不足")
@@ -479,9 +505,9 @@ def apply_filters(
                 return None
 
         # 7. 计算其他盘中指标
-        today_high  = float(intra["High"].squeeze().max())
-        today_low   = float(intra["Low"].squeeze().min())
-        launch_pt   = float(intra["Low"].squeeze().iloc[0])
+        today_high  = float(safe_series(intra, "High").max())
+        today_low   = float(safe_series(intra, "Low").min())
+        launch_pt   = float(safe_series(intra, "Low").iloc[0])
 
         # 是否仍是"一字板"（价格贴近当日最高，无回调空间）
         # 用绝对价差而非百分比，对低价股更准确
@@ -709,7 +735,7 @@ def run_morning_scan() -> None:
     for t, df in daily_data.items():
         try:
             avg_vol    = float(df["Volume"].iloc[-20:].mean())
-            last_close = float(df["Close"].squeeze().iloc[-1])
+            last_close = float(safe_series(df, "Close").iloc[-1])
             if avg_vol * last_close >= FILTER["min_dollar_volume"]:
                 liquid.append(t)
         except (IndexError, ValueError, KeyError):
