@@ -1090,21 +1090,209 @@ def serialize_to_prompt(market_snap: dict, stocks_block: str,
     )
 
     instructions = {
-        "telegram": """生成**中文** ASX每日简报（Telegram格式）：
-1. 开头3句：市场情绪 + 今日最值得关注主题
-2. 每只股票（共3段）：公司简介(1句) → 异动原因(2-3句) → 技术面(1-2句) → 催化剂预测(1-2句) → 建议(买入/观望/回避+理由)
-3. 结尾：1句整体展望
-要求：适当Emoji，每只≤150字，不确定注明"需自行核查"，末尾加⚠️免责声明""",
+        "telegram": """生成中文 ASX 日交易简报（专业交易员 + 事件驱动 + 时间线叙事）
+━━━━━━━━━━━━━━━━━━
+【核心目标】
+基于输入的：
+- 个股技术指标（必须充分使用）
+- 大盘/市场情绪指标（必须纳入判断）
+- 最新 + 历史公告/新闻 + 历史数据
+输出：
+👉 “市场状态 + 个股演化时间线 + 当前阶段 + 下一步推演”
+本质：交易叙事重建，而不是信息总结。
+━━━━━━━━━━━━━━━━━━
+【市场情绪识别（必须先做）】
+必须先判断整体市场属于：
+- Risk-on（风险偏好上升）
+- Risk-off（避险）
+- Rotation（板块轮动）
+- Choppy（震荡无趋势）
+判断依据必须来自输入数据：
+- 大盘走势/成交量
+- 关键指数技术结构
+- 个股整体涨跌分布
+并在开头体现。
+━━━━━━━━━━━━━━━━━━
+【结构】
+1. 开头（2–3句）
+- 市场情绪判断（必须明确）
+- 当前主线资金方向
+- 一个结构性预期差或风险点
+━━━━━━━━━━━━━━━━━━
+2. 个股
+每只必须构建“时间线故事”：
+━━━━━━━━━━━━━━━━━━
+【A. 时间线叙事（必须）】
+必须包含：
+- 过去（历史公告/旧新闻）
+- 中间（市场反应/价格变化）
+- 现在（最新公告/异动）
+- 当前阶段判断（重估 / 兑现 / 加速 / 破位 / 反转）
+要求：
+→ 必须形成因果链（事件 → 反应 → 结构变化）
+━━━━━━━━━━━━━━━━━━
+【B. 技术面（必须高密度使用）】
+必须使用3–6个指标组合：
+- 趋势结构（上升/下降/震荡）
+- 均线体系（MA20/50/200）
+- 动量（RSI / MACD）
+- 成交量变化
+- 支撑/阻力
+- 波动/突破结构
+要求：
+- 必须解释“指标意味着什么”
+- 技术面必须服务于“阶段判断”
+━━━━━━━━━━━━━━━━━━
+【C. 驱动逻辑】
+- 为什么市场在“此刻”重新定价
+- 公告/新闻如何改变预期
+━━━━━━━━━━━━━━━━━━
+【D. 下一步推演】
+必须包含：
+- 1–3个催化剂
+- 成功路径 → 结果
+- 失败路径 → 风险结构
+━━━━━━━━━━━━━━━━━━
+【E. 我的判断】
+- 倾向观察 / 倾向参与 / 倾向回避
+禁止强投资指令
+每只≤140字
+━━━━━━━━━━━━━━━━━━
+【风格随机】
+A 机构分析师（结构化）
+B 交易员复盘（节奏感）
+C 事件叙事（故事化）
+━━━━━━━━━━━━━━━━━━
+【核心强制规则】
+- 必须市场情绪 + 个股情绪一致性分析
+- 必须时间线（过去→现在→未来）
+- 必须因果链（公告→资金→技术→阶段）
+- 必须至少1个预期差或反直觉点
+━━━━━━━━━━━━━━━━━━
+【免责声明】
+末尾加上
+⚠️仅为市场分析，不构成投资建议""",
 
-        "twitter": """Generate English Twitter/X thread (use ---TWEET--- between tweets):
-Tweet 1(hook ≤250): market summary
-Tweets 2-4: one per stock — $TICKER + % move + catalyst (1 line) + Buy/Watch/Avoid
-Tweet 5: outlook + #ASX #AustralianStocks + disclaimer
-No fabrication. Flag uncertainty as "to verify".""",
+        "twitter": """Generate an English ASX trading thread for X (Twitter)
+━━━━━━━━━━━━━━━━━━
+【Core objective】
+Create engagement via:
+👉 conflict + narrative + interpretation
+NOT news summarization
+━━━━━━━━━━━━━━━━━━
+【Market regime detection (mandatory)】
+First infer market regime from inputs:
+- Risk-on
+- Risk-off
+- Rotation
+- Choppy / range-bound
+Must reflect it in Hook.
+━━━━━━━━━━━━━━━━━━
+【Structure】
+Tweet 1 (Hook ≤220 chars)
+- Market regime + dominant narrative
+- Must include ONE:
+  - mispricing
+  - contradiction
+  - hidden risk
+━━━━━━━━━━━━━━━━━━
+Tweets 2–4 (stocks)
+Each tweet must include:
+- $TICKER + move
+- Real driver (announcement / technical / flow)
+- Trader interpretation (NOT description)
+- Leaning stance (Buy / Watch / Avoid)
+━━━━━━━━━━━━━━━━━━
+Tweet 5 (outlook)
+- Next market phase
+- Hashtags: #ASX #AustralianStocks
+━━━━━━━━━━━━━━━━━━
+【Mandatory variation system】
+At least ONE must be:
+- Contrarian
+- Disagreement-based
+- Or challenge consensus
+Structure must vary:
+- single line
+- broken lines
+- bullet format
+━━━━━━━━━━━━━━━━━━
+【Style constraints】
+- ≤15 words per sentence preferred
+- No AI clichés
+- No repetitive phrasing
+- Uncertainty → “to verify”
+末尾加上
+⚠️ Not financial advice""",
 
-        "xiaohongshu": """生成**中文**小红书投资笔记：
-标题（≤20字，含关键数据）→ 开头钩子(2句) → 每只股票用"为什么关注XX"叙事(核心逻辑+技术直觉+我的判断) → 今日投资启示 → 话题标签(#澳股 #ASX投资等3-5个)
-要求：专业但亲切，不确定注明"待核查"，末尾加免责声明""",
+        "xiaohongshu": """生成中文小红书 ASX交易复盘笔记（交易叙事日记风格）
+━━━━━━━━━━━━━━━━━━
+【核心定位】
+不是新闻解读，不是分析报告
+👉 是“交易者连续观察记录 + 情绪 + 反思”
+━━━━━━━━━━━━━━━━━━
+【市场情绪识别（必须）】
+基于大盘 + 个股整体表现判断：
+- Risk-on / Risk-off / Rotation / Choppy
+必须影响全文语气。
+━━━━━━━━━━━━━━━━━━
+【结构】
+标题（≤18字）
+必须包含：
+- 冲突 + 结果 + 情绪
+例：这3只票，我只看懂1只
+━━━━━━━━━━━━━━━━━━
+开头（2句）
+必须包含：
+- 反直觉 / 误判 / 情绪冲突
+- 带个人视角（像“观察者”而不是“报告”）
+━━━━━━━━━━━━━━━━━━
+正文
+每只必须是“故事”：
+━━━━━━━━━━━━━━━━━━
+【1. 时间线故事（核心）】
+必须包含：
+- 过去：历史公告/旧新闻
+- 中间：市场如何反应
+- 现在：最新公告/异动
+- 阶段判断：情绪/结构位置
+→ 必须像连续观察，而不是一次性解读
+━━━━━━━━━━━━━━━━━━
+【2. 技术直觉（人话）】
+- 趋势/量能/结构
+- 禁止指标堆砌
+- 用“感觉 + 结构”表达
+━━━━━━━━━━━━━━━━━━
+【3. 我的理解】
+- 为什么当时/现在这么看
+- 可以允许犹豫/误判
+━━━━━━━━━━━━━━━━━━
+【4. 我的判断】
+- 倾向 / 犹豫 / 回避 / 重新观察
+必须包含至少1个：
+- 犹豫
+- 错过
+- 误判
+- 不确定
+━━━━━━━━━━━━━━━━━━
+【结尾】
+- 今日交易认知（必须是经验，不是总结市场）
+━━━━━━━━━━━━━━━━━━
+【风格随机】
+A 日记型（第一人称）
+B 教学型（解释给别人看）
+C 反思型（带错误）
+━━━━━━━━━━━━━━━━━━
+【情绪与流量规则】
+- 必须有情绪痕迹
+- 必须短句
+- 至少1句“非标准金融表达”
+- 必须像真实人在写
+━━━━━━━━━━━━━━━━━━
+【标签】
+#澳股 #ASX #短线交易 #股票复盘（3–5个）
+末尾加上
+⚠️仅个人记录，不构成投资建议""",
     }
 
     instruction = instructions.get(platform, instructions["telegram"])
