@@ -65,7 +65,10 @@ ASX_HEADERS = {
     "Referer":    "https://www.asx.com.au",
 }
 ASX_ANN_ALL    = "https://asx.api.markitdigital.com/asx-research/1.0/markets/announcements"
-ASX_ANN_TICKER = "https://asx.api.markitdigital.com/asx-research/1.0/company/{code}/announcements"
+# ASX单股历史公告API已确认不存在（404）。
+# 经测试所有参数变体均被服务器忽略，无法按ticker过滤。
+# 历史公告通过 fetch_announcements() 从今日公告缓存积累，见下方说明。
+PDF_DL_BASE    = "https://cdn-api.markitdigital.com/apiman-gateway/ASX/asx-research/1.0/file/{doc_key}?access_token=83ff96335c2d45a094df02a206a39ff4"
 GOOGLE_RSS     = "https://news.google.com/rss/search?q={q}&hl=en-AU&gl=AU&ceid=AU:en"
 
 PDF_MAX_CHARS    = 2000   # 每个PDF关键段落合计上限（关键词提取后更精准）
@@ -512,8 +515,142 @@ def fetch_fundamentals(ticker: str) -> dict:
                 "industry": "未知", "market_cap_m": 0.0}
 
 
+def _ann_significance(headline: str, sensitive: bool,
+                      doc_type: str, pdf_text: str,
+                      pub_date: str) -> int:
+    """公告重要性评分（0-10）"""
+    score = 0
+    if sensitive:
+        score += 4
+    if any(w.lower() in doc_type.lower() for w in ANN_WHITELIST):
+        score += 3
+    if pdf_text:
+        score += 2
+    if pub_date >= (date.today() - timedelta(days=7)).isoformat():
+        score += 1
+    return score
+
+
+def _is_noise_announcement(doc_type: str, headline: str) -> bool:
+    """判断公告是否为噪音（合规/行政类，对股价无实质影响）"""
+    combined = (doc_type + " " + headline).lower()
+    return any(kw in combined for kw in ANN_NOISE_KEYWORDS)
+
+
+# ── 今日公告缓存（进程内有效，避免多次重复请求）──────────────
+# ── SQLite公告数据库（本地历史积累）────────────────────────
+# ASX没有任何可用的单股历史公告API（经详尽测试确认）。
+# 解决方案：每次运行时把今日全市场公告存入本地SQLite。
+# 第1天只有今日数据，30天后有30天历史，180天后有完整半年时间线。
+# 这比任何第三方API都可靠，因为数据是自己积累的。
+ANN_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "announcements.db")
+
+_today_ann_cache: dict = {}
+
+
+def _init_ann_db() -> None:
+    """初始化SQLite公告数据库（首次运行自动建表）"""
+    import sqlite3
+    try:
+        with sqlite3.connect(ANN_DB_PATH) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS announcements (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol      TEXT    NOT NULL,
+                    date        TEXT    NOT NULL,
+                    headline    TEXT,
+                    sensitive   INTEGER DEFAULT 0,
+                    doc_type    TEXT,
+                    doc_key     TEXT,
+                    pdf_text    TEXT,
+                    significance INTEGER DEFAULT 0,
+                    UNIQUE(symbol, date, headline)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_date ON announcements(symbol, date)")
+            conn.commit()
+        log.info(f"公告数据库就绪：{ANN_DB_PATH}")
+    except Exception as e:
+        log.error(f"公告数据库初始化失败: {e}")
+
+
+def _save_announcements_to_db(ann_dict: dict) -> None:
+    """将今日公告字典批量写入SQLite（IGNORE重复）"""
+    import sqlite3
+    if not ann_dict:
+        return
+    today = date.today().isoformat()
+    rows  = []
+    for sym, a in ann_dict.items():
+        rows.append((
+            sym, today,
+            a.get("headline", ""),
+            1 if a.get("sensitive") else 0,
+            a.get("doc_type", ""),
+            a.get("documentKey", ""),
+            a.get("pdf_text", ""),
+            a.get("significance", 0),
+        ))
+    try:
+        with sqlite3.connect(ANN_DB_PATH) as conn:
+            conn.executemany("""
+                INSERT OR IGNORE INTO announcements
+                    (symbol, date, headline, sensitive, doc_type, doc_key, pdf_text, significance)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+            conn.commit()
+        log.info(f"公告写入DB：{len(rows)} 条")
+    except Exception as e:
+        log.error(f"公告写入DB失败: {e}")
+
+
+def _load_announcements_from_db(code: str, days: int = 180) -> list:
+    """从SQLite读取单股近N天历史公告，按significance+date降序"""
+    import sqlite3
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    try:
+        with sqlite3.connect(ANN_DB_PATH) as conn:
+            rows = conn.execute("""
+                SELECT date, headline, sensitive, doc_type, pdf_text, significance
+                FROM   announcements
+                WHERE  symbol = ? AND date >= ?
+                ORDER  BY significance DESC, date DESC
+                LIMIT  20
+            """, (code, cutoff)).fetchall()
+        result = [
+            {
+                "date":        r[0],
+                "headline":    r[1],
+                "sensitive":   bool(r[2]),
+                "doc_type":    r[3],
+                "pdf_text":    r[4] or "",
+                "significance": r[5],
+            }
+            for r in rows
+        ]
+        log.info(f"公告DB [{code}]: {len(result)} 条历史记录（近{days}天）")
+        return result
+    except Exception as e:
+        log.error(f"公告DB读取失败 [{code}]: {e}")
+        return []
+
+
 def fetch_today_announcements() -> dict:
-    today, result, page = date.today().isoformat(), {}, 0
+    """
+    拉取今日全市场公告，过滤噪音，price-sensitive公告提取PDF。
+    结果：① 写入SQLite积累历史 ② 进程内缓存避免重复请求。
+    返回：{code: {headline, sensitive, doc_type, documentKey, pdf_text, significance}}
+    """
+    global _today_ann_cache
+    today = date.today().isoformat()
+    if today in _today_ann_cache:
+        log.info(f"今日公告（进程缓存）：{len(_today_ann_cache[today])} 只")
+        return _today_ann_cache[today]
+
+    _init_ann_db()
+    result, page = {}, 0
+    pdf_done = set()
+
     while True:
         data = _get(ASX_ANN_ALL,
                     params={"itemsPerPage": 100, "page": page},
@@ -528,112 +665,84 @@ def fetch_today_announcements() -> dict:
             if item.get("date", "")[:10] < today:
                 got_old = True
                 break
-            sym = item.get("symbol", "")
-            if sym and sym not in result:
+            sym      = item.get("symbol", "")
+            headline = item.get("headline", "")[:80]
+            doc_type = item.get("documentType", "")
+            is_sens  = item.get("isPriceSensitive", False)
+            doc_key  = item.get("documentKey", "")
+            pdf_txt  = ""
+
+            if not sym:
+                continue
+            if _is_noise_announcement(doc_type, headline):
+                continue
+
+            # price-sensitive公告用documentKey下载PDF（每股限1份）
+            if is_sens and doc_key and sym not in pdf_done:
+                pdf_url = PDF_DL_BASE.format(doc_key=doc_key)
+                log.info(f"  PDF提取 [{sym}]: {headline[:40]}...")
+                pdf_txt = _extract_pdf_keywords(pdf_url)
+                if pdf_txt:
+                    pdf_done.add(sym)
+                time.sleep(0.2)
+
+            if sym not in result:
+                sig = _ann_significance(headline, is_sens, doc_type, pdf_txt, today)
                 result[sym] = {
-                    "headline":  item.get("headline", "")[:70],
-                    "sensitive": item.get("isPriceSensitive", False),
+                    "headline":    headline,
+                    "sensitive":   is_sens,
+                    "doc_type":    doc_type,
+                    "documentKey": doc_key,
+                    "pdf_text":    pdf_txt,
+                    "significance": sig,
                 }
         if got_old or len(items) < 100:
             break
         page += 1
         time.sleep(0.3)
-    log.info(f"今日公告：{len(result)} 只")
+
+    # 写入SQLite（积累历史）
+    _save_announcements_to_db(result)
+    _today_ann_cache[today] = result
+    log.info(f"今日公告：{len(result)} 只（有效），PDF {len(pdf_done)} 份")
     return result
 
 
-def _ann_significance(item: dict) -> int:
+def fetch_announcements(code: str,
+                        today_ann: Optional[dict] = None) -> list:
     """
-    公告重要性评分（0-10）：
-    - isPriceSensitive: +4
-    - 白名单文档类型: +3
-    - PDF关键词命中（PDF文本不为空时预估）: +2
-    - 近7天内发布: +1
+    获取单股公告列表（今日 + SQLite历史积累）。
+
+    数据来源说明：
+    - ASX单股历史公告API经详尽测试确认不可用（所有端点404或忽略过滤参数）
+    - 本函数从本地SQLite读取历史数据（每日自动积累）
+    - 第1天：仅有今日数据；运行30天后：有30天历史；180天后：完整半年
+    - 今日公告若已在DB中则自动合并，不重复
+
+    返回：按significance+date降序的公告列表（最多20条）
     """
-    score = 0
-    if item.get("sensitive"):
-        score += 4
-    doc_type = item.get("doc_type", "")
-    if any(w.lower() in doc_type.lower() for w in ANN_WHITELIST):
-        score += 3
-    if item.get("pdf_text"):
-        score += 2
-    pub = item.get("date", "")
-    if pub >= (date.today() - timedelta(days=7)).isoformat():
-        score += 1
-    return score
+    # 从SQLite读取历史（包含今日已写入的）
+    history = _load_announcements_from_db(code, days=180)
 
+    # 若今日公告尚未在DB中（极少数情况：DB写入失败），从内存补充
+    if today_ann and code in today_ann:
+        today_str = date.today().isoformat()
+        already   = any(a["date"] == today_str for a in history)
+        if not already:
+            ann  = today_ann[code]
+            item = {
+                "date":        today_str,
+                "headline":    ann["headline"],
+                "sensitive":   ann["sensitive"],
+                "doc_type":    ann.get("doc_type", ""),
+                "pdf_text":    ann.get("pdf_text", ""),
+                "significance": ann.get("significance", 0),
+            }
+            history.insert(0, item)
+            log.info(f"公告 [{code}]: 今日公告从内存补充（DB未命中）")
 
-def _is_noise_announcement(doc_type: str, headline: str) -> bool:
-    """判断公告是否为噪音（合规/行政类，对股价无实质影响）"""
-    combined = (doc_type + " " + headline).lower()
-    return any(kw in combined for kw in ANN_NOISE_KEYWORDS)
+    return history
 
-
-def fetch_announcements(code: str, days: int = 180) -> list:
-    """
-    历史公告：过滤噪音、评分排序、price-sensitive提取PDF关键段落。
-    返回按significance降序的公告列表（最多15条有效公告）。
-    """
-    cutoff    = (date.today() - timedelta(days=days)).isoformat()
-    raw       = []
-    pdf_count = 0
-    page      = 0
-    url       = ASX_ANN_TICKER.format(code=code)
-
-    while True:
-        data = _get(url, params={"itemsPerPage": 20, "page": page},
-                    label=f"历史公告/{code}")
-        if not data:
-            break
-        items = data.get("data", {}).get("items", [])
-        if not items:
-            break
-        got_old = False
-        for item in items:
-            pub = item.get("date", "")[:10]
-            if pub < cutoff:
-                got_old = True
-                break
-            doc_type = item.get("documentType", "")
-            headline = item.get("headline", "")[:80]
-
-            # 过滤噪音公告
-            if _is_noise_announcement(doc_type, headline):
-                log.debug(f"过滤噪音公告 [{code}]: {headline[:40]}")
-                continue
-
-            is_sens = item.get("isPriceSensitive", False)
-            docs    = item.get("documents", []) or []
-            pdf_url = docs[0].get("url", "") if docs else ""
-            pdf_txt = ""
-
-            # 仅price-sensitive公告提取PDF
-            if is_sens and pdf_url and pdf_count < PDF_MAX_PER_STOCK:
-                log.info(f"  PDF提取 [{code}]: {headline[:40]}...")
-                pdf_txt = _extract_pdf_keywords(pdf_url)
-                if pdf_txt:
-                    pdf_count += 1
-                time.sleep(0.3)
-
-            raw.append({
-                "date":      pub,
-                "headline":  headline,
-                "sensitive": is_sens,
-                "doc_type":  doc_type,
-                "pdf_text":  pdf_txt,
-            })
-        if got_old or len(items) < 20:
-            break
-        page += 1
-        time.sleep(0.2)
-
-    # 评分 + 降序排列，取Top 15有效公告
-    for a in raw:
-        a["significance"] = _ann_significance(a)
-    result = sorted(raw, key=lambda x: (x["significance"], x["date"]), reverse=True)[:15]
-    log.info(f"公告 [{code}]: 原始{len(raw)}条→过滤后{len(result)}条，PDF {pdf_count} 份")
-    return result
 
 
 def _extract_pdf_keywords(url: str) -> str:
@@ -1154,7 +1263,7 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         code = s["ticker"].replace(".AX", "")
         log.info(f"  [#{idx}] {s['ticker']} 评分:{s['composite_score']}...")
 
-        ann_hist = fetch_announcements(code, days=90)
+        ann_hist = fetch_announcements(code, today_ann=today_ann)
         news     = fetch_news(s["ticker"], s.get("company_name", ""))
         timeline = build_timeline_text(code, ann_hist, news, today_ann)
 
@@ -1247,7 +1356,7 @@ def run_report_flow(all_data: dict, market_snap: dict,
         fund = existing if (existing and existing.get("company_name")) else fetch_fundamentals(ticker)
 
         # 历史公告（含PDF关键段落提取）+ 新闻
-        ann_hist  = fetch_announcements(code, days=180)
+        ann_hist  = fetch_announcements(code, today_ann=today_ann)
         news      = fetch_news(ticker, fund.get("company_name", ""))
         timeline  = build_timeline_text(code, ann_hist, news, today_ann)
         pdf_texts = [a["pdf_text"] for a in ann_hist if a.get("pdf_text")]
