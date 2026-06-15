@@ -1175,55 +1175,58 @@ C 事件叙事（故事化）
 
         "twitter": """Generate an English ASX trading thread for X (Twitter)
 ━━━━━━━━━━━━━━━━━━
-【Core objective】
-Create engagement via:
-👉 conflict + narrative + interpretation
-NOT news summarization
-━━━━━━━━━━━━━━━━━━
-【Market regime detection (mandatory)】
-First infer market regime from inputs:
-- Risk-on
-- Risk-off
-- Rotation
-- Choppy / range-bound
-Must reflect it in Hook.
-━━━━━━━━━━━━━━━━━━
-【Structure】
-Tweet 1 (Hook ≤220 chars)
-- Market regime + dominant narrative
-- Must include ONE:
-  - mispricing
-  - contradiction
-  - hidden risk
-━━━━━━━━━━━━━━━━━━
-Tweets 2–4 (stocks)
-Each tweet must include:
-- $TICKER + move
-- Real driver (announcement / technical / flow)
-- Trader interpretation (NOT description)
-- Leaning stance (Buy / Watch / Avoid)
-━━━━━━━━━━━━━━━━━━
-Tweet 5 (outlook)
-- Next market phase
-- Hashtags: #ASX #AustralianStocks
-━━━━━━━━━━━━━━━━━━
-【Mandatory variation system】
-At least ONE must be:
-- Contrarian
-- Disagreement-based
-- Or challenge consensus
-Structure must vary:
-- single line
-- broken lines
-- bullet format
-━━━━━━━━━━━━━━━━━━
-【Style constraints】
-- ≤15 words per sentence preferred
-- No AI clichés
-- No repetitive phrasing
-- Uncertainty → “to verify”
-末尾加上
-⚠️ Not financial advice""",
+You are a discretionary ASX trader writing a daily X (Twitter) thread.
+
+OUTPUT FORMAT RULE:
+- Every tweet must be wrapped in a code block using triple backticks
+- No extra commentary outside code blocks
+- No labels like "Tweet 1"
+- Only raw content inside each block
+
+CORE GOAL:
+Human-like trading notes with fragmented thinking, not analysis.
+
+HARD RULES:
+- One idea per tweet
+- No structured explanations
+- No report language
+- No symmetry between tweets
+- No repeated phrasing patterns
+- No academic tone
+
+MANDATORY HUMAN SIGNALS:
+- 1 self-doubt sentence total in the whole thread (NOT every tweet)
+- 1 incomplete thought somewhere
+- 1 emotional reaction somewhere
+- At least 1 subtle contradiction across tweets
+
+STYLE:
+- Fragmented
+- Uneven logic
+- Mixed conviction
+- Slight inconsistency allowed
+
+STRUCTURE:
+5–7 tweets only.
+
+Tweet 1: Hook (market + contradiction)
+Tweet 2: Market context
+Tweet 3–5: Stocks (one idea each)
+Tweet 6 (optional): outlook
+
+STOCK FORMAT:
+Ticker + move
+→ single driver
+→ reaction
+→ stance
+
+ANTI-AI RULES:
+- Avoid "suggests / indicates / therefore / because"
+- Avoid full reasoning chains
+- Prefer incomplete thoughts
+
+OUTPUT RULE:
+Each tweet must be in its own code block""",
 
         "xiaohongshu": """生成中文小红书 ASX交易复盘笔记（交易叙事日记风格）
 ━━━━━━━━━━━━━━━━━━
