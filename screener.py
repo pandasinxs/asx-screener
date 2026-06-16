@@ -1180,10 +1180,10 @@ You are a discretionary ASX trader writing a daily X (Twitter) thread.
 INPUT:
 - ASX index data
 - sector performance
-- top 3 stocks (price, technicals, news timeline)
+- up to 3 stocks (price, technicals, news timeline)
 
 OUTPUT:
-5–7 tweets.
+4–7 tweets.
 
 FORMAT (MANDATORY):
 - Each tweet must be inside its own triple backtick code block
@@ -1293,12 +1293,8 @@ Do NOT explain in a formal way. Compress into trading notes.
 
 --------------------------------------------------
 
-OUTPUT ONLY THE THREAD.
-
---------------------------------------------------
-
 OUTPUT RULE:
-Each tweet must be in its own code block""",
+Each tweet threads must be in its own code block""",
 
         "xiaohongshu": """生成中文小红书 ASX交易复盘笔记（交易叙事日记风格）
 ━━━━━━━━━━━━━━━━━━
