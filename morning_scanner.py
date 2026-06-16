@@ -1872,8 +1872,7 @@ def _build_morning_prompt(platform: str, stocks_block: str,
     )
 
     instructions = {
-        "seo": f"""\
-You are a short-term trading research analyst specializing in US equities.
+        "seo": """You are a short-term trading research analyst specializing in US equities.
 
 Your task is to generate a high-value intraday market analysis report based strictly on real-time scanner data captured within the first 30 minutes after market open (NOT EOD / closing data).
 
@@ -2006,12 +2005,9 @@ Naturally incorporate:
 
 * Intraday-only validity of signals
 * Distinction between live trading vs post-market analysis
-* Conditional logic rather than deterministic prediction
+* Conditional logic rather than deterministic prediction""",
 
-""",
-
-        "twitter": f"""\
-Generate an English X (Twitter) thread — ASX morning catalyst report ({today}).
+        "twitter": """Generate an English X (Twitter) thread — ASX morning catalyst report ({today}).
 
 MANDATORY NARRATIVE RULE — Each stock tweet answers THREE questions:
   Q1 What happened? (trigger event — cite specific data/number from the announcement)
@@ -2028,8 +2024,7 @@ Final tweet: Key risk + #ASX #Catalyst #AustralianStocks + disclaimer
 
 Rules: Convert numbers to judgment language. ≤280 chars/tweet. Separator: ---TWEET---""",
 
-        "xiaohongshu": f"""\
-生成**中文**小红书投资笔记（今日{today}，共{n_candidates}只早盘异动股）。
+        "xiaohongshu": """生成**中文**小红书投资笔记（今日{today}，共{n_candidates}只早盘异动股）。
 
 【叙事定位】：不是数据播报员，是"投资侦探"——
 你发现了今日涨停背后的完整故事，从几个月前的铺垫写到今天的爆发，
