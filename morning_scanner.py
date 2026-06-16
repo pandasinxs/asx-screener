@@ -15,7 +15,6 @@ from datetime import datetime, date, timezone, timedelta
 from typing import Optional
 
 import yfinance as yf
-import numpy as np
 import pandas as pd
 import requests
 from google import genai
@@ -1160,106 +1159,140 @@ def apply_filters(
 # Gemini 综合分析（三阶段流程第三步）
 # ============================================================
 
-def _format_news_for_prompt(news_timeline: list[dict], max_items: int = 8) -> str:
+def build_gemini_batch_prompt(candidates: list[dict]) -> str:
     """
-    将新闻时间线格式化为Gemini可消费的结构化文本。
-    包含：标题 + 正文摘要 + 关键数字（这才是讲故事的原材料）。
-    Token控制：正文最多200字/条，关键数字最多5个/条。
-    """
-    if not news_timeline:
-        return "  【无近期公告或新闻，此股纯属技术炒作，慎重】"
+    构建批量分析Prompt——叙事驱动版。
 
-    lines = []
-    for n in news_timeline[:max_items]:
+    核心设计原则：
+    给Gemini的不是"数据堆"，而是"侦探档案"：
+      - 按事件链角色（trigger/followup/analyst/background）分层呈现新闻
+      - 触发事件放顶部高亮，含正文摘要和关键数字
+      - 历史背景按时间倒序，让Gemini理解故事演进
+      - 孤立价格事件（无对应新闻的大涨大跌）单独标注，提示异常
+
+    输出JSON字段含故事三层结构：
+      catalyst（今日触发）→ backstory（历史背景）→ story_chain（因果链）
+    """
+
+    def _fmt_item(n: dict, body_limit: int = 300) -> str:
+        """渲染单条新闻：标题 + 关键数字 + 正文（按重要性截取）。
+        定义在函数级别（build_gemini_batch_prompt内），所有候选共用同一个函数对象。
+        """
         days   = n.get("days_ago", "?")
-        src    = n.get("source", "未知来源")
+        src    = n.get("source", "")
         title  = n.get("title", "")
         body   = n.get("body", "")
         facts  = n.get("key_facts", [])
-        flag   = "⭐【价格敏感】" if n.get("sensitive") else ""
-        trigger_flag = "🔥【触发事件】" if n.get("is_trigger") else ""
+        move   = n.get("price_move_str", "")
+        sens   = "⭐价格敏感 " if n.get("sensitive") else ""
+        move_s = f" → {move}" if move else ""
 
-        # 标题行
-        lines.append(f"\n  ▶ [{days}天前] {flag}{trigger_flag}{src}")
-        lines.append(f"    标题: {title}")
-
-        # 关键数字（最重要的部分——具体数字才能支撑叙事）
+        lines = [f"  [{days}天前] {sens}{src}: {title}{move_s}"]
         if facts:
             lines.append(f"    关键数字: {' | '.join(facts[:5])}")
-
-        # 正文摘要（控制长度）
         if body:
-            body_short = body[:250].rstrip()
-            if len(body) > 250:
-                body_short += "..."
-            lines.append(f"    正文摘要: {body_short}")
+            body_trim = body[:body_limit].rstrip()
+            if len(body) > body_limit:
+                body_trim += "..."
+            lines.append(f"    正文: {body_trim}")
+        return "\n".join(lines)
 
-    return "\n".join(lines)
-
-
-def build_gemini_batch_prompt(candidates: list[dict]) -> str:
-    """
-    构建批量分析Prompt（升级版）。
-    核心升级：新闻不再只有标题，包含正文摘要+关键数字，
-    让Gemini能真正理解催化剂逻辑而不是猜标题。
-    """
     blocks = []
     for c in candidates:
-        metrics    = c.get("hist_metrics", {})
-        news       = c.get("news_timeline", [])
-        news_text  = _format_news_for_prompt(news, max_items=6)
+        metrics  = c.get("hist_metrics", {})
+        timeline = c.get("news_timeline", [])
+        orphans  = c.get("orphan_price_events", [])
 
-        # 触发事件单独高亮（最多2条，放在block顶部）
-        triggers = [n for n in news if n.get("is_trigger")]
-        trigger_block = ""
+        # ── 按chain_role分组 ──────────────────────────────────
+        triggers    = [n for n in timeline if n.get("chain_role") == "trigger"]
+        followups   = [n for n in timeline if n.get("chain_role") == "followup"]
+        analysts    = [n for n in timeline if n.get("chain_role") == "analyst"]
+        backgrounds = [n for n in timeline if n.get("chain_role") == "background"]
+
+        # 触发事件（最重要，正文给足300字）
+        trigger_section = ""
         if triggers:
-            t = triggers[0]
-            facts_str = " | ".join(t.get("key_facts", [])[:3])
-            trigger_block = (
-                f"\n⚡ 核心触发事件: {t['title']}\n"
-                f"   关键数字: {facts_str if facts_str else '见下方正文'}\n"
-                f"   正文摘要: {t.get('body','')[:200] or '（无正文）'}"
+            trigger_section = "\n⚡【直接催化剂 — 今日涨幅的直接触发事件】\n"
+            trigger_section += "\n".join(_fmt_item(n, 300) for n in triggers[:2])
+        else:
+            trigger_section = "\n⚠️【无明确触发事件 — 此股可能是技术性或跟风炒作】"
+
+        # 后续进展（150字）
+        followup_section = ""
+        if followups:
+            followup_section = "\n\n📈【后续进展 — 催化剂发酵轨迹】\n"
+            followup_section += "\n".join(_fmt_item(n, 150) for n in followups[:3])
+
+        # 分析师观点（100字）
+        analyst_section = ""
+        if analysts:
+            analyst_section = "\n\n🔍【分析师/机构观点】\n"
+            analyst_section += "\n".join(_fmt_item(n, 100) for n in analysts[:2])
+
+        # 历史背景（仅标题，帮助理解公司发展脉络）
+        bg_section = ""
+        if backgrounds:
+            bg_section = "\n\n📚【历史背景 — 公司近期发展脉络】\n"
+            bg_lines   = [
+                f"  [{n.get('days_ago','?')}天前] {n.get('source','')}: {n.get('title','')}"
+                for n in backgrounds[:4]
+            ]
+            bg_section += "\n".join(bg_lines)
+
+        # 孤立价格事件（无新闻的大涨大跌）
+        orphan_section = ""
+        if orphans:
+            orphan_section = "\n\n❓【孤立价格异动 — 大涨大跌但无对应公告，需核查】\n"
+            orphan_section += "\n".join(
+                f"  {e['date']}: 单日{'+' if e['change_pct']>0 else ''}{e['change_pct']}%"
+                for e in orphans[:4]
             )
 
-        block = f"""
-━━━ {c['ticker']} ━━━{trigger_block}
-今日量价: 涨{c['change_pct']}% | 量比{c['vol_ratio']}x | 换手${c['dollar_volume']:,}
-价位: ${c['price']} | VWAP${c['vwap']}(距{c['vwap_dist_pct']}%) | {"⚠️一字板" if c['is_straight'] else f"回调空间{c['pullback_room']}%"}
-历史技术: {metrics.get('trend','?')} | RSI={metrics.get('rsi_14','?')} | 5日{metrics.get('ret_5d_pct','?')}% | 60日{metrics.get('ret_60d_pct','?')}% | 距高点{metrics.get('pct_from_period_high','?')}%
-
-完整新闻/公告时间线（含正文）:
-{news_text}"""
+        pullback_label = "⚠️一字板" if c["is_straight"] else f"回调空间{c['pullback_room']}%"
+        block = (
+            f"\n{'━'*48}\n"
+            f"【{c['ticker']}】\n"
+            f"今日: 涨{c['change_pct']}% | 量比{c['vol_ratio']}x | 换手${c['dollar_volume']:,}\n"
+            f"价格: ${c['price']} | VWAP${c['vwap']}(距{c['vwap_dist_pct']}%)"
+            f" | {pullback_label}\n"
+            f"历史: {metrics.get('trend','?')} | RSI={metrics.get('rsi_14','?')}"
+            f" | 5日{metrics.get('ret_5d_pct','?')}% | 60日{metrics.get('ret_60d_pct','?')}%"
+            f" | 距高点{metrics.get('pct_from_period_high','?')}%"
+            f"{trigger_section}"
+            f"{followup_section}"
+            f"{analyst_section}"
+            f"{bg_section}"
+            f"{orphan_section}"
+        )
         blocks.append(block)
 
     stocks_section = "\n".join(blocks)
 
-    prompt = f"""你是专业的ASX短线量化分析师，今日为{date.today().isoformat()}。
-以下股票均已通过量化初筛（涨幅≥10%、量比≥1.5x、价格在VWAP 5%以内）。
+    return f"""你是专业的ASX短线量化分析师，今日为{date.today().isoformat()}。
+以下股票已通过量化初筛（涨≥10%、量比≥1.5x、VWAP偏离≤5%）且有≤2天内公告/新闻。
 
 {stocks_section}
 
-请对每只股票输出结构化分析，严格按照以下JSON格式，不要输出任何其他内容：
+请对每只股票输出结构化分析。严格按照以下JSON格式，不要输出任何JSON以外的内容：
 
 {{
   "TICKER.AX": {{
     "verdict": "买入" | "观望" | "回避",
     "confidence": "高" | "中" | "低",
-    "catalyst": "1句话：今日涨幅的直接触发事件是什么（必须引用具体公告/新闻标题或关键数字）",
-    "backstory": "2-3句话：这个催化剂的历史背景——公司此前做了什么、市场预期如何、今日公告是否超出预期",
-    "story_chain": "1-2句话：梳理时间线中的因果链——哪个早期事件埋下了今日涨幅的伏笔",
-    "short_term_view": "1-2句话：未来1-3日的可能走势（明确说明上行情景和下行风险，各1句）",
-    "entry_note": "入场参考：回踩VWAP $X.XX附近建仓 / 一字板暂不追入等待回调 / 等具体价位"
+    "catalyst": "1句：今日涨幅的直接触发事件（必须引用具体公告/新闻标题或关键数字，禁止泛化）",
+    "backstory": "2-3句：这个催化剂的历史背景——公司此前铺垫了什么，市场原有预期是什么，今日是否超预期",
+    "story_chain": "1-2句：从时间线中找出因果链——哪个早期事件为今日涨幅埋下伏笔（如：3个月前拿到XX合同，今日季报确认收入兑现）",
+    "short_term_view": "上行情景（1句）+ 下行风险（1句）",
+    "entry_note": "具体价位或条件：回踩VWAP $X.XX建仓 / 一字板等待回调至$X.XX / 等放量确认"
   }}
 }}
 
-分析要求：
-- catalyst/backstory/story_chain 三个字段合起来构成完整的"为什么今天涨"故事，必须有实质内容
-- verdict=买入：催化剂真实可验证 + 有历史背景支撑 + 非一字拉升
-- verdict=回避：一字板 / 无实质公告仅靠新闻炒作 / RSI>80且距高点<5%
-- 新闻正文或关键数字为空的字段，直接说"公告正文未获取，需核查"，禁止编造
-- 每个字段严格控制在规定句数内，禁止输出JSON以外的任何内容"""
-
-    return prompt
+分析规则：
+- catalyst/backstory/story_chain 三个字段合起来必须构成完整的"为什么今天涨"故事
+- 如果触发事件是"⚠️无明确触发事件"，verdict只能是"回避"
+- 孤立价格异动（无对应新闻）说明存在信息不对称，在short_term_view中必须提及
+- 无正文或关键数字的字段，明确写"公告正文未获取，需核查原文"，禁止编造
+- 每个字段严格控制在规定句数内"""
 
 
 def analyze_candidates_batch(candidates: list[dict]) -> dict[str, dict]:
@@ -1295,25 +1328,59 @@ def analyze_candidates_batch(candidates: list[dict]) -> dict[str, dict]:
 # ============================================================
 
 def send_telegram(msg: str) -> None:
+    """
+    发送 Telegram 消息，自动按4000字节分段。
+    叙事卡片版每只股票内容较多，单条可能超限，按段落切割保持完整性。
+    """
     if not TELEGRAM_TOKEN or not CHAT_ID:
         log.warning("Telegram未配置，跳过通知")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(
-            url,
-            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10,
-        )
-        if not resp.ok:
-            log.error(f"Telegram发送失败: {resp.status_code} {resp.text[:100]}")
-    except requests.RequestException as e:
-        log.error(f"Telegram请求异常: {e}")
+
+    url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    # 按段落切割（遇到连续换行），尽量保持每张卡片完整
+    chunks: list[str] = []
+    current = ""
+    for paragraph in msg.split("\n\n"):
+        candidate = (current + "\n\n" + paragraph).strip() if current else paragraph
+        if len(candidate) > 3800:
+            if current:
+                chunks.append(current.strip())
+            current = paragraph
+        else:
+            current = candidate
+    if current:
+        chunks.append(current.strip())
+
+    for chunk in chunks:
+        try:
+            resp = requests.post(
+                url,
+                json={
+                    "chat_id"                  : CHAT_ID,
+                    "text"                     : chunk,
+                    "parse_mode"               : "HTML",
+                    "disable_web_page_preview" : True,
+                },
+                timeout=10,
+            )
+            if not resp.ok:
+                log.error(f"Telegram发送失败: {resp.status_code} {resp.text[:100]}")
+        except requests.RequestException as e:
+            log.error(f"Telegram请求异常: {e}")
+        time.sleep(0.5)
 
 
 def format_telegram_message(candidates: list[dict], ai_results: dict, today: str) -> str:
-    """格式化最终Telegram消息"""
-    # 按verdict优先级排序：买入 > 观望 > 回避
+    """
+    格式化主报告 Telegram 消息——叙事卡片版。
+
+    设计原则：
+    - 每只股票是一张独立的"故事卡片"，从催化剂讲到入场建议
+    - 新增字段全部利用：backstory（背景）/ story_chain（因果链）
+    - 新闻正文摘要和关键数字直接在卡片里呈现，不只是标题
+    - 孤立价格事件（无对应新闻的大涨大跌）在卡片末尾警示
+    - 发送逻辑：header + 每只股票各一条消息（避免单条超4096字节）
+    """
     verdict_order = {"买入": 0, "观望": 1, "回避": 2}
     candidates.sort(
         key=lambda c: (
@@ -1324,42 +1391,96 @@ def format_telegram_message(candidates: list[dict], ai_results: dict, today: str
         )
     )
 
-    lines = [f"⚡ <b>First Pullback 候选 {today}</b>\n"]
+    # 统计摘要
+    buy_cnt   = sum(1 for c in candidates
+                    if ai_results.get(c["ticker"], {}).get("verdict") == "买入")
+    watch_cnt = sum(1 for c in candidates
+                    if ai_results.get(c["ticker"], {}).get("verdict") == "观望")
+    avoid_cnt = sum(1 for c in candidates
+                    if ai_results.get(c["ticker"], {}).get("verdict") == "回避")
 
-    for c in candidates:
-        ai  = ai_results.get(c["ticker"], {})
+    header = (
+        f"⚡ <b>First Pullback 候选 {today}</b>\n"
+        f"共 {len(candidates)} 只 | "
+        f"🟢买入:{buy_cnt}  🟡观望:{watch_cnt}  🔴回避:{avoid_cnt}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    cards = [header]
+
+    for idx, c in enumerate(candidates, 1):
+        ai      = ai_results.get(c["ticker"], {})
         verdict = ai.get("verdict", "—")
         conf    = ai.get("confidence", "—")
         verdict_emoji = {"买入": "🟢", "观望": "🟡", "回避": "🔴"}.get(verdict, "⚪")
 
-        src_flag = "📋 ASX" if c.get("ann_source") == "asx" else "📰 新闻"
+        # ── 行情数据行 ────────────────────────────────────────
+        sl_flag  = "⚠️一字板" if c["is_straight"] else f"↩回调{c['pullback_room']}%"
+        src_flag = "📋ASX" if c.get("ann_source") == "asx" else "📰新闻"
         sen_flag = "⭐" if c.get("ann_sensitive") else ""
-        sl_flag  = "⚠️ 一字" if c["is_straight"] else f"↩ 回调{c['pullback_room']}%"
 
-        lines.append(
-            f"{verdict_emoji} <b>{c['ticker']}</b>  {verdict}({conf})  "
-            f"+{c['change_pct']}%  量:{c['vol_ratio']}x\n"
-            f"   💰 ${c['price']} | VWAP ${c['vwap']}(±{c['vwap_dist_pct']}%) | {sl_flag}\n"
-            f"   {src_flag}{sen_flag} {c.get('ann_headline','')}\n"
-        )
+        card_lines = [
+            f"\n{verdict_emoji} <b>#{idx} {c['ticker']}</b>  "
+            f"{verdict}（{conf}信心）  +{c['change_pct']}%  量{c['vol_ratio']}x",
 
+            f"💰 ${c['price']} | VWAP${c['vwap']}(偏{c['vwap_dist_pct']}%) | {sl_flag}",
+            f"{src_flag}{sen_flag} <i>{c.get('ann_headline', '')[:80]}</i>",
+        ]
+
+        # ── 触发催化剂（今日涨幅的直接原因）────────────────────
         if ai.get("catalyst"):
-            lines.append(f"   🔥 催化: {ai['catalyst']}\n")
-        if ai.get("backstory"):
-            lines.append(f"   📖 背景: {ai['backstory']}\n")
-        if ai.get("story_chain"):
-            lines.append(f"   🔗 因果: {ai['story_chain']}\n")
-        if ai.get("short_term_view"):
-            lines.append(f"   📈 短期: {ai['short_term_view']}\n")
-        if ai.get("entry_note"):
-            lines.append(f"   🎯 入场: {ai['entry_note']}\n")
+            card_lines.append(f"\n🔥 <b>催化剂</b>: {ai['catalyst']}")
 
-    lines.append(
-        "\n─────────────────\n"
-        "⚠️ 止损: 跌破启动低点或 -8%\n"
-        "💰 止盈: +10%锁半仓，+20%清仓"
+        # ── 历史背景（铺垫这个催化剂的前情）────────────────────
+        if ai.get("backstory"):
+            card_lines.append(f"📖 <b>背景</b>: {ai['backstory']}")
+
+        # ── 因果链（从早期埋伏到今日引爆）──────────────────────
+        if ai.get("story_chain"):
+            card_lines.append(f"🔗 <b>因果链</b>: {ai['story_chain']}")
+
+        # ── 触发新闻正文摘要（最多1条trigger，最多150字）────────
+        # 这是关键：让读者拿到真实内容而不只是标题
+        timeline = c.get("news_timeline", [])
+        trigger_items = [n for n in timeline if n.get("chain_role") == "trigger"]
+        if trigger_items:
+            t_item = trigger_items[0]
+            body   = t_item.get("body", "")
+            facts  = t_item.get("key_facts", [])
+            if body:
+                body_short = body[:160].rstrip()
+                if len(body) > 160:
+                    body_short += "..."
+                card_lines.append(f"📄 <b>公告摘要</b>: {body_short}")
+            if facts:
+                card_lines.append(f"📊 <b>关键数字</b>: {' | '.join(facts[:4])}")
+
+        # ── 孤立价格事件警告（大涨大跌无对应新闻）──────────────
+        orphans = c.get("orphan_price_events", [])
+        if orphans:
+            orphan_str = "、".join(
+                f"{e['date']}单日{'+' if e['change_pct']>0 else ''}{e['change_pct']}%"
+                for e in orphans[:2]
+            )
+            card_lines.append(f"❓ <b>异动警示</b>: {orphan_str}（无对应公告，需核查）")
+
+        # ── 短期展望 + 入场建议 ──────────────────────────────────
+        if ai.get("short_term_view"):
+            card_lines.append(f"\n📈 <b>短期</b>: {ai['short_term_view']}")
+        if ai.get("entry_note"):
+            card_lines.append(f"🎯 <b>入场</b>: {ai['entry_note']}")
+
+        card_lines.append("─" * 22)
+        cards.append("\n".join(card_lines))
+
+    # 尾部固定止盈止损提示
+    cards.append(
+        "⚠️ <b>止损</b>: 跌破启动低点或 -8%\n"
+        "💰 <b>止盈</b>: +10% 锁半仓，+20% 清仓\n"
+        "本内容仅供参考，不构成投资建议。"
     )
-    return "\n".join(lines)
+
+    return "\n".join(cards)
 
 
 # ============================================================
@@ -1392,7 +1513,7 @@ def run_morning_scan() -> None:
     liquid: list[str] = []
     for t, df in daily_data.items():
         try:
-            avg_vol    = float(df["Volume"].iloc[-20:].mean())
+            avg_vol    = float(safe_series(df, "Volume").iloc[-20:].mean())
             last_close = float(safe_series(df, "Close").iloc[-1])
             if avg_vol * last_close >= FILTER["min_dollar_volume"]:
                 liquid.append(t)
@@ -1457,20 +1578,64 @@ def run_morning_scan() -> None:
         )
         return
 
-    # ── 阶段二：精筛数据采集（历史指标 + 新闻时间线）──────────
-    log.info("【阶段二】采集历史指标和新闻时间线...")
+    # ── 阶段二：精筛数据采集（历史指标 + 新闻时间线 + 新闻门控）──
+    log.info("【阶段二】采集历史指标和新闻时间线（含新闻质量门控）...")
 
+    final_pass: list[dict] = []
     for c in stage1_pass:
-        code = c["ticker"].replace(".AX", "")
-
-        # 历史指标（从已有日线数据计算，无需额外API调用）
+        code  = c["ticker"].replace(".AX", "")
         daily = daily_data.get(c["ticker"])
+
+        # 历史指标（复用已有日线，无额外API调用）
         c["hist_metrics"] = compute_historical_metrics(daily) if daily is not None else {}
 
-        # 新闻时间线（这里会额外调用ASX+yfinance）
+        # 新闻时间线（触发PDF下载 + 网页正文抓取）
         log.info(f"  📰 {c['ticker']}: 获取新闻时间线...")
-        c["news_timeline"] = get_stock_news_timeline(code, days_back=90)
-        time.sleep(0.5)  # 避免ASX API限速
+        timeline = get_stock_news_timeline(code, days_back=90)
+
+        # ── 硬性门控：无≤2天内新闻/公告则直接DROP ──────────
+        # 这是Morning Scanner的核心哲学：没有催化剂就没有故事，
+        # 没有故事就没有文章，没有文章就不应该出现在候选列表里。
+        if not has_recent_news(timeline, max_days=2):
+            log.info(
+                f"  🚫 {c['ticker']}: 新闻门控DROP — "
+                f"无≤2天内公告/新闻（最新: {timeline[0]['days_ago'] if timeline else 'N/A'}天前）"
+            )
+            continue
+
+        # 价格-事件对齐：把历史涨跌节点和对应新闻自动关联
+        # 让Gemini能直接读取"那条公告导致了那次+8%"的因果关系
+        if daily is not None:
+            orphan_events = align_price_events_to_news(daily, timeline)
+            if orphan_events:
+                # 孤立价格事件（无对应新闻的大涨大跌）也存入候选，
+                # 可能是内幕消息提前反应，Gemini需要知道
+                c["orphan_price_events"] = orphan_events
+                log.info(
+                    f"  ⚠️ {c['ticker']}: {len(orphan_events)}个孤立价格事件"
+                    f"（大涨大跌无对应新闻，提示Gemini核查）"
+                )
+
+        c["news_timeline"] = timeline
+        final_pass.append(c)
+        time.sleep(0.5)
+
+    dropped = len(stage1_pass) - len(final_pass)
+    log.info(
+        f"阶段二完成：{len(final_pass)} 只通过新闻门控"
+        f"（{dropped} 只因无近期新闻DROP）"
+    )
+
+    if not final_pass:
+        send_telegram(
+            f"📋 <b>First Pullback 早盘扫描 {today}</b>\n\n"
+            f"技术筛选通过 {len(stage1_pass)} 只，但均无近2天内新闻/公告。\n"
+            f"无故事可讲，今日不发候选。"
+        )
+        return
+
+    # 用通过门控的列表替换（后续阶段统一用 final_pass）
+    stage1_pass = final_pass
 
     # ── 阶段三：Gemini综合分析 ──────────────────────────────
     log.info("【阶段三】Gemini综合分析...")
@@ -1508,150 +1673,280 @@ def run_morning_scan() -> None:
 
 def _build_morning_stock_block(c: dict, ai: dict, rank: int) -> str:
     """
-    构建单只股票的完整数据块，供Prompt消费。
-    包含：盘中量价结构 + 历史指标摘要 + 新闻时间线 + Gemini初步结论。
-    """
-    code    = c["ticker"].replace(".AX", "")
-    metrics = c.get("hist_metrics", {})
-    ai      = ai or {}
+    构建单只股票的完整文案素材包。
 
-    # 新闻时间线文本（含正文摘要+关键数字——这才是故事原材料）
-    timeline_lines = []
-    for n in c.get("news_timeline", [])[:8]:
+    数据分层结构（文案AI可按层取用）：
+      Section A — 今日行情快照（量价结构）
+      Section B — 事件链时间线（按chain_role分组）
+                  🔥 trigger   直接催化剂（含正文+关键数字，这是故事核心）
+                  📈 followup  后续进展（催化剂发酵轨迹）
+                  🔍 analyst   分析师/机构观点
+                  📚 background 历史背景（公司发展脉络）
+      Section C — 孤立价格异动（大涨大跌无对应新闻，信息不对称警示）
+      Section D — 历史技术摘要
+      Section E — AI量化结论（三层故事结构）
+
+    设计原则：正文和关键数字优先展示，标题降级为辅助信息。
+    """
+    ai      = ai or {}
+    metrics = c.get("hist_metrics", {})
+    timeline = c.get("news_timeline", [])
+
+    # ── Section A：今日行情快照 ────────────────────────────────
+    sl_flag  = "⚠️ 一字拉升（暂不追入）" if c["is_straight"] else f"✅ 回调空间{c['pullback_room']}%"
+    src_flag = "ASX官方公告" if c.get("ann_source") == "asx" else "新闻来源"
+    sen_flag = "（⭐价格敏感公告）" if c.get("ann_sensitive") else ""
+
+    section_a = (
+        f"【今日行情快照】\n"
+        f"  涨幅 +{c['change_pct']}% | 量比 {c['vol_ratio']}x"
+        f" | 日换手 ${c['dollar_volume']:,}\n"
+        f"  价格 ${c['price']} | VWAP ${c['vwap']}（偏离{c['vwap_dist_pct']}%）"
+        f" | {sl_flag}\n"
+        f"  今日高点 ${c['today_high']} | 启动低点 ${c['launch_pt']}\n"
+        f"  催化剂来源: {src_flag}{sen_flag}\n"
+        f"  公告标题: {c.get('ann_headline', '无')}"
+    )
+
+    # ── Section B：事件链时间线（按chain_role分层）─────────────
+    chain_groups: dict[str, list] = {
+        "trigger"   : [],
+        "followup"  : [],
+        "analyst"   : [],
+        "background": [],
+    }
+    for n in timeline:
+        role = n.get("chain_role", "background")
+        if role in chain_groups:
+            chain_groups[role].append(n)
+
+    def _render_news_item(n: dict, body_limit: int, show_body: bool = True) -> str:
+        """渲染单条新闻：标题 + 关键数字 + 正文（按体量截取）"""
         days     = n.get("days_ago", "?")
-        src      = n.get("source", "")
+        src      = n.get("source", "未知")
         title    = n.get("title", "")
         body     = n.get("body", "")
         facts    = n.get("key_facts", [])
-        move_str = n.get("price_move_str", "")   # 价格-事件对齐结果
-        flag     = "⭐" if n.get("sensitive") else "📋" if "公告" in src else "📰"
-        trigger  = "🔥【今日触发】" if n.get("is_trigger") else ""
+        move_str = n.get("price_move_str", "")
+        sens     = "⭐" if n.get("sensitive") else ""
 
-        move_label = f" → 市场反应:{move_str}" if move_str else ""
-        timeline_lines.append(f"\n  [{days}天前] {flag}{trigger} {src}")
-        timeline_lines.append(f"  标题: {title}{move_label}")
+        move_label = f"  → 股价反应: {move_str}" if move_str else ""
+        lines      = [f"  [{days}天前] {sens}{src}: {title}{move_label}"]
 
-        # 关键数字：定量事实，讲故事的"弹药"
+        # 关键数字是讲故事的"弹药"，始终展示
         if facts:
-            timeline_lines.append(f"  关键数字: {' | '.join(facts[:6])}")
+            lines.append(f"  📊 关键数字: {' | '.join(facts[:6])}")
 
-        # 正文摘要（300字足够讲清一个事件的来龙去脉）
-        if body:
-            body_trim = body[:300].rstrip()
-            if len(body) > 300:
+        # 正文按重要性决定给多少字
+        if show_body and body:
+            body_trim = body[:body_limit].rstrip()
+            if len(body) > body_limit:
                 body_trim += "..."
-            timeline_lines.append(f"  正文: {body_trim}")
+            lines.append(f"  📝 正文: {body_trim}")
 
-    timeline_text = "\n".join(timeline_lines) if timeline_lines else "  无近期公告/新闻"
+        return "\n".join(lines)
 
-    # 历史技术摘要（压缩为关键数字，不传原始序列）
-    hist_block = (
-        f"趋势:{metrics.get('trend','?')} | "
-        f"RSI={metrics.get('rsi_14','?')} | "
-        f"5日涨{metrics.get('ret_5d_pct','?')}% | "
-        f"20日涨{metrics.get('ret_20d_pct','?')}% | "
-        f"60日涨{metrics.get('ret_60d_pct','?')}%\n"
-        f"  年化波动:{metrics.get('vol_annualized_pct','?')}% | "
-        f"距历史高点:{metrics.get('pct_from_period_high','?')}% | "
-        f"量能趋势(5v20):{metrics.get('vol_trend_5v20','?')}x"
+    timeline_sections = []
+
+    # trigger：最重要，正文给足400字，最多2条
+    if chain_groups["trigger"]:
+        timeline_sections.append("🔥【直接催化剂 — 今日涨幅的触发事件（最重要）】")
+        for n in chain_groups["trigger"][:2]:
+            timeline_sections.append(_render_news_item(n, body_limit=400, show_body=True))
+
+    # followup：后续进展，正文200字，最多3条
+    if chain_groups["followup"]:
+        timeline_sections.append("\n📈【后续进展 — 催化剂发酵轨迹】")
+        for n in chain_groups["followup"][:3]:
+            timeline_sections.append(_render_news_item(n, body_limit=200, show_body=True))
+
+    # analyst：机构观点，正文150字，最多2条
+    if chain_groups["analyst"]:
+        timeline_sections.append("\n🔍【分析师/机构观点】")
+        for n in chain_groups["analyst"][:2]:
+            timeline_sections.append(_render_news_item(n, body_limit=150, show_body=True))
+
+    # background：历史背景，只显示标题+关键数字（不给正文，节省token）
+    if chain_groups["background"]:
+        timeline_sections.append("\n📚【历史背景 — 理解公司发展脉络，帮助判断今日催化剂是否超预期】")
+        for n in chain_groups["background"][:4]:
+            timeline_sections.append(_render_news_item(n, body_limit=0, show_body=False))
+
+    section_b = (
+        "【事件链时间线（按催化剂角色分层）】\n"
+        + ("\n".join(timeline_sections) if timeline_sections else "  暂无新闻/公告数据")
     )
 
-    # Gemini故事分析（结构化输出，供文案AI直接引用讲故事）
-    gemini_summary = ""
-    if ai:
-        verdict = ai.get("verdict", "")
-        conf    = ai.get("confidence", "")
-        parts   = [f"量化判断: {verdict}（{conf}信心）"] if verdict else []
-        # 故事三层结构：触发 → 背景 → 因果链
-        if ai.get("catalyst"):
-            parts.append(f"🔥 今日触发: {ai['catalyst']}")
-        if ai.get("backstory"):
-            parts.append(f"📖 历史背景: {ai['backstory']}")
-        if ai.get("story_chain"):
-            parts.append(f"🔗 因果链: {ai['story_chain']}")
-        if ai.get("short_term_view"):
-            parts.append(f"📈 短期展望: {ai['short_term_view']}")
-        if ai.get("entry_note"):
-            parts.append(f"🎯 入场参考: {ai['entry_note']}")
-        gemini_summary = "\n  ".join(parts)
+    # ── Section C：孤立价格事件（大涨大跌无对应新闻）───────────
+    orphans     = c.get("orphan_price_events", [])
+    section_c   = ""
+    if orphans:
+        orphan_lines = [
+            f"  {e['date']}: 单日{'+' if e['change_pct']>0 else ''}{e['change_pct']}%"
+            f"（无对应公告）"
+            for e in orphans[:4]
+        ]
+        section_c = (
+            "\n❓【孤立价格异动 — 大涨大跌但无对应公告，可能存在信息不对称】\n"
+            "（写作时请提示读者核查是否有未公开信息）\n"
+            + "\n".join(orphan_lines)
+        )
 
-    sl_flag = "⚠️ 一字拉升（暂不追入）" if c["is_straight"] else f"✅ 回调空间{c['pullback_room']}%"
-
-    return (
-        f"\n{'='*52}\n"
-        f"#{rank} {c['ticker']} | {c.get('ann_headline', '无公告')[:60]}\n"
-        f"{'='*52}\n"
-        f"【今日异动数据】\n"
-        f"  涨幅: +{c['change_pct']}%  | 量比: {c['vol_ratio']}x"
-        f" | 换手: ${c['dollar_volume']:,}\n"
-        f"  价格: ${c['price']} | VWAP ${c['vwap']}(距{c['vwap_dist_pct']}%)"
-        f" | {sl_flag}\n"
-        f"  今日高点: ${c['today_high']} | 启动低点: ${c['launch_pt']}\n"
-        f"  公告来源: {'ASX官方' if c.get('ann_source')=='asx' else '新闻'}"
-        f"{'  ⭐价格敏感' if c.get('ann_sensitive') else ''}\n\n"
-        f"【历史技术摘要（近6个月）】\n  {hist_block}\n\n"
-        f"【精选新闻/公告时间线】\n{timeline_text}\n\n"
-        f"【AI量化初步结论（供参考）】\n  {gemini_summary if gemini_summary else '暂无'}"
+    # ── Section D：历史技术摘要 ────────────────────────────────
+    section_d = (
+        "【历史技术摘要（近6个月）】\n"
+        f"  趋势: {metrics.get('trend','?')} | "
+        f"RSI: {metrics.get('rsi_14','?')} | "
+        f"5日涨: {metrics.get('ret_5d_pct','?')}% | "
+        f"20日涨: {metrics.get('ret_20d_pct','?')}% | "
+        f"60日涨: {metrics.get('ret_60d_pct','?')}%\n"
+        f"  年化波动: {metrics.get('vol_annualized_pct','?')}% | "
+        f"距历史高点: {metrics.get('pct_from_period_high','?')}% | "
+        f"量能趋势(近5日/20日均量): {metrics.get('vol_trend_5v20','?')}x"
     )
+
+    # ── Section E：AI量化结论（三层故事结构）────────────────────
+    ai_lines = []
+    verdict  = ai.get("verdict", "")
+    conf     = ai.get("confidence", "")
+    if verdict:
+        ai_lines.append(f"  量化判断: {verdict}（{conf}信心）")
+    if ai.get("catalyst"):
+        ai_lines.append(f"  🔥 今日触发: {ai['catalyst']}")
+    if ai.get("backstory"):
+        ai_lines.append(f"  📖 历史背景: {ai['backstory']}")
+    if ai.get("story_chain"):
+        ai_lines.append(f"  🔗 因果链: {ai['story_chain']}")
+    if ai.get("short_term_view"):
+        ai_lines.append(f"  📈 短期展望: {ai['short_term_view']}")
+    if ai.get("entry_note"):
+        ai_lines.append(f"  🎯 入场参考: {ai['entry_note']}")
+
+    section_e = (
+        "【AI量化初步结论（三层故事结构，供文案参考）】\n"
+        + ("\n".join(ai_lines) if ai_lines else "  暂无AI分析")
+    )
+
+    # ── 拼装完整数据块 ────────────────────────────────────────
+    parts = [
+        f"\n{'='*56}",
+        f"#{rank} {c['ticker']}",
+        f"{'='*56}",
+        section_a,
+        "",
+        section_b,
+    ]
+    if section_c:
+        parts.append(section_c)
+    parts += ["", section_d, "", section_e]
+
+    return "\n".join(parts)
 
 
 def _build_morning_prompt(platform: str, stocks_block: str,
                           today: str, n_candidates: int) -> str:
     """
     生成各平台的最终Prompt文本。
-    Morning版本强调：催化剂驱动、短线窗口、纪律止损，与EOD日报的中期逻辑叙事不同。
+
+    数据包说明注入策略：
+    - 在数据包引言里明确告诉文案AI各字段含义
+    - 强制三层叙事结构（触发→背景→因果链）
+    - 明确指出chain_role的含义，避免AI忽略事件分类
+    - 孤立价格异动单独提示，要求文案AI处理信息不对称问题
     """
+    # 数据包说明（三个平台共用，避免重复写）
+    data_guide = (
+        "【数据包说明 — 请务必阅读后再生成内容】\n"
+        "每只股票的数据按以下结构组织：\n"
+        "  🔥 直接催化剂(trigger)：今日涨幅的直接触发事件，含正文摘要和关键数字\n"
+        "     → 这是故事的核心，必须具体引用，不能泛化\n"
+        "  📈 后续进展(followup)：催化剂发酵的中间节点，说明市场如何消化这个事件\n"
+        "  🔍 分析师观点(analyst)：机构如何解读，帮助判断市场共识\n"
+        "  📚 历史背景(background)：公司此前的铺垫，解释为什么今天这件事重要\n"
+        "  ❓ 孤立价格异动：大涨大跌但无对应公告，写作时须提示读者核查\n"
+        "  AI量化结论：已提供catalyst/backstory/story_chain三层分析，可直接引用\n"
+        "数据优先级：公告PDF正文 > ASX公告标题 > 新闻正文 > 技术指标"
+    )
+
     instructions = {
-        "telegram": f"""生成**中文** ASX早盘异动简报（Telegram格式，今日{today}）：
+        "telegram": (
+            f"生成**中文** ASX早盘催化剂简报（Telegram格式，今日{today}）。\n\n"
+            "【强制三层叙事框架 — 每只股票必须包含】：\n"
+            "  第一层 今天发生了什么（trigger事件）：具体内容+关键数字，禁止写'公司发布公告'这种空话\n"
+            "  第二层 为什么重要（background铺垫）：公司此前做了什么，今日是否超预期，超在哪里\n"
+            "  第三层 故事主线（story_chain）：一句话'X个月前→中间节点→今日兑现'\n\n"
+            "【输出格式】：\n"
+            "1. 开头2句：今日市场氛围 + 本次候选的共同催化剂主题\n"
+            "2. 每只股票（≤200字）：公司简介(1句) → 三层叙事 → 技术面(1句，VWAP位置) → 结论\n"
+            "3. 结尾：1句整体风险提示\n\n"
+            "规则：禁止罗列原始数字，转化为判断语言；"
+            "不确定内容注明'需自行核查'；适当Emoji；末尾⚠️免责声明。"
+        ),
 
-1. 开头2句：今日ASX开盘氛围 + 本次异动股的共同主题（如"矿业催化剂集中爆发"）
-2. 每只股票（各一段）：
-   - 一句话公司简介
-   - 今日异动原因（基于公告/新闻，2-3句）
-   - 短线技术面（1句：VWAP位置 + 是否已出现回调空间）
-   - 入场建议（买入/观望/回避 + 一句理由 + 止损位）
-3. 结尾：1句风险提示
+        "twitter": (
+            f"Generate an English X (Twitter) thread — ASX morning catalyst report ({today}).\n\n"
+            "MANDATORY NARRATIVE RULE — Each stock tweet answers THREE questions:\n"
+            "  Q1 What happened? (trigger event — cite specific data/number from the announcement)\n"
+            "  Q2 Why does this matter? (background — what was expected, did this beat it?)\n"
+            "  Q3 What's the story arc? (story_chain — 'X months ago → milestone → today confirmed')\n\n"
+            "FORMAT:\n"
+            f"Tweet 1 (hook ≤250 chars): Biggest move of the day + catalyst theme\n"
+            f"Tweets 2–{n_candidates + 1}: One per stock:\n"
+            "  Line 1: $ASX:TICKER +X% | [Trigger: specific announcement + key number]\n"
+            "  Line 2: [Why it matters + story arc in 1 line] | Buy/Watch/Avoid\n"
+            "  Note: Flag 'unconfirmed' for any orphan price move without announcement\n"
+            "Final tweet: Key risk + #ASX #Catalyst #AustralianStocks + disclaimer\n\n"
+            "Rules: Convert numbers to judgment language. ≤280 chars/tweet. Separator: ---TWEET---"
+        ),
 
-格式要求：适当Emoji，每只≤150字，量化数据转化为判断语言（禁止罗列原始数字），
-末尾加⚠️免责声明。不确定内容注明"需自行核查"。""",
-
-        "twitter": f"""Generate an English X (Twitter) thread about today's ASX morning movers ({today}):
-
-Tweet 1 (hook ≤250 chars): Opening line with the biggest move % + catalyst theme
-Tweets 2-{n_candidates+1}: One per stock — $ASX:TICKER | +X% | Catalyst in 1 line | Buy/Watch/Avoid
-Final tweet: Risk reminder + #ASX #MorningScan #AustralianStocks + disclaimer
-
-Rules: No raw numbers dump — convert to judgment. Flag uncertainty as "unconfirmed".
-Each tweet ≤280 chars. Use ---TWEET--- as separator between tweets.""",
-
-        "xiaohongshu": f"""生成**中文**小红书早盘异动笔记（今日{today}）：
-
-标题（≤20字，含核心数据，例如"今日ASX这{n_candidates}只股暴涨，背后原因是..."）
-开头钩子（2句，引发好奇心）
-正文：每只股票用"为什么今天突然涨？"叙事角度
-  - 核心催化剂（公告/新闻事件）
-  - 技术信号（1-2句，口语化）
-  - 我的判断（买入/观望/回避 + 理由）
-结尾：今日早盘启示 + 风险提示
-话题标签：#澳股 #ASX投资 #股票 #早盘异动（3-5个）
-末尾免责声明。写作风格：专业但亲切，像朋友分享，不确定注明"待核查"。""",
+        "xiaohongshu": (
+            f"生成**中文**小红书投资笔记（今日{today}，共{n_candidates}只早盘异动股）。\n\n"
+            "【叙事定位】：不是数据播报员，是'投资侦探'——\n"
+            "你发现了今日涨停背后的完整故事，从几个月前的铺垫写到今天的爆发，\n"
+            "让读者恍然大悟'原来这家公司早就埋了这颗种子'。\n\n"
+            "【每只股票必须包含三层故事】：\n"
+            "  ① 今天的引爆点（trigger事件，必须有具体内容，引用关键数字）\n"
+            "  ② 为什么今天这件事让股价爆了（background，逻辑解释）\n"
+            "  ③ 时间线上的伏笔（story_chain，'X个月前→...→今日兑现'）\n\n"
+            "【输出格式】：\n"
+            "标题（≤20字，钩子式，含情绪词，例如'这家公司埋了X个月的局，今天爆了'）\n"
+            "开头钩子（2句，引发好奇心，不剧透答案）\n"
+            "每只股票：\n"
+            "  🔍 公司是谁（1句行业+主营）\n"
+            "  💥 今天发生了什么（trigger，含具体数字）\n"
+            "  🏗️ 背景故事（2-3句，为什么重要）\n"
+            "  🔗 时间线伏笔（1-2句因果链）\n"
+            "  ❓ 如有孤立价格异动，提示读者'X日曾有不明原因大涨，需核查'\n"
+            "  📊 技术信号（1句，口语化，不堆数字）\n"
+            "  🎯 我的判断（买入/观望/回避 + 1句理由）\n"
+            "结尾：今日投资启示（1句心得）+ 风险提示\n"
+            "话题：#澳股 #ASX投资 #股票分析 #早盘异动（可加行业标签）\n"
+            "写作风格：专业但亲切，像朋友分享干货；不确定写'待核查'；末尾免责声明。"
+        ),
     }
 
     instruction = instructions.get(platform, instructions["telegram"])
 
     return (
-        f"📋 <b>ASX早盘Prompt — {platform.upper()} — {today}</b>\n"
+        f"📋 <b>ASX早盘文案Prompt — {platform.upper()} — {today}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>👇 复制以下全部内容给AI生成文章</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"你是一位专注澳大利亚股市(ASX)的资深短线分析师。\n\n"
-        f"=== 今日早盘异动数据包（共{n_candidates}只候选）===\n"
+        f"你是一位专注澳大利亚股市(ASX)的资深短线分析师，"
+        f"擅长用催化剂驱动的叙事方式分析个股异动。\n\n"
+        f"{data_guide}\n\n"
+        f"=== 今日早盘数据包"
+        f"（{n_candidates}只候选，均已通过新闻门控：≤2天内有公告/新闻）===\n"
         f"{stocks_block}\n\n"
         f"=== 输出任务 ===\n"
         f"{instruction}\n\n"
-        f"规则：数据来自公开渠道，不构成投资建议。"
-        f"数据矛盾时优先级：公告原文 > 新闻 > 技术指标。"
-        f"禁止重复罗列原始数字，转化为判断语言。\n"
+        f"=== 全局规则（优先级最高，任何平台均适用）===\n"
+        f"1. 数据优先级：公告PDF正文 > ASX公告标题 > 新闻正文 > 技术指标\n"
+        f"2. 禁止罗列原始数字，必须转化为投资判断语言\n"
+        f"3. 无正文的字段写'正文未获取，建议查看ASX原文'\n"
+        f"4. 孤立价格异动（❓标注）必须在文中提示读者核查\n"
+        f"5. 三层叙事（触发→背景→因果链）缺一不可，不得压缩成一句话\n"
+        f"6. 所有内容不构成投资建议，末尾必须加免责声明\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -1663,9 +1958,14 @@ def run_report_prompt(
 ) -> None:
     """
     日报Prompt生成主函数。
-    输入：stage1_pass（已含news_timeline和hist_metrics）+ ai_results
-    输出：向Telegram发送三个平台的Prompt文本，用户复制给AI生成文案
+    输入：stage1_pass（已含news_timeline、hist_metrics、orphan_price_events）+ ai_results
+    输出：向Telegram发送三个平台的Prompt文本，用户复制给AI生成文案。
     不调用Gemini，不产生额外API费用。
+
+    发送策略：
+    - 每个平台Prompt之间等待3秒，避免Telegram限速
+    - 每个Prompt发送前先发一条简短header，标注平台和股票数
+    - send_telegram() 内部已按段落自动分段，无需手动切割
     """
     if not candidates:
         log.warning("run_report_prompt：无候选股，跳过")
@@ -1682,28 +1982,57 @@ def run_report_prompt(
             -c["change_pct"],
         ),
     )
+    n_candidates = len(sorted_candidates)
 
-    # 构建股票数据块（每只股票一个块）
-    stock_blocks = []
+    # 构建股票数据块（所有平台共用同一份数据包）
+    log.info(f"构建{n_candidates}只股票的文案数据包...")
+    stock_blocks: list[str] = []
     for rank, c in enumerate(sorted_candidates, 1):
-        ai  = ai_results.get(c["ticker"], {})
+        ai    = ai_results.get(c["ticker"], {})
         block = _build_morning_stock_block(c, ai, rank)
         stock_blocks.append(block)
-        log.info(f"  数据块构建完成 #{rank}: {c['ticker']}")
 
-    stocks_block  = "\n".join(stock_blocks)
-    n_candidates  = len(sorted_candidates)
+        # 统计各层内容丰富度（便于debug）
+        timeline   = c.get("news_timeline", [])
+        has_body   = sum(1 for n in timeline if n.get("body"))
+        has_facts  = sum(1 for n in timeline if n.get("key_facts"))
+        has_orphan = len(c.get("orphan_price_events", []))
+        log.info(
+            f"  #{rank} {c['ticker']}: "
+            f"新闻{len(timeline)}条 | 含正文{has_body} | "
+            f"含关键数字{has_facts} | 孤立事件{has_orphan}"
+        )
 
-    # 发送三个平台Prompt
+    stocks_block = "\n".join(stock_blocks)
+
+    # 发送三个平台Prompt（每个平台之间3秒间隔）
+    platform_labels = {
+        "telegram"    : "Telegram 中文简报",
+        "twitter"     : "X/Twitter 英文Thread",
+        "xiaohongshu" : "小红书 投资笔记",
+    }
     for platform in ["telegram", "twitter", "xiaohongshu"]:
-        log.info(f"  发送 [{platform}] Prompt...")
+        label = platform_labels[platform]
+        log.info(f"  发送 [{label}] Prompt...")
+
+        # 先发一条简短header，用户知道接下来是什么
+        send_telegram(
+            f"📝 <b>文案Prompt — {label}</b>\n"
+            f"共{n_candidates}只股票 | 复制以下内容给AI生成文章 👇"
+        )
+        time.sleep(1.0)
+
         prompt_text = _build_morning_prompt(
             platform, stocks_block, today, n_candidates
         )
         send_telegram(prompt_text)
-        time.sleep(2.0)   # 避免Telegram限速（连续发长消息）
+        log.info(f"  ✅ [{label}] Prompt已发送（{len(prompt_text)}字符）")
+        time.sleep(3.0)  # 平台间间隔，避免Telegram限速
 
-    log.info(f"日报Prompt发送完成（{n_candidates}只股票 × 3平台）")
+    log.info(
+        f"日报Prompt全部发送完成 | "
+        f"{n_candidates}只股票 × 3平台 | 今日{today}"
+    )
 
 
 if __name__ == "__main__":
