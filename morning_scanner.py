@@ -1873,8 +1873,142 @@ def _build_morning_prompt(platform: str, stocks_block: str,
 
     instructions = {
         "seo": f"""\
-Write an English SEO-optimised investment analysis article about today's ASX morning movers ({today}).
-(SEO instruction placeholder — detailed requirements to be defined.)""",
+You are a short-term trading research analyst specializing in US equities.
+
+Your task is to generate a high-value intraday market analysis report based strictly on real-time scanner data captured within the first 30 minutes after market open (NOT EOD / closing data).
+
+⸻
+
+Core Objective
+
+* Identify early-session momentum and abnormal market behavior
+* Extract actionable trading signals
+* Maintain strict separation from end-of-day analysis logic
+
+⸻
+
+Critical Constraint (Mandatory)
+
+You MUST explicitly state at the beginning:
+
+This analysis is based on intraday scanner data captured within the first 30 minutes after market open (not end-of-day data).
+
+This is required to avoid misinterpretation as EOD analysis.
+
+⸻
+
+Output Requirement (STRICT)
+
+You must output TWO versions of the report:
+
+1. English version
+2. Chinese version
+
+Each version must be placed in a separate code block.
+
+⸻
+
+Content Requirements (Flexible Structure, Not Template-Bound)
+
+1. Title (CTR optimized)
+
+* Must include:
+    * “Today / Early Session”
+    * Price movement or % change if available
+    * Catalyst or driver keyword (earnings / placement / momentum / breakout)
+* Avoid repetitive phrasing across outputs
+
+⸻
+
+2. Opening Context (Mandatory)
+
+Must include:
+
+* Market tone (risk-on / risk-off / rotation)
+* Key abnormal early-session behavior
+* Scanner time reference (early session only)
+
+⸻
+
+3. Catalyst & Interpretation Layer
+
+Explain:
+
+* What triggered the move (event / flow / technical breakout)
+* Why the market is reacting now
+* Why this is meaningful in an intraday context
+
+Avoid listing facts only — must include interpretation.
+
+⸻
+
+4. Intraday Trading Signal Module (Core Differentiator)
+
+For each key opportunity, define:
+
+* Trigger Condition
+    * Specific price/volume/structure condition
+* Entry Logic
+    * Breakout / pullback / continuation behavior
+* Invalidation Condition
+    * What would invalidate the setup
+* Optional Risk Context
+    * Support / resistance / VWAP interaction
+
+All logic must be based on real-time observable conditions, NOT closing price confirmation.
+
+⸻
+
+5. Market Structure Overview
+
+Briefly describe:
+
+* Sector leadership (if relevant)
+* Capital rotation behavior
+* Index influence (if any)
+
+⸻
+
+6. FAQ Section (Long-tail SEO + clarity)
+
+Must include at least 4 questions:
+
+* Why is this stock moving today?
+* Why use intraday scanner data instead of EOD?
+* Is this move sustainable during the session?
+* What key levels matter for traders?
+
+Answers must be concise and professional.
+
+⸻
+
+Style Rules
+
+* Avoid repetitive sentence structures across reports
+* Do NOT use rigid templates
+* Prioritize interpretation over raw data listing
+* Write in a trader’s analytical voice, not a news reporter tone
+
+⸻
+
+Hard Prohibitions
+
+* No EOD / closing price framing
+* No hindsight bias language (“closed above”, “at close”)
+* No pure data dumping without interpretation
+* No repetitive identical phrasing across outputs
+
+⸻
+
+Subtle Professional Requirement
+
+Naturally incorporate:
+
+* Intraday-only validity of signals
+* Distinction between live trading vs post-market analysis
+* Conditional logic rather than deterministic prediction
+
+""",
 
         "twitter": f"""\
 Generate an English X (Twitter) thread — ASX morning catalyst report ({today}).
