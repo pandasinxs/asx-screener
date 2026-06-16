@@ -47,7 +47,7 @@ GEMINI_KEY     = os.environ.get("GEMINI_API_KEY", "")
 WATCHLIST_FILE = "watchlist.json"
 ALERTED_FILE   = "alerted.json"
 
-GEMINI_MODEL = "gemini-2.5-flash-preview-05-14"
+GEMINI_MODEL = "gemini-2.5-flash"
 gemini_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
 # 模块级公告缓存：由 run_morning_scan() 注入，供 get_stock_news_timeline() 使用。
