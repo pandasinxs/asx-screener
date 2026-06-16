@@ -8,12 +8,17 @@
 # ============================================================
 
 import os
+import re
+import io
 import json
 import time
 import logging
+import xml.etree.ElementTree as ET
 from datetime import datetime, date, timezone, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
+import numpy as np
 import yfinance as yf
 import pandas as pd
 import requests
@@ -441,7 +446,7 @@ def _extract_pdf_content(doc_key: str, max_chars: int = 2500) -> tuple[str, list
 
     url = PDF_DL_BASE.format(doc_key=doc_key)
     try:
-        import pdfplumber, io as _io
+        import pdfplumber
 
         resp = requests.get(url, headers=ASX_HEADERS, timeout=20, stream=True)
         resp.raise_for_status()
@@ -452,7 +457,7 @@ def _extract_pdf_content(doc_key: str, max_chars: int = 2500) -> tuple[str, list
             return "", []
 
         pages_text = []
-        with pdfplumber.open(_io.BytesIO(resp.content)) as pdf:
+        with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
             for page in pdf.pages[:15]:
                 t = page.extract_text()
                 if t:
@@ -625,8 +630,6 @@ def get_stock_news_timeline(code: str, days_back: int = 90) -> list[dict]:
 
     # ── 来源2：Google News ────────────────────────────────────
     # v2修复：RSS link是google转跳链接，先resolve再fetch正文
-    import xml.etree.ElementTree as ET
-    from email.utils import parsedate_to_datetime
 
     google_queries = [
         f"ASX:{code}",
