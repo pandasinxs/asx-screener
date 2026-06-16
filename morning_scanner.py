@@ -1872,63 +1872,57 @@ def _build_morning_prompt(platform: str, stocks_block: str,
     )
 
     instructions = {
-        "telegram": (
-            f"生成**中文** ASX早盘催化剂简报（Telegram格式，今日{today}）。\n\n"
-            "【强制三层叙事框架 — 每只股票必须包含】：\n"
-            "  第一层 今天发生了什么（trigger事件）：具体内容+关键数字，禁止写'公司发布公告'这种空话\n"
-            "  第二层 为什么重要（background铺垫）：公司此前做了什么，今日是否超预期，超在哪里\n"
-            "  第三层 故事主线（story_chain）：一句话'X个月前→中间节点→今日兑现'\n\n"
-            "【输出格式】：\n"
-            "1. 开头2句：今日市场氛围 + 本次候选的共同催化剂主题\n"
-            "2. 每只股票（≤200字）：公司简介(1句) → 三层叙事 → 技术面(1句，VWAP位置) → 结论\n"
-            "3. 结尾：1句整体风险提示\n\n"
-            "规则：禁止罗列原始数字，转化为判断语言；"
-            "不确定内容注明'需自行核查'；适当Emoji；末尾⚠️免责声明。"
-        ),
+        "seo": f"""\
+Write an English SEO-optimised investment analysis article about today's ASX morning movers ({today}).
+(SEO instruction placeholder — detailed requirements to be defined.)""",
 
-        "twitter": (
-            f"Generate an English X (Twitter) thread — ASX morning catalyst report ({today}).\n\n"
-            "MANDATORY NARRATIVE RULE — Each stock tweet answers THREE questions:\n"
-            "  Q1 What happened? (trigger event — cite specific data/number from the announcement)\n"
-            "  Q2 Why does this matter? (background — what was expected, did this beat it?)\n"
-            "  Q3 What's the story arc? (story_chain — 'X months ago → milestone → today confirmed')\n\n"
-            "FORMAT:\n"
-            f"Tweet 1 (hook ≤250 chars): Biggest move of the day + catalyst theme\n"
-            f"Tweets 2–{n_candidates + 1}: One per stock:\n"
-            "  Line 1: $ASX:TICKER +X% | [Trigger: specific announcement + key number]\n"
-            "  Line 2: [Why it matters + story arc in 1 line] | Buy/Watch/Avoid\n"
-            "  Note: Flag 'unconfirmed' for any orphan price move without announcement\n"
-            "Final tweet: Key risk + #ASX #Catalyst #AustralianStocks + disclaimer\n\n"
-            "Rules: Convert numbers to judgment language. ≤280 chars/tweet. Separator: ---TWEET---"
-        ),
+        "twitter": f"""\
+Generate an English X (Twitter) thread — ASX morning catalyst report ({today}).
 
-        "xiaohongshu": (
-            f"生成**中文**小红书投资笔记（今日{today}，共{n_candidates}只早盘异动股）。\n\n"
-            "【叙事定位】：不是数据播报员，是'投资侦探'——\n"
-            "你发现了今日涨停背后的完整故事，从几个月前的铺垫写到今天的爆发，\n"
-            "让读者恍然大悟'原来这家公司早就埋了这颗种子'。\n\n"
-            "【每只股票必须包含三层故事】：\n"
-            "  ① 今天的引爆点（trigger事件，必须有具体内容，引用关键数字）\n"
-            "  ② 为什么今天这件事让股价爆了（background，逻辑解释）\n"
-            "  ③ 时间线上的伏笔（story_chain，'X个月前→...→今日兑现'）\n\n"
-            "【输出格式】：\n"
-            "标题（≤20字，钩子式，含情绪词，例如'这家公司埋了X个月的局，今天爆了'）\n"
-            "开头钩子（2句，引发好奇心，不剧透答案）\n"
-            "每只股票：\n"
-            "  🔍 公司是谁（1句行业+主营）\n"
-            "  💥 今天发生了什么（trigger，含具体数字）\n"
-            "  🏗️ 背景故事（2-3句，为什么重要）\n"
-            "  🔗 时间线伏笔（1-2句因果链）\n"
-            "  ❓ 如有孤立价格异动，提示读者'X日曾有不明原因大涨，需核查'\n"
-            "  📊 技术信号（1句，口语化，不堆数字）\n"
-            "  🎯 我的判断（买入/观望/回避 + 1句理由）\n"
-            "结尾：今日投资启示（1句心得）+ 风险提示\n"
-            "话题：#澳股 #ASX投资 #股票分析 #早盘异动（可加行业标签）\n"
-            "写作风格：专业但亲切，像朋友分享干货；不确定写'待核查'；末尾免责声明。"
-        ),
+MANDATORY NARRATIVE RULE — Each stock tweet answers THREE questions:
+  Q1 What happened? (trigger event — cite specific data/number from the announcement)
+  Q2 Why does this matter? (background — what was expected, did this beat it?)
+  Q3 What's the story arc? (story_chain — 'X months ago → milestone → today confirmed')
+
+FORMAT:
+Tweet 1 (hook ≤250 chars): Biggest move of the day + catalyst theme
+Tweets 2–{n_candidates + 1}: One per stock:
+  Line 1: $ASX:TICKER +X% | [Trigger: specific announcement + key number]
+  Line 2: [Why it matters + story arc in 1 line] | Buy/Watch/Avoid
+  Note: Flag 'unconfirmed' for any orphan price move without announcement
+Final tweet: Key risk + #ASX #Catalyst #AustralianStocks + disclaimer
+
+Rules: Convert numbers to judgment language. ≤280 chars/tweet. Separator: ---TWEET---""",
+
+        "xiaohongshu": f"""\
+生成**中文**小红书投资笔记（今日{today}，共{n_candidates}只早盘异动股）。
+
+【叙事定位】：不是数据播报员，是"投资侦探"——
+你发现了今日涨停背后的完整故事，从几个月前的铺垫写到今天的爆发，
+让读者恍然大悟"原来这家公司早就埋了这颗种子"。
+
+【每只股票必须包含三层故事】：
+  ① 今天的引爆点（trigger事件，必须有具体内容，引用关键数字）
+  ② 为什么今天这件事让股价爆了（background，逻辑解释）
+  ③ 时间线上的伏笔（story_chain，"X个月前→...→今日兑现"）
+
+【输出格式】：
+标题（≤20字，钩子式，含情绪词，例如"这家公司埋了X个月的局，今天爆了"）
+开头钩子（2句，引发好奇心，不剧透答案）
+每只股票：
+  🔍 公司是谁（1句行业+主营）
+  💥 今天发生了什么（trigger，含具体数字）
+  🏗️ 背景故事（2-3句，为什么重要）
+  🔗 时间线伏笔（1-2句因果链）
+  ❓ 如有孤立价格异动，提示读者"X日曾有不明原因大涨，需核查"
+  📊 技术信号（1句，口语化，不堆数字）
+  🎯 我的判断（买入/观望/回避 + 1句理由）
+结尾：今日投资启示（1句心得）+ 风险提示
+话题：#澳股 #ASX投资 #股票分析 #早盘异动（可加行业标签）
+写作风格：专业但亲切，像朋友分享干货；不确定写"待核查"；末尾免责声明。""",
     }
 
-    instruction = instructions.get(platform, instructions["telegram"])
+    instruction = instructions.get(platform, instructions["seo"])
 
     return (
         f"📋 <b>ASX早盘文案Prompt — {platform.upper()} — {today}</b>\n"
@@ -2010,11 +2004,11 @@ def run_report_prompt(
 
     # 发送三个平台Prompt（每个平台之间3秒间隔）
     platform_labels = {
-        "telegram"    : "Telegram 中文简报",
+        "seo"         : "SEO 网页文章",
         "twitter"     : "X/Twitter 英文Thread",
         "xiaohongshu" : "小红书 投资笔记",
     }
-    for platform in ["telegram", "twitter", "xiaohongshu"]:
+    for platform in ["seo", "twitter", "xiaohongshu"]:
         label = platform_labels[platform]
         log.info(f"  发送 [{label}] Prompt...")
 
