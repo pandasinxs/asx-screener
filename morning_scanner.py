@@ -309,9 +309,14 @@ def _resolve_google_news_url(google_url: str) -> str:
         resp.close()
         # 如果最终URL还是google域，说明redirect失败
         if "google.com" in final_url:
+            log.warning(f"Google News redirect未跳转，仍停留在google域: {final_url[:100]}")
             return ""
         return final_url
-    except Exception:
+    except requests.Timeout:
+        log.warning(f"Google News redirect超时: {google_url[:80]}")
+        return ""
+    except Exception as e:
+        log.warning(f"Google News redirect失败: {google_url[:80]} — {type(e).__name__}: {e}")
         return ""
 
 
@@ -374,6 +379,14 @@ def _fetch_article_body(url: str, max_chars: int = 1500) -> str:
             )
 
         body = _SPACE_RE.sub(" ", body).strip()
+
+        # 质量门控：正文太短（很可能是导航条/付费墙提示，不是真实正文）
+        if len(body) < 80:
+            log.warning(
+                f"正文质量过低（{len(body)}字符），疑似反爬/付费墙拦截: {url[:80]}"
+            )
+            return ""
+
         if len(body) > max_chars:
             cut  = body[:max_chars].rfind(". ")
             body = body[:cut + 1] if cut > max_chars * 0.7 else body[:max_chars] + "..."
@@ -381,11 +394,11 @@ def _fetch_article_body(url: str, max_chars: int = 1500) -> str:
         return body
 
     except requests.Timeout:
-        log.debug(f"正文抓取超时: {url[:60]}")
+        log.warning(f"正文抓取超时: {url[:80]}")
     except requests.RequestException as e:
-        log.debug(f"正文抓取失败: {url[:60]} — {e}")
+        log.warning(f"正文抓取失败: {url[:80]} — {type(e).__name__}: {e}")
     except Exception as e:
-        log.debug(f"正文解析异常: {url[:60]} — {e}")
+        log.warning(f"正文解析异常: {url[:80]} — {type(e).__name__}: {e}")
     return ""
 
 
@@ -453,7 +466,11 @@ def _extract_pdf_content(doc_key: str, max_chars: int = 2500) -> tuple[str, list
 
         ct = resp.headers.get("Content-Type", "")
         if "pdf" not in ct.lower():
-            log.debug(f"PDF响应非PDF格式: {ct}")
+            log.warning(
+                f"PDF响应非PDF格式 [doc_key={doc_key[:20]}]: "
+                f"Content-Type={ct} | status={resp.status_code} | "
+                f"响应片段: {resp.text[:150]!r}"
+            )
             return "", []
 
         pages_text = []
@@ -499,11 +516,11 @@ def _extract_pdf_content(doc_key: str, max_chars: int = 2500) -> tuple[str, list
         log.warning("pdfplumber未安装，跳过PDF提取。运行: pip install pdfplumber")
         return "", []
     except requests.Timeout:
-        log.warning(f"PDF下载超时: {doc_key[:20]}")
+        log.warning(f"PDF下载超时 [doc_key={doc_key[:20]}] url={url[:80]}")
     except requests.RequestException as e:
-        log.warning(f"PDF下载失败: {doc_key[:20]} — {e}")
+        log.warning(f"PDF下载失败 [doc_key={doc_key[:20]}] url={url[:80]} — {e}")
     except Exception as e:
-        log.warning(f"PDF解析异常: {doc_key[:20]} — {e}")
+        log.warning(f"PDF解析异常 [doc_key={doc_key[:20]}] — {type(e).__name__}: {e}")
     return "", []
 
 
@@ -790,13 +807,23 @@ def get_stock_news_timeline(code: str, days_back: int = 90) -> list[dict]:
     # 统计日志
     with_body   = sum(1 for i in result if i.get("body"))
     with_facts  = sum(1 for i in result if i.get("key_facts"))
-    triggers    = sum(1 for i in result if i.get("chain_role") == "trigger")
+    triggers    = [i for i in result if i.get("chain_role") == "trigger"]
     recent_cnt  = sum(1 for i in result if i.get("days_ago", 999) <= 2)
     log.info(
         f"新闻时间线 [{code}]: {len(result)}条 | "
         f"含正文:{with_body} | 含关键数字:{with_facts} | "
-        f"trigger:{triggers} | 近2天:{recent_cnt}"
+        f"trigger:{len(triggers)} | 近2天:{recent_cnt}"
     )
+
+    # 关键症状检测：trigger新闻存在，但没有任何正文 → Prompt里只会看到标题
+    triggers_without_body = [t for t in triggers if not t.get("body")]
+    if triggers_without_body:
+        for t in triggers_without_body:
+            log.warning(
+                f"⚠️ [{code}] trigger新闻无正文（Prompt中只有标题）: "
+                f"来源={t.get('source')} | 标题={t.get('title','')[:60]}"
+            )
+
     return result
 
 
@@ -1872,142 +1899,12 @@ def _build_morning_prompt(platform: str, stocks_block: str,
     )
 
     instructions = {
-        "seo": """You are a short-term trading research analyst specializing in US equities.
+        "seo": f"""\
+Write an English SEO-optimised investment analysis article about today's ASX morning movers ({today}).
+(SEO instruction placeholder — detailed requirements to be defined.)""",
 
-Your task is to generate a high-value intraday market analysis report based strictly on real-time scanner data captured within the first 30 minutes after market open (NOT EOD / closing data).
-
-⸻
-
-Core Objective
-
-* Identify early-session momentum and abnormal market behavior
-* Extract actionable trading signals
-* Maintain strict separation from end-of-day analysis logic
-
-⸻
-
-Critical Constraint (Mandatory)
-
-You MUST explicitly state at the beginning:
-
-This analysis is based on intraday scanner data captured within the first 30 minutes after market open (not end-of-day data).
-
-This is required to avoid misinterpretation as EOD analysis.
-
-⸻
-
-Output Requirement (STRICT)
-
-You must output TWO versions of the report:
-
-1. English version
-2. Chinese version
-
-Each version must be placed in a separate code block.
-
-⸻
-
-Content Requirements (Flexible Structure, Not Template-Bound)
-
-1. Title (CTR optimized)
-
-* Must include:
-    * “Today / Early Session”
-    * Price movement or % change if available
-    * Catalyst or driver keyword (earnings / placement / momentum / breakout)
-* Avoid repetitive phrasing across outputs
-
-⸻
-
-2. Opening Context (Mandatory)
-
-Must include:
-
-* Market tone (risk-on / risk-off / rotation)
-* Key abnormal early-session behavior
-* Scanner time reference (early session only)
-
-⸻
-
-3. Catalyst & Interpretation Layer
-
-Explain:
-
-* What triggered the move (event / flow / technical breakout)
-* Why the market is reacting now
-* Why this is meaningful in an intraday context
-
-Avoid listing facts only — must include interpretation.
-
-⸻
-
-4. Intraday Trading Signal Module (Core Differentiator)
-
-For each key opportunity, define:
-
-* Trigger Condition
-    * Specific price/volume/structure condition
-* Entry Logic
-    * Breakout / pullback / continuation behavior
-* Invalidation Condition
-    * What would invalidate the setup
-* Optional Risk Context
-    * Support / resistance / VWAP interaction
-
-All logic must be based on real-time observable conditions, NOT closing price confirmation.
-
-⸻
-
-5. Market Structure Overview
-
-Briefly describe:
-
-* Sector leadership (if relevant)
-* Capital rotation behavior
-* Index influence (if any)
-
-⸻
-
-6. FAQ Section (Long-tail SEO + clarity)
-
-Must include at least 4 questions:
-
-* Why is this stock moving today?
-* Why use intraday scanner data instead of EOD?
-* Is this move sustainable during the session?
-* What key levels matter for traders?
-
-Answers must be concise and professional.
-
-⸻
-
-Style Rules
-
-* Avoid repetitive sentence structures across reports
-* Do NOT use rigid templates
-* Prioritize interpretation over raw data listing
-* Write in a trader’s analytical voice, not a news reporter tone
-
-⸻
-
-Hard Prohibitions
-
-* No EOD / closing price framing
-* No hindsight bias language (“closed above”, “at close”)
-* No pure data dumping without interpretation
-* No repetitive identical phrasing across outputs
-
-⸻
-
-Subtle Professional Requirement
-
-Naturally incorporate:
-
-* Intraday-only validity of signals
-* Distinction between live trading vs post-market analysis
-* Conditional logic rather than deterministic prediction""",
-
-        "twitter": """Generate an English X (Twitter) thread — ASX morning catalyst report ({today}).
+        "twitter": f"""\
+Generate an English X (Twitter) thread — ASX morning catalyst report ({today}).
 
 MANDATORY NARRATIVE RULE — Each stock tweet answers THREE questions:
   Q1 What happened? (trigger event — cite specific data/number from the announcement)
@@ -2024,7 +1921,8 @@ Final tweet: Key risk + #ASX #Catalyst #AustralianStocks + disclaimer
 
 Rules: Convert numbers to judgment language. ≤280 chars/tweet. Separator: ---TWEET---""",
 
-        "xiaohongshu": """生成**中文**小红书投资笔记（今日{today}，共{n_candidates}只早盘异动股）。
+        "xiaohongshu": f"""\
+生成**中文**小红书投资笔记（今日{today}，共{n_candidates}只早盘异动股）。
 
 【叙事定位】：不是数据播报员，是"投资侦探"——
 你发现了今日涨停背后的完整故事，从几个月前的铺垫写到今天的爆发，
