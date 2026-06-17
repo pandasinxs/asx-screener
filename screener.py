@@ -873,6 +873,7 @@ def build_timeline_text(code: str, announcements: list, news: list,
     构建精选时间线文本：
     - 公告按significance评分排序，优先显示高价值公告
     - 公告标注significance分和是否price-sensitive
+    - ★ price-sensitive公告若有PDF关键段落，附在标题下方
     - 新闻和公告合并，按日期降序
     """
     events = []
@@ -881,9 +882,16 @@ def build_timeline_text(code: str, announcements: list, news: list,
         sig  = a.get("significance", 0)
         flag = "⭐" if a["sensitive"] else "📋"
         sig_label = f"[重要度:{sig}]" if sig >= 5 else ""
+        line = f"{flag}{sig_label}[公告] {a['headline']}"
+
+        # PDF关键段落附加在公告标题下方（缩进显示，与新闻区分）
+        pdf_txt = a.get("pdf_text", "")
+        if pdf_txt:
+            line += f"\n    📄PDF关键内容: {pdf_txt[:400]}"
+
         events.append({
             "date": a["date"],
-            "text": f"{flag}{sig_label}[公告] {a['headline']}",
+            "text": line,
             "sort_key": (a["date"], sig),
         })
 
@@ -1058,12 +1066,14 @@ def _build_report_stock_block(ticker: str, tech: dict,
         f"板块:{fund.get('sector','未知')} | 市值:{fund.get('market_cap_m',0)}M AUD\n"
         f"{'='*50}\n"
         f"【技术面数据】\n{tech_line}\n\n"
-        f"【精选新闻/公告时间线（已过滤噪音）】\n{timeline}"
+        f"【精选新闻/公告时间线（含PDF关键段落，已过滤噪音）】\n{timeline}"
     )
 
-    # PDF关键段落（仅添加已提取的）
+    # 日报场景PDF需要完整版（不截断），供你写文章引用原文数据。
+    # timeline里已嵌入400字符精简版供AI快速参考；这里补充完整全文。
     for i, txt in enumerate(pdf_texts[:PDF_MAX_PER_STOCK], 1):
-        block += f"\n\n【价格敏感公告关键内容#{i}（关键词段落提取）】\n{txt}"
+        if len(txt) > 400:   # 只有完整版比timeline里的摘要更长时才补充
+            block += f"\n\n【价格敏感公告完整原文#{i}（供撰文引用）】\n{txt}"
 
     return block
 
@@ -1090,298 +1100,21 @@ def serialize_to_prompt(market_snap: dict, stocks_block: str,
     )
 
     instructions = {
-        "telegram": """生成中文 ASX 日交易简报（专业交易员 + 事件驱动 + 时间线叙事）
-━━━━━━━━━━━━━━━━━━
-【核心目标】
-基于输入的：
-- 个股技术指标（必须充分使用）
-- 大盘/市场情绪指标（必须纳入判断）
-- 最新 + 历史公告/新闻 + 历史数据
-输出：
-👉 “市场状态 + 个股演化时间线 + 当前阶段 + 下一步推演”
-本质：交易叙事重建，而不是信息总结。
-━━━━━━━━━━━━━━━━━━
-【市场情绪识别（必须先做）】
-必须先判断整体市场属于：
-- Risk-on（风险偏好上升）
-- Risk-off（避险）
-- Rotation（板块轮动）
-- Choppy（震荡无趋势）
-判断依据必须来自输入数据：
-- 大盘走势/成交量
-- 关键指数技术结构
-- 个股整体涨跌分布
-并在开头体现。
-━━━━━━━━━━━━━━━━━━
-【结构】
-1. 开头（2–3句）
-- 市场情绪判断（必须明确）
-- 当前主线资金方向
-- 一个结构性预期差或风险点
-━━━━━━━━━━━━━━━━━━
-2. 个股
-每只必须构建“时间线故事”：
-━━━━━━━━━━━━━━━━━━
-【A. 时间线叙事（必须）】
-必须包含：
-- 过去（历史公告/旧新闻）
-- 中间（市场反应/价格变化）
-- 现在（最新公告/异动）
-- 当前阶段判断（重估 / 兑现 / 加速 / 破位 / 反转）
-要求：
-→ 必须形成因果链（事件 → 反应 → 结构变化）
-━━━━━━━━━━━━━━━━━━
-【B. 技术面（必须高密度使用）】
-必须使用3–6个指标组合：
-- 趋势结构（上升/下降/震荡）
-- 均线体系（MA20/50/200）
-- 动量（RSI / MACD）
-- 成交量变化
-- 支撑/阻力
-- 波动/突破结构
-要求：
-- 必须解释“指标意味着什么”
-- 技术面必须服务于“阶段判断”
-━━━━━━━━━━━━━━━━━━
-【C. 驱动逻辑】
-- 为什么市场在“此刻”重新定价
-- 公告/新闻如何改变预期
-━━━━━━━━━━━━━━━━━━
-【D. 下一步推演】
-必须包含：
-- 1–3个催化剂
-- 成功路径 → 结果
-- 失败路径 → 风险结构
-━━━━━━━━━━━━━━━━━━
-【E. 我的判断】
-- 倾向观察 / 倾向参与 / 倾向回避
-禁止强投资指令
-每只≤140字
-━━━━━━━━━━━━━━━━━━
-【风格随机】
-A 机构分析师（结构化）
-B 交易员复盘（节奏感）
-C 事件叙事（故事化）
-━━━━━━━━━━━━━━━━━━
-【核心强制规则】
-- 必须市场情绪 + 个股情绪一致性分析
-- 必须时间线（过去→现在→未来）
-- 必须因果链（公告→资金→技术→阶段）
-- 必须至少1个预期差或反直觉点
-━━━━━━━━━━━━━━━━━━
-【免责声明】
-末尾加上
-⚠️仅为市场分析，不构成投资建议""",
+        "telegram": """生成**中文** ASX每日简报（Telegram格式）：
+1. 开头3句：市场情绪 + 今日最值得关注主题
+2. 每只股票（共3段）：公司简介(1句) → 异动原因(2-3句) → 技术面(1-2句) → 催化剂预测(1-2句) → 建议(买入/观望/回避+理由)
+3. 结尾：1句整体展望
+要求：适当Emoji，每只≤150字，不确定注明"需自行核查"，末尾加⚠️免责声明""",
 
-        "twitter": """Generate an English ASX trading thread for X (Twitter)
-━━━━━━━━━━━━━━━━━━
-You are a discretionary ASX trader writing a daily X (Twitter) thread.
+        "twitter": """Generate English Twitter/X thread (use ---TWEET--- between tweets):
+Tweet 1(hook ≤250): market summary
+Tweets 2-4: one per stock — $TICKER + % move + catalyst (1 line) + Buy/Watch/Avoid
+Tweet 5: outlook + #ASX #AustralianStocks + disclaimer
+No fabrication. Flag uncertainty as "to verify".""",
 
-INPUT:
-- ASX index data
-- sector performance
-- up to 3 stocks (price, technicals, news timeline)
-
-OUTPUT:
-4–7 tweets.
-
-FORMAT (MANDATORY):
-- Each tweet must be inside its own triple backtick code block
-- No text outside code blocks
-- Clean and copy-ready
-
---------------------------------------------------
-
-CORE PRIORITY (MOST IMPORTANT):
-
-Every stock tweet MUST include:
-
-1) PAST CATALYST
-- What happened recently (deal / news / announcement)
-
-2) CURRENT DRIVER
-- What is moving the stock now (flow / momentum / positioning / reaction)
-
-3) TRADER INTERPRETATION
-- What this likely means (continuation / exhaustion / crowded / early)
-
-If any of these 3 are missing → output is invalid.
-
---------------------------------------------------
-
-MARKET TWEETS:
-
-- Focus on structure (index + sector + breadth)
-- Avoid generic statements
-- Include at least one interpretive view (not just description)
-
---------------------------------------------------
-EMOTION MODE (pick ONE per thread, do NOT mention it):
-
-1. balanced (default)
-
-- neutral tone
-
-- mix of confidence and caution
-
-2. constructive bullish
-
-- slightly positive bias
-
-- acknowledges risk but leans constructive
-
-3. cautious
-
-- more selective, but NOT overly negative
-
-4. opportunistic
-
-- sees trades even if market imperfect
-
-RULES:
-
-- Do NOT default to cautious every time
-
-- Do NOT stack multiple negative phrases
-
-- At least 1 tweet must feel actionable or constructive
-
---------------------------------------------------
-
-STYLE:
-
-- Human trader notes, not reports
-- Short sentences
-- Slight fragmentation allowed
-- No long explanations
-
---------------------------------------------------
-
-HUMAN SIGNALS:
-
-- Include 1–2 uncertainty expressions total (not everywhere)
-- Include at least 1 emotional reaction (e.g. "feels crowded", "not clean")
-- Allow slight inconsistency
-
---------------------------------------------------
-
-ANTI-AI RULES:
-
-- No “suggests / indicates / therefore / because”
-- No full reasoning chains
-- No symmetrical structure across stocks
-- No generic filler (e.g. "market is interesting")
-
---------------------------------------------------
-
-TONE CONTROL:
-
-- Default: balanced
-- Avoid persistent pessimism
-- At least one clear stance (not just observation)
-
---------------------------------------------------
-
-STOCK STRUCTURE (IMPORTANT):
-
-Ticker + move  
-→ past catalyst  
-→ current driver  
-→ trader reaction (short, natural)  
-
-Do NOT explain in a formal way. Compress into trading notes.
-
---------------------------------------------------
-
-OUTPUT RULE:
-Each tweet threads must be in its own code block""",
-
-        "xiaohongshu": """生成中文小红书 ASX交易复盘笔记（交易叙事日记风格）
-━━━━━━━━━━━━━━━━━━
-你是ASX短线交易者，每天做盯盘记录，不是写报告。
-
-目标：
-用自然人话记录今天市场 + 3个盲盒（“盲盒”指代“股票”） + 真实交易决策。
-
-━━━━━━━━━━━━━━
-整体原则
-- 不写分析报告
-- 不强制模板句
-- 所有结构只提供“方向提示”，不做固定句式
-- 允许真实交易结果：看好/看空/买入/卖出/持有/错过
-
-━━━━━━━━━━━━━━
-标题（提示，不是模板）
-需要表达：
-- 今天的情绪冲突或交易状态
-- 可以是看懂/看不懂/做对/做错/没动/差点进
-
-但：
-- 不限制必须用某几个词
-- 不限制结构
-
-━━━━━━━━━━━━━━
-开头（提示）
-需要包含：
-- 今天市场整体感受（情绪化）
-- 今天看了3个盲盒
-- 可有轻微吐槽或主观感受
-
-不要求固定句式
-
-━━━━━━━━━━━━━━
-过渡句（提示）
-只需要一个自然切换，从闲聊到认真分析，不要求固定表达，必须说人话
-
-━━━━━━━━━━━━━━
-每个盲盒（核心）
-
-每个盲盒包含4个信息，但表达方式自由：
-
-1. （可选）你的第一感觉（可以是好/坏/犹豫/兴奋/无感）
-2. 发生了什么（盘面 / 新闻 / 变化）（必须包含历史新闻和现在新闻）
-3. 你的真实交易行为（重点：必须真实）
-
-交易行为允许全部类型，包括但不限于：
-- 看好直接买入
-- 看好但等待回调
-- 回调加仓
-- 轻仓试探
-- 已持有继续拿
-- 止盈/止损离场
-- 想买但没敢
-- 错过
-- 继续观察
-- 放弃
-
-4. 可选：你的正向预测（短线或中线均可，不强制）
-
-说明：
-- 不要求每只股票都有正向预测
-- 不要求必须扩展逻辑
-- 只在你自然想补充时写
-
-━━━━━━━━━━━━━━
-结尾（提示）
-写一个当天交易感受或认知总结：
-- 可以是经验
-- 可以是反思
-- 可以是情绪总结
-- 不要求统一方向
-
-━━━━━━━━━━━━━━
-风格要求
-- 人话优先
-- 短句优先
-- 允许情绪
-- 不要报告感
-- 不要固定模板句
-- 不要强制关键词
-━━━━━━━━━━━━━━━━━━
-【标签】
-#澳股 #ASX（3–5个）
-末尾加上
-⚠️仅个人记录，不构成投资建议""",
+        "xiaohongshu": """生成**中文**小红书投资笔记：
+标题（≤20字，含关键数据）→ 开头钩子(2句) → 每只股票用"为什么关注XX"叙事(核心逻辑+技术直觉+我的判断) → 今日投资启示 → 话题标签(#澳股 #ASX投资等3-5个)
+要求：专业但亲切，不确定注明"待核查"，末尾加免责声明""",
     }
 
     instruction = instructions.get(platform, instructions["telegram"])
