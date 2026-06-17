@@ -1100,11 +1100,7 @@ def serialize_to_prompt(market_snap: dict, stocks_block: str,
     )
 
     instructions = {
-        "telegram": """生成**中文** ASX每日简报（Telegram格式）：
-1. 开头3句：市场情绪 + 今日最值得关注主题
-2. 每只股票（共3段）：公司简介(1句) → 异动原因(2-3句) → 技术面(1-2句) → 催化剂预测(1-2句) → 建议(买入/观望/回避+理由)
-3. 结尾：1句整体展望
-要求：适当Emoji，每只≤150字，不确定注明"需自行核查"，末尾加⚠️免责声明""",
+        "seo": """生成**中文** SEO网页文章（占位说明，后续细化）：撰写一篇面向搜索引擎的ASX市场分析长文，结构化标题+小标题，自然融入关键词，内容覆盖今日市场概况和精选股票分析。""",
 
         "twitter": """Generate English Twitter/X thread (use ---TWEET--- between tweets):
 Tweet 1(hook ≤250): market summary
@@ -1117,7 +1113,7 @@ No fabrication. Flag uncertainty as "to verify".""",
 要求：专业但亲切，不确定注明"待核查"，末尾加免责声明""",
     }
 
-    instruction = instructions.get(platform, instructions["telegram"])
+    instruction = instructions.get(platform, instructions["seo"])
 
     return f"""📋 <b>ASX日报Prompt — {platform.upper()} — {market_snap.get('date','')}</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1381,8 +1377,8 @@ def run_report_flow(all_data: dict, market_snap: dict,
 
     stocks_block = "\n".join(stock_blocks)
 
-    # 发送三个平台Prompt
-    for platform in ["telegram", "twitter", "xiaohongshu"]:
+    # 发送三个平台Prompt（SEO网页文章 + Twitter/X + 小红书）
+    for platform in ["seo", "twitter", "xiaohongshu"]:
         log.info(f"发送 [{platform}] Prompt...")
         prompt_text = serialize_to_prompt(market_snap, stocks_block, platform)
         send_telegram(prompt_text)
