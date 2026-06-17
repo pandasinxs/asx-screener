@@ -24,6 +24,7 @@ import requests
 import yfinance as yf
 import pandas as pd
 import pdfplumber
+import watchlist_db as wdb
 from datetime import datetime, date, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Optional
@@ -1262,6 +1263,17 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         )
         + market_note
     )
+
+    # 写入长期监测队列（供 intraday_monitor.py 使用）
+    wdb.init_watchlist_db()
+    for s in signals:
+        wdb.upsert_watchlist(
+            ticker=s["ticker"],
+            company_name=s.get("company_name", s["ticker"]),
+            tier_level=tier_level,
+            tier_label=tier_label,
+            composite_score=s["composite_score"],
+        )
 
     # Top3逐只Gemini深度分析
     log.info(f"深度分析 Top {len(signals)} 只（Gemini）...")
