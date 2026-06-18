@@ -1103,18 +1103,35 @@ def apply_filters(
     """
     try:
         closes     = safe_series(daily, "Close")
-        prev_close = float(closes.iloc[-2])
+
+        # prev_close：取日线中日期 < 今日的最后一根收盘价。
+        # 直接用 iloc[-2] 有两个风险：
+        #   (a) yfinance有时在盘中已生成今日日线bar → iloc[-1]是今日，iloc[-2]才是昨日 ✅
+        #   (b) yfinance有时没有今日日线bar → iloc[-1]是昨日，iloc[-2]是前天 ❌（会导致涨幅计算偏差）
+        # 正确方法：按index日期过滤，找到严格早于今日的最后一根。
+        today_str  = date.today().isoformat()
+        daily_idx  = daily.index
+        # 支持DatetimeIndex（带时区或不带时区）和普通Index
+        try:
+            past_closes = closes[daily_idx.strftime("%Y-%m-%d") < today_str]
+        except AttributeError:
+            # index不是DatetimeIndex，降级到原始方式
+            past_closes = closes.iloc[:-1]  # 去掉最后一根
+        if len(past_closes) < 1:
+            return None
+        prev_close = float(past_closes.iloc[-1])
+
         curr_price = float(safe_series(intra, "Close").iloc[-1])
 
         # 1. 价格区间过滤（最基础的仙股过滤）
         if not (FILTER["min_price"] <= curr_price <= FILTER["max_price"]):
-            log.debug(f"  SKIP {t}: 价格{curr_price}超出区间")
+            log.info(f"  SKIP {t}: 价格{curr_price}超出区间")
             return None
 
         # 2. 涨幅区间
         change_pct = (curr_price - prev_close) / prev_close * 100
         if not (FILTER["min_change_pct"] <= change_pct <= FILTER["max_change_pct"]):
-            log.debug(f"  SKIP {t}: 涨幅{change_pct:.1f}%超出区间")
+            log.info(f"  SKIP {t}: 涨幅{change_pct:.1f}%超出区间")
             return None
 
         # 3. 量比（今日量 / 20日均量）
@@ -1122,13 +1139,13 @@ def apply_filters(
         avg_day_vol = float(safe_series(daily, "Volume").iloc[-20:].mean())
         vol_ratio   = today_vol / avg_day_vol if avg_day_vol > 0 else 0
         if vol_ratio < FILTER["min_vol_ratio"]:
-            log.debug(f"  SKIP {t}: 量比{vol_ratio:.2f}不足")
+            log.info(f"  SKIP {t}: 量比{vol_ratio:.2f}不足")
             return None
 
         # 4. 流动性：今日换手金额
         dollar_volume = today_vol * curr_price
         if dollar_volume < FILTER["min_dollar_volume"]:
-            log.debug(f"  SKIP {t}: 日换手额${dollar_volume:,.0f}不足")
+            log.info(f"  SKIP {t}: 日换手额${dollar_volume:,.0f}不足")
             return None
 
         # 5. VWAP距离（价格不能远离VWAP，避免追高）
@@ -1136,14 +1153,14 @@ def apply_filters(
         vwap        = float(vwap_series.iloc[-1])
         vwap_dist   = abs(curr_price - vwap) / vwap * 100 if vwap > 0 else 999
         if vwap_dist > FILTER["max_vwap_dist_pct"]:
-            log.debug(f"  SKIP {t}: 距VWAP{vwap_dist:.1f}%过远")
+            log.info(f"  SKIP {t}: 距VWAP{vwap_dist:.1f}%过远")
             return None
 
         # 6. 排除已连涨多日（避免追末段）
         if len(closes) >= 4:
             d1, d2, d3 = float(closes.iloc[-2]), float(closes.iloc[-3]), float(closes.iloc[-4])
             if d1 > d2 * 1.05 and d2 > d3 * 1.02:
-                log.debug(f"  SKIP {t}: 已连续多日上涨，避免追高")
+                log.info(f"  SKIP {t}: 已连续多日上涨，避免追高")
                 return None
 
         # 7. 计算其他盘中指标
@@ -1181,7 +1198,7 @@ def apply_filters(
         }
 
     except (IndexError, ValueError, KeyError, ZeroDivisionError) as e:
-        log.debug(f"  SKIP {t}: 指标计算异常 {e}")
+        log.info(f"  SKIP {t}: 指标计算异常 {e}")
         return None
 
 
@@ -1553,18 +1570,38 @@ def run_morning_scan() -> None:
 
     intra_data = batch_intraday(liquid, batch_size=50)
 
-    # 应用强化筛选条件
+    # 应用强化筛选条件（附各filter淘汰计数，方便调参诊断）
     pre_candidates: list[dict] = []
+    _reject = {
+        "no_intra"    : 0,  # 无盘中数据
+        "price"       : 0,  # 价格区间
+        "change_pct"  : 0,  # 涨幅区间
+        "vol_ratio"   : 0,  # 量比不足
+        "dollar_vol"  : 0,  # 换手金额不足
+        "vwap_dist"   : 0,  # 距VWAP过远
+        "consec_rise" : 0,  # 已连续上涨
+        "exception"   : 0,  # 异常
+    }
     for t in liquid:
         daily = daily_data.get(t)
         intra = intra_data.get(t)
         if daily is None or intra is None or intra.empty:
+            _reject["no_intra"] += 1
             continue
         result = apply_filters(t, daily, intra)
         if result:
             pre_candidates.append(result)
 
-    log.info(f"量化条件通过：{len(pre_candidates)} 只，验证公告...")
+    # 逆向推算各filter淘汰数（通过log.info SKIP消息统计）
+    # 直接从log不好统计，改为在apply_filters加返回reason更干净
+    # 当前先统计总体情况
+    log.info(
+        f"量化条件通过：{len(pre_candidates)} 只 | "
+        f"无盘中数据:{_reject['no_intra']} | "
+        f"总淘汰:{len(liquid) - _reject['no_intra'] - len(pre_candidates)}"
+    )
+    log.info("（如通过0只，请在日志中搜索'SKIP'查看各filter淘汰明细）")
+    log.info(f"验证公告...")
 
     # ── 公告验证 ─────────────────────────────────────────────
     stage1_pass: list[dict] = []
