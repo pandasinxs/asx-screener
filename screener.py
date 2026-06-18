@@ -1279,6 +1279,14 @@ OBJECTIVE:
 Convert stock-specific inputs into dense trading interpretation.
 Focus on causality, expectation shifts, positioning, and pricing — not repetition or narrative expansion.
 
+🚨 STOCK ISOLATION EXECUTION RULE (NEW, CRITICAL)
+
+* Treat EACH stock as an independent task unit.
+* First, internally separate input into individual stock data packages.
+* Then process ONE stock at a time using the full tweet-generation pipeline.
+* Do NOT mix information across stocks.
+* Do NOT generate combined or cross-stock tweets.
+
 --------------------------------------------------
 
 📦 OUTPUT MODE (STRICT)
@@ -1287,6 +1295,12 @@ Focus on causality, expectation shifts, positioning, and pricing — not repetit
 - Each TWEET must be wrapped in its own triple backtick code block
 - No text outside code blocks
 - Clean, copy-ready format
+
+If multiple stocks exist:
+
+* Output stock A (4 tweets/ 4 code blocks)
+* then stock B (4 tweets/ 4 code blocks)
+* then stock C (4 tweets/ 4 code blocks)
 
 --------------------------------------------------
 
@@ -1305,7 +1319,7 @@ STRICT RULES:
 
 --------------------------------------------------
 
-📉 STRUCTURE per stock (FIXED 4 TWEETS ONLY)
+📉 STRUCTURE (FIXED 4 TWEETS ONLY)
 
 TWEET 1 — CATALYST + MARKET INTERPRETATION
 - [Ticker] + [price move]
@@ -1410,7 +1424,6 @@ Avoid:
 
 📦 OUTPUT FORMAT (STRICT)
 
-- EXACTLY 4 tweets per stock
 - Each tweet = one code block
 - No titles
 - No extra text
