@@ -1290,17 +1290,22 @@ Focus on causality, expectation shifts, positioning, and pricing — not repetit
 
 --------------------------------------------------
 
-🧠 CORE FRAMEWORK
+🧠 TRADER SPEECH RULE
 
-Always interpret through:
+All tweets must sound like real-time trader notes.
 
-Catalyst → Expectation Shift → Positioning/Flow → Risk/Outcome
+STRICT RULES:
 
-You must convert information into market behavior, not summary.
+- No formal comparisons (Before/After is banned)
+- No full causal explanation chains
+- No labeled reasoning (catalyst/driver/flow labels are forbidden in output)
+- Thoughts must be incomplete or slightly abrupt
+- Sentences may "skip logic steps"
+- Interpretation must be implied, not declared
 
 --------------------------------------------------
 
-📉 THREAD STRUCTURE (FIXED 4 TWEETS ONLY)
+📉 STRUCTURE per stock (FIXED 4 TWEETS ONLY)
 
 TWEET 1 — CATALYST + MARKET INTERPRETATION
 - [Ticker] + [price move]
@@ -1371,13 +1376,26 @@ Do NOT label these explicitly.
 
 🧠 HUMAN SIGNALS (GLOBAL REQUIREMENTS)
 
-Across each THREAD:
+Across each tweet:
 
 - Max 1–2 uncertainty expressions total
 - At least 1 emotional reaction (e.g. “feels crowded”, “not clean”, “too smooth”)
 - At least 1 incomplete thought
 - At least 1 subtle contradiction
 - Conviction must vary across tweets
+
+Use:
+
+- fragments instead of full sentences
+- hesitation allowed ("feels like", "maybe", "not fully clean")
+- partial thoughts
+- trading intuition tone
+
+Avoid:
+
+- structured analysis language
+- academic transitions
+- fully closed reasoning
 
 --------------------------------------------------
 
@@ -1386,7 +1404,7 @@ Across each THREAD:
 - Default: balanced
 - Slightly opinionated but probabilistic
 - Avoid persistent pessimism
-- At least one clear stance per THREAD
+- At least one clear stance per tweet
 
 --------------------------------------------------
 
