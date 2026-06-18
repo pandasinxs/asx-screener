@@ -1157,7 +1157,7 @@ Each article MUST include:
 Include:
 - title (SEO optimized, natural language)
 - description (1–2 sentences, search oriented)
-- pubdate (YYYY-MM-DD)
+- pubDate (YYYY-MM-DD)
 
 -------------------------------------------------
 
