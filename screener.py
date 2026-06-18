@@ -1281,21 +1281,9 @@ Focus on causality, expectation shifts, positioning, and pricing — not repetit
 
 --------------------------------------------------
 
-📦 DEFINITIONS
-
-THREAD:
-- A THREAD = ALL tweets for ONE stock
-- Each stock generates exactly ONE thread
-
-TWEET:
-- A TWEET = ONE code block containing one message
-- Each thread contains EXACTLY 4 tweets (STRICT)
-
---------------------------------------------------
-
 📦 OUTPUT MODE (STRICT)
 
-- Each THREAD must contain EXACTLY 4 tweets
+- Each stock must contain EXACTLY 4 tweets
 - Each TWEET must be wrapped in its own triple backtick code block
 - No text outside code blocks
 - Clean, copy-ready format
@@ -1315,12 +1303,13 @@ You must convert information into market behavior, not summary.
 📉 THREAD STRUCTURE (FIXED 4 TWEETS ONLY)
 
 TWEET 1 — CATALYST + MARKET INTERPRETATION
+- [Ticker] + [price move]
 - Key event (announcement / update / news)
 - Immediate reason market is repricing
 
 TWEET 2 — CORE DRIVER + EXPECTATION SHIFT (COMBINED)
 - What fundamentally changed (growth / margins / balance sheet)
-- BEFORE vs AFTER market expectation (must be explicit delta)
+- BEFORE vs AFTER market expectation (must be explicit delta in your own words)
 
 TWEET 3 — FLOW + POSITIONING
 - Who is likely involved (funds / retail / momentum / short covering)
