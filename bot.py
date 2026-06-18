@@ -15,7 +15,15 @@ from google import genai
 
 import watchlist_db as wdb
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("/home/ubuntu/logs/bot.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID        = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
@@ -119,15 +127,43 @@ def get_yf_news(code: str) -> list:
     except:
         return []
 
-def get_stock_price(code: str) -> dict:
-    try:
-        fi = yf.Ticker(f"{code.upper().replace('.AX','')}.AX").fast_info
-        return {
-            'price' : round(float(fi.last_price), 3),
-            'change': round(float(fi.regular_market_day_change_percent or 0), 2)
-        }
-    except:
-        return {}
+def get_stock_price(code: str, retries: int = 3) -> dict:
+    """
+    获取实时价格。带短重试（最多3次，间隔递增），
+    避免Yahoo Finance瞬时限流/超时被误判成"股票代码不存在"。
+    （此前裸except一次失败即返回{}，导致/watch命令在瞬时网络抖动时
+    错误提示"代码可能不存在"，BHP这种真实存在的股票也会被误报）
+
+    涨跌幅手动计算：fast_info已确认不存在regular_market_day_change_percent
+    这个属性（实测AttributeError），改用previous_close和last_price相除算出，
+    并对previous_close为None/0做防御，避免除零或无意义结果。
+    """
+    ticker = f"{code.upper().replace('.AX','')}.AX"
+    for attempt in range(1, retries + 1):
+        try:
+            fi = yf.Ticker(ticker).fast_info
+            price = fi.last_price
+            if price is None:
+                raise ValueError("last_price为空")
+
+            prev_close = fi.previous_close
+            if prev_close and float(prev_close) != 0:
+                change = round((float(price) / float(prev_close) - 1) * 100, 2)
+            else:
+                change = 0.0
+                log.warning(f"get_stock_price [{ticker}]: previous_close无效({prev_close})，change设为0")
+
+            return {
+                'price' : round(float(price), 3),
+                'change': change
+            }
+        except Exception as e:
+            if attempt < retries:
+                log.warning(f"get_stock_price重试 [{ticker}] {attempt}/{retries}: {e}")
+                time.sleep(1.5 * attempt)
+            else:
+                log.error(f"get_stock_price最终失败 [{ticker}]：{e}")
+    return {}
 
 def format_stock_info(code: str, anns: list, news: list, price: dict) -> str:
     lines = [f"📊 <b>{code.upper().replace('.AX','')}.AX</b>"]
@@ -279,8 +315,11 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     price_info = get_stock_price(code_raw)
     if not price_info:
         await update.message.reply_text(
-            f"❌ 无法获取 {ticker} 的价格数据，代码可能不存在或暂时无法访问。\n"
-            f"请确认代码正确后重试（例如 BHP、CBA、WES 等不含后缀的代码）。"
+            f"❌ 暂时无法获取 {ticker} 的价格数据。\n"
+            f"已重试3次仍失败，可能是Yahoo Finance瞬时限流/网络问题，"
+            f"也可能代码确实不存在。\n"
+            f"建议稍等1分钟后重试；如果反复失败，请确认代码正确"
+            f"（例如 BHP、CBA、WES 等不含后缀的代码）。"
         )
         return
 
