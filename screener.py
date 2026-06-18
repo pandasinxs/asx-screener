@@ -1339,6 +1339,10 @@ TWEET 4 — RISK + OUTCOME
 - Sustainability of narrative
 - Final directional bias (early / mid / late phase repricing)
 
+Tweet 1 can be structured.
+Tweets 2–4 must explicitly avoid any pattern that could be interpreted as formatting.
+Each tweet must be ≤280 characters; no multi-paragraph or multi-point construction.
+
 --------------------------------------------------
 
 🔧 CRITICAL COMPRESSION RULE (MANDATORY)
