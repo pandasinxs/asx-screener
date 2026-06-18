@@ -542,6 +542,21 @@ def monitor_one_ticker(item: dict) -> None:
         extra_lines.append(f"距今日高点：{signal['dist_from_high_pct']}%")
     extra_text = "\n".join(extra_lines)
 
+    # 来源文案：EOD自动筛选 vs 用户手动添加，两套表述，避免None值露出或文案矛盾
+    # （手动添加的股票没有tier_level/composite_score，原样塞进f-string会显示"None"）
+    if item.get("source") == "manual":
+        source_line = (
+            f"🔎 来源：手动添加监测 "
+            f"(已监测{item.get('days_elapsed', 0)}/{item.get('total_days', 0)}天"
+            f"{'，第' + str(item['reselect_count']) + '次续期' if item.get('reselect_count') else ''})"
+        )
+    else:
+        source_line = (
+            f"🔎 来源：{item.get('tier_label') or 'EOD'} 筛选 "
+            f"(综合评分:{item.get('composite_score') if item.get('composite_score') is not None else 'N/A'}，"
+            f"已监测{item.get('days_elapsed', 0)}/{item.get('total_days', 0)}天)"
+        )
+
     msg = (
         f"🚨 <b>入场信号触发</b>\n\n"
         f"<b>{item.get('company_name', ticker)}</b> ({ticker})\n"
@@ -551,9 +566,7 @@ def monitor_one_ticker(item: dict) -> None:
         f"{extra_text}\n\n"
         f"📌 建议执行窗口：{signal['execution_window']}\n"
         f"🛑 止损逻辑：{stop_logic}（止损价参考 ${stop_loss:.3f}）\n\n"
-        f"🔎 来源：{item.get('tier_label','')} EOD筛选 "
-        f"(综合评分:{item.get('composite_score','N/A')}，"
-        f"已监测{item.get('days_elapsed',0)}/{item.get('total_days',0)}天)\n"
+        f"{source_line}\n"
         f"⚠️ 15分钟K线级别确认，非逐笔实时信号，请结合实时盘口核实再操作"
     )
     send_telegram(msg)
