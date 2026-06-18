@@ -1817,13 +1817,24 @@ def run_report_flow(all_data: dict, market_snap: dict,
         return
 
     stocks_block = "\n".join(stock_blocks)
+    today        = market_snap.get("date", date.today().isoformat())
 
-    # 发送三个平台Prompt（SEO网页文章 + Twitter/X + 小红书）
+# 先发一条摘要通知（短消息，不会被分割）
+    tickers_str = " / ".join(target_tickers)
+    send_telegram(
+        f"📂 <b>ASX日报Prompt就绪 {today}</b>\n\n"
+        f"股票：{tickers_str}\n"
+        f"以下3个文件已发送，复制文件内容给AI生成文章👇"
+    )
+
+    # 每个平台发一个.txt附件（不分割，手机直接下载复制）
     for platform in ["seo", "twitter", "xiaohongshu"]:
-        log.info(f"发送 [{platform}] Prompt...")
+        log.info(f"发送 [{platform}] Prompt文件...")
         prompt_text = serialize_to_prompt(market_snap, stocks_block, platform)
-        send_telegram(prompt_text)
-        time.sleep(2.0)
+        filename    = f"prompt_{platform}_{today}.txt"
+        caption     = f"📋 {platform.upper()} Prompt — {today}"
+        send_document(filename, prompt_text, caption=caption)
+        time.sleep(1.5)
 
     log.info("=== 日报Prompt发送完成 ===")
 
