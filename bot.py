@@ -13,6 +13,8 @@ from telegram.ext import (Application, CommandHandler,
                           MessageHandler, filters, ContextTypes)
 from google import genai
 
+import watchlist_db as wdb
+
 logging.basicConfig(level=logging.WARNING)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -156,6 +158,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               /news BHP  — 查看公告、新闻和AI分析
               /status    — 查看系统状态
               /logs      — 查看最近日志
+              /watch BHP 15  — 添加BHP到长期监测，15天
+              /unwatch BHP   — 移出监测队列
+              /watchlist     — 查看当前监测队列
 
            💬 直接用中文问我，例：
               "BHP最近有什么公告？"
@@ -236,6 +241,130 @@ async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"读取失败：{e}")
 
+async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /watch BHP 15
+    添加股票到长期盘中监测队列，并指定监测天数。
+    重复添加同一股票 → 累加天数（封顶45天，由watchlist_db.MAX_MONITOR_DAYS控制）。
+    """
+    if not auth(update): return
+
+    if len(ctx.args) < 2:
+        await update.message.reply_text(
+            "用法：/watch 代码 天数\n例如：/watch BHP 15\n"
+            "（重复添加同一股票会累加监测天数，最长45天）"
+        )
+        return
+
+    code_raw = ctx.args[0].upper().replace(".AX", "")
+    ticker = f"{code_raw}.AX"
+
+    try:
+        days = int(ctx.args[1])
+    except ValueError:
+        await update.message.reply_text(f"❌ 天数必须是整数，你输入的是：{ctx.args[1]}")
+        return
+
+    if days < 1:
+        await update.message.reply_text("❌ 天数至少为1天")
+        return
+    if days > wdb.MAX_MONITOR_DAYS:
+        await update.message.reply_text(
+            f"⚠️ 单次添加天数不能超过{wdb.MAX_MONITOR_DAYS}天，"
+            f"已自动调整为{wdb.MAX_MONITOR_DAYS}天"
+        )
+        days = wdb.MAX_MONITOR_DAYS
+
+    await update.message.reply_text(f"🔍 正在验证 {ticker} ...")
+    price_info = get_stock_price(code_raw)
+    if not price_info:
+        await update.message.reply_text(
+            f"❌ 无法获取 {ticker} 的价格数据，代码可能不存在或暂时无法访问。\n"
+            f"请确认代码正确后重试（例如 BHP、CBA、WES 等不含后缀的代码）。"
+        )
+        return
+
+    company_name = ticker
+    try:
+        info = yf.Ticker(ticker).info
+        company_name = info.get("longName", ticker)
+    except Exception:
+        pass
+
+    wdb.init_watchlist_db()
+    result = wdb.upsert_watchlist_manual(ticker, company_name, days)
+
+    if result.get("action") == "error":
+        await update.message.reply_text(f"❌ 添加失败：{result.get('error', '未知错误')}")
+        return
+
+    price_line = f"💰 现价：${price_info.get('price', 'N/A')}"
+
+    if result["action"] == "created":
+        await update.message.reply_text(
+            f"✅ <b>已加入监测队列</b>\n\n"
+            f"{company_name} ({ticker})\n"
+            f"{price_line}\n"
+            f"📅 监测天数：{result['new_total']}天\n\n"
+            f"系统将在交易时段每15分钟扫描一次，"
+            f"出现突破/回踩/尾盘确认信号时会推送给你。",
+            parse_mode="HTML"
+        )
+    else:
+        capped_note = "（已达到45天上限）" if result.get("capped") else ""
+        await update.message.reply_text(
+            f"✅ <b>监测天数已累加</b>\n\n"
+            f"{company_name} ({ticker})\n"
+            f"{price_line}\n"
+            f"📅 原有进度：已监测{result['days_elapsed']}天\n"
+            f"📅 新增：+{result['added_days']}天{capped_note}\n"
+            f"📅 当前总监测天数：{result['new_total']}天\n"
+            f"🔁 第{result['reselect_count']}次加入/续期",
+            parse_mode="HTML"
+        )
+
+async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/unwatch BHP —— 从监测队列移出指定股票"""
+    if not auth(update): return
+
+    if not ctx.args:
+        await update.message.reply_text("用法：/unwatch 代码\n例如：/unwatch BHP")
+        return
+
+    ticker = f"{ctx.args[0].upper().replace('.AX', '')}.AX"
+    ok = wdb.remove_from_watchlist(ticker)
+    if ok:
+        await update.message.reply_text(f"✅ 已将 {ticker} 移出监测队列")
+    else:
+        await update.message.reply_text(f"⚠️ {ticker} 当前不在监测队列中")
+
+async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/watchlist —— 查看当前所有正在监测的股票"""
+    if not auth(update): return
+
+    items = wdb.list_watchlist_for_display(include_exited=False)
+    if not items:
+        await update.message.reply_text("📭 当前监测队列为空\n用 /watch 代码 天数 添加股票")
+        return
+
+    lines = [f"📋 <b>当前监测队列（{len(items)}只）</b>\n"]
+    for it in items:
+        remain = it["total_days"] - it["days_elapsed"]
+        source_tag = "🤖EOD" if it["source"] == "eod" else "✋手动"
+        score_str = f" 评分:{it['composite_score']}" if it.get("composite_score") is not None else ""
+        last_sig = (f" | 上次信号:{it['last_signal_mode']}({it['last_signal_date']})"
+                    if it.get("last_signal_mode") else "")
+        lines.append(
+            f"{source_tag} <b>{it['ticker']}</b> {it.get('company_name','')}\n"
+            f"   进度:{it['days_elapsed']}/{it['total_days']}天（剩{remain}天）"
+            f"{score_str}{last_sig}"
+        )
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3900] + "\n\n…（队列较长，已截断，完整数据见watchlist.db）"
+    await update.message.reply_text(text, parse_mode="HTML")
+
 async def cmd_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
     msg   = update.message.text
@@ -269,6 +398,9 @@ def main():
     app.add_handler(CommandHandler("news",    cmd_news))
     app.add_handler(CommandHandler("status",  cmd_status))
     app.add_handler(CommandHandler("logs",    cmd_logs))
+    app.add_handler(CommandHandler("watch",     cmd_watch))
+    app.add_handler(CommandHandler("unwatch",   cmd_unwatch))
+    app.add_handler(CommandHandler("watchlist", cmd_watchlist))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_ai))
     print("Bot v3 启动中...")
