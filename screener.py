@@ -974,6 +974,30 @@ def send_telegram(text: str) -> None:
             log.error(f"Telegram发送失败: {e}")
         time.sleep(0.5)
 
+def send_document(filename: str, content: str, caption: str = "") -> None:
+    """
+    通过Telegram sendDocument接口发送.txt文件附件。
+    用于发送日报Prompt——内容太长不适合直接贴消息，
+    手机端可直接下载文件，复制粘贴给AI生成文章。
+    """
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        log.warning("Telegram未配置，跳过send_document")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    try:
+        r = requests.post(
+            url,
+            data={"chat_id": CHAT_ID, "caption": caption},
+            files={"document": (filename, content.encode("utf-8"), "text/plain")},
+            timeout=30,
+        )
+        r.raise_for_status()
+        log.info(f"文件发送成功: {filename} ({len(content)} 字符)")
+    except requests.HTTPError as e:
+        log.error(f"send_document HTTP错误 [{filename}]: {e}")
+    except Exception as e:
+        log.error(f"send_document失败 [{filename}]: {e}")
+
 # ════════════════════════════════════════════════════════════
 # 6. Prompt构建
 # ════════════════════════════════════════════════════════════
