@@ -1,24 +1,26 @@
 # ============================================================
-# ASX SYSTEM — screener.py  v13
+# ASX SYSTEM — screener.py  v14
 #
 # 流程一：EOD选股
 #   全市场K线 → T1-T4筛选 → Top3加权评分 → 新闻/公告时间线
-#   → Gemini深度分析 → Telegram
+#   → Gemini深度分析 → Telegram → signals.json → GitHub推送
 #
 # 流程二：每日日报Prompt（不调用Gemini）
 #   Top3 Movers → 技术面+精选新闻+公告+PDF关键段落
-#   → 构建三平台Prompt → Telegram
+#   → 构建三平台Prompt → Telegram附件（SEO/Twitter/小红书）
 #
-# v13改进：
-#   - 加权综合评分排序，Top3精选
-#   - 公告白名单过滤（保留有意义类型，过滤合规噪音）
-#   - PDF关键词段落提取（替代截取前N字符）
-#   - 新增price_percentile_1y / vol_consistency / price_events
-#   - 公告significance评分
-#   - 所有网络错误分类写入log
+# v14新增（相对v13）：
+#   - calc_confidence()：基于层级的置信度算法（替代composite_score当confidence用）
+#   - _parse_gemini_json_fields()：正则抓取Gemini输出的JSON字段
+#   - generate_signals_json()：生成en.json/zh.json写入asxbox仓库
+#   - push_to_github()：自动检测branch，推送signals到Cloudflare Pages
+#   - Gemini Prompt末尾强制输出JSON_TAG/ONE_LINER四字段
+#   - _json_valid标志：Gemini失败时跳过该股票不写入JSON
+#   - send_document()：日报Prompt改为.txt附件发送（解决消息过长分割问题）
+#   - 日报平台矩阵：SEO文章 / Twitter / 小红书（替代原Telegram简报）
 # ============================================================
 
-import os, io, re, sys, time, logging
+import os, io, re, sys, time, logging, json, subprocess
 import xml.etree.ElementTree as ET
 import requests
 import yfinance as yf
@@ -59,6 +61,10 @@ RETRY_MAX       = 20
 RETRY_WAIT      = 30
 TIMEOUT         = 15
 TOP_N           = 3     # 精选Top 3
+
+# ── GitHub网站仓库配置 ────────────────────────────────────────
+ASXBOX_REPO     = os.path.expanduser("~/asxbox")
+SIGNALS_DIR     = os.path.join(ASXBOX_REPO, "src", "data", "signals")
 
 ASX_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
@@ -351,6 +357,185 @@ def calc_composite_score(tech: dict) -> float:
         "price_pct_1y"  : norm(tech.get("price_pct_1y", 50), 50, 100),
     }
     return round(sum(SCORE_WEIGHTS[k] * v for k, v in scores.items()), 4)
+
+
+def calc_confidence(tech: dict, tier_level: str) -> float:
+    """
+    置信度（0.0-1.0），用于signals.json的confidence字段。
+
+    不同于composite_score（相对排序分），confidence是对信号有效性
+    的概率估计，有实际含义：0.85表示该信号约有85%的概率延续趋势。
+
+    计算逻辑：
+    - 基准分由筛选层级决定（T1质量最高，T4最低）
+    - ADX趋势强度加成（ADX>40视为强趋势）
+    - 相对强度加成（RS跑赢大盘越多越好）
+    - 量能连续性小幅加成
+    - 距52周高点越近折扣越小（已接近突破位）
+    - 硬上限0.92（无完美信号），硬下限0.50
+    """
+    base_map = {"T1": 0.85, "T2": 0.75, "T3": 0.65, "T4": 0.55}
+    base = base_map.get(tier_level, 0.60)
+
+    # ADX加成：ADX在25-50之间线性加成，最多+0.05
+    adx   = tech.get("adx14", 20)
+    adx_bonus = min(0.05, max(0.0, (adx - 25) / (50 - 25) * 0.05))
+
+    # RS加成：RS在1.0-1.3之间线性加成，最多+0.05
+    rs    = tech.get("rs_vs_xjo", 1.0)
+    rs_bonus = min(0.05, max(0.0, (rs - 1.0) / 0.3 * 0.05))
+
+    # 量能连续性加成
+    vol_bonus = 0.02 if tech.get("vol_consistency") else 0.0
+
+    # 距52周高点折扣：dist_52w_hi_pct是负数（如-5%表示距高点5%）
+    # 越接近高点（绝对值越小）折扣越小
+    dist = abs(tech.get("dist_52w_hi_pct", -20))
+    dist_penalty = min(0.05, dist / 20 * 0.05)
+
+    confidence = base + adx_bonus + rs_bonus + vol_bonus - dist_penalty
+    return round(min(0.92, max(0.50, confidence)), 2)
+
+
+# ════════════════════════════════════════════════════════════
+# JSON字段提取 & signals.json生成 & GitHub推送
+# ════════════════════════════════════════════════════════════
+
+def _parse_gemini_json_fields(text: str) -> dict:
+    """
+    从Gemini分析文本里用正则抓取四个固定字段。
+    Gemini被要求在分析末尾输出：
+        【JSON_TAG_EN】Bullish Momentum
+        【JSON_TAG_ZH】强势突破
+        【JSON_ONE_LINER_ZH】一句中文解释
+        【JSON_ONE_LINER_EN】One line English explanation
+
+    字段缺失时返回空字符串，不抛异常。
+    """
+    patterns = {
+        "tag_en":       r"【JSON_TAG_EN】(.+)",
+        "tag_zh":       r"【JSON_TAG_ZH】(.+)",
+        "one_liner_zh": r"【JSON_ONE_LINER_ZH】(.+)",
+        "one_liner_en": r"【JSON_ONE_LINER_EN】(.+)",
+    }
+    result = {}
+    for key, pat in patterns.items():
+        m = re.search(pat, text)
+        result[key] = m.group(1).strip() if m else ""
+        if not result[key]:
+            log.warning(f"_parse_gemini_json_fields: [{key}] 未找到，Gemini输出可能不完整")
+    return result
+
+
+def generate_signals_json(signals: list) -> bool:
+    """
+    从signals列表生成en.json和zh.json并写入~/asxbox/src/data/signals/。
+
+    signals列表里每个元素需包含：
+        ticker, confidence, _json_tag_en, _json_tag_zh,
+        _json_one_liner_en, _json_one_liner_zh
+
+    有信号才写文件，无信号直接返回False（网站保持上一天数据）。
+    """
+    if not signals:
+        log.info("generate_signals_json: 无信号，跳过写文件")
+        return False
+
+    today_str = date.today().isoformat()
+
+    # 构建英文版
+    en_payload = {
+        "date": today_str,
+        "signals": [
+            {
+                "symbol":     s["ticker"],
+                "tag":        s.get("_json_tag_en", ""),
+                "confidence": s.get("confidence", 0.60),
+                "one_liner":  s.get("_json_one_liner_en", ""),
+            }
+            for s in signals
+        ]
+    }
+
+    # 构建中文版
+    zh_payload = {
+        "date": today_str,
+        "signals": [
+            {
+                "symbol":     s["ticker"],
+                "tag":        s.get("_json_tag_zh", ""),
+                "confidence": s.get("confidence", 0.60),
+                "one_liner":  s.get("_json_one_liner_zh", ""),
+            }
+            for s in signals
+        ]
+    }
+
+    try:
+        os.makedirs(SIGNALS_DIR, exist_ok=True)
+        en_path = os.path.join(SIGNALS_DIR, "en.json")
+        zh_path = os.path.join(SIGNALS_DIR, "zh.json")
+
+        with open(en_path, "w", encoding="utf-8") as f:
+            json.dump(en_payload, f, ensure_ascii=False, indent=2)
+        with open(zh_path, "w", encoding="utf-8") as f:
+            json.dump(zh_payload, f, ensure_ascii=False, indent=2)
+
+        log.info(f"signals.json写入成功：{len(signals)} 个信号")
+        return True
+    except Exception as e:
+        log.error(f"generate_signals_json写文件失败: {e}")
+        return False
+
+
+def push_to_github() -> bool:
+    """
+    将asxbox仓库的变更推送到GitHub。
+    只推送src/data/signals/目录，不影响其他文件。
+    自动检测默认branch（避免main/master硬编码失败）。
+    失败时写log，不中断主流程。
+    """
+    today_str = date.today().isoformat()
+    try:
+        # 自动检测默认branch
+        r = subprocess.run(
+            ["git", "-C", ASXBOX_REPO, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=10
+        )
+        branch = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "main"
+        log.info(f"push_to_github: 使用branch={branch}")
+
+        cmds = [
+            ["git", "-C", ASXBOX_REPO, "add",
+             "src/data/signals/en.json",
+             "src/data/signals/zh.json"],
+            ["git", "-C", ASXBOX_REPO, "commit",
+             "-m", f"chore: update signals {today_str}"],
+            ["git", "-C", ASXBOX_REPO, "push", "origin", branch],
+        ]
+        for cmd in cmds:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                if "nothing to commit" in result.stdout + result.stderr:
+                    log.info("push_to_github: 无变更，跳过commit")
+                    return True
+                log.error(
+                    f"push_to_github git命令失败: {' '.join(cmd)}\n"
+                    f"stdout: {result.stdout}\nstderr: {result.stderr}"
+                )
+                return False
+            log.info(f"git: {' '.join(cmd[2:])} → OK")
+
+        log.info(f"push_to_github: 推送成功 [{today_str}] branch={branch}")
+        return True
+    except subprocess.TimeoutExpired:
+        log.error("push_to_github: git命令超时（30秒）")
+        return False
+    except Exception as e:
+        log.error(f"push_to_github异常: {e}")
+        return False
 
 # ════════════════════════════════════════════════════════════
 # 3. 数据获取
@@ -974,6 +1159,8 @@ def send_telegram(text: str) -> None:
             log.error(f"Telegram发送失败: {e}")
         time.sleep(0.5)
 
+
+
 def send_document(filename: str, content: str, caption: str = "") -> None:
     """
     通过Telegram sendDocument接口发送.txt文件附件。
@@ -1058,7 +1245,13 @@ def _build_screener_prompt(signal: dict, timeline: str,
 【综合结论】给出买入/观望/回避建议，说明止损位（基于ATR或关键支撑），
 以及最值得关注的一个上行/下行风险。
 
-规则：不确定内容标注"需进一步核查"，禁止编造数据。"""
+规则：不确定内容标注"需进一步核查"，禁止编造数据。
+
+===== 固定输出字段（必须在分析末尾严格按格式输出，不得省略）=====
+【JSON_TAG_EN】（英文信号标签，2-4个词，如：Bullish Momentum / Range Break Setup / Overbought Pressure）
+【JSON_TAG_ZH】（中文信号标签，2-4个字，如：强势突破 / 区间试探 / 超买压力）
+【JSON_ONE_LINER_ZH】（一句中文核心解释，≤25字，描述当前技术或事件驱动的关键状态）
+【JSON_ONE_LINER_EN】（One English sentence, ≤20 words, same meaning as ZH above）"""
 
 
 def _build_report_stock_block(ticker: str, tech: dict,
@@ -1125,456 +1318,27 @@ def serialize_to_prompt(market_snap: dict, stocks_block: str,
     )
 
     instructions = {
-        "seo": """You are a professional ASX equity research analyst and SEO content engine.
-
-Your task is to generate a high-quality END-OF-DAY (EOD) stock analysis article based on structured market data.
-
-This content is designed for:
-- SEO indexing (Google search traffic)
-- Retail trader education
-- Post-market strategy interpretation
-- Content automation pipeline
-
--------------------------------------------------
-CRITICAL CONTEXT
--------------------------------------------------
-This is END-OF-DAY (EOD) data.
-
-You MUST:
-- Use full-session price action (NOT intraday signals)
-- Focus on closing behavior, not triggers
-- Avoid VWAP, entry signals, or intraday mechanics
-- Avoid any "real-time execution framing"
-
--------------------------------------------------
-OUTPUT REQUIREMENT (STRICT)
--------------------------------------------------
-You MUST generate:
-
-1. English SEO article in Markdown format
-2. Chinese SEO article in Markdown format
-
-Each article must be output in a separate code block.
-
--------------------------------------------------
-FILE NAMING RULE
--------------------------------------------------
-Before output, provide filenames:
-
-Format:
-YYYY-MM-DD-TICKER-KEYTHEME.md
-
-Example:
-2026-06-17-AIA.AX-approaching-resistance.md
-
-Key theme must reflect dominant narrative:
-(e.g. breakout, earnings momentum, resistance test, trend continuation)
-
--------------------------------------------------
-ARTICLE STRUCTURE (SEO + TRADING HYBRID)
--------------------------------------------------
-
-Each article MUST include:
-
-## 1. YAML Front Matter (mandatory)
-
-Include:
-- title (SEO optimized, natural language)
-- description (1–2 sentences, search oriented)
-- pubDate (YYYY-MM-DD)
-
--------------------------------------------------
-
-## 2. Market Context Section
-- ASX200 performance
-- sector leadership
-- macro tone (risk-on / risk-off / rotation)
-
--------------------------------------------------
-
-## 3. Stock Overview
-- company name
-- sector
-- market cap (if provided)
-- positioning summary (1 paragraph)
-
--------------------------------------------------
-
-## 4. Technical Analysis (EOD-based)
-Must include:
-- MA50 / MA200 trend structure
-- RSI interpretation (not just value)
-- ADX trend strength interpretation
-- volume confirmation or lack of it
-- proximity to 52-week high/low
-
-IMPORTANT:
-- This is NOT a trading signal section
-- Do NOT include entry/exit triggers
-- Do NOT use VWAP or intraday logic
-
--------------------------------------------------
-
-## 5. Catalyst & Narrative Flow (MOST IMPORTANT)
-You must build a STORY, not a list.
-
-Structure:
-- Catalyst → Market reaction → Confirmation → Interpretation
-
-Rules:
-- Prioritize narrative continuity
-- If no direct catalyst exists, explain macro/sector/flow-driven narrative
-- Always explain "why now"
-
--------------------------------------------------
-
-## 6. EOD Outlook
-- continuation vs exhaustion vs consolidation
-- next session bias (soft directional expectation)
-- key resistance/support zones (NOT trigger-based)
-
--------------------------------------------------
-
-## 7. Conclusion
-- one paragraph synthesis
-- classify stock behavior (e.g. trend continuation / range-bound / breakout attempt)
-
--------------------------------------------------
-
-## 8. FAQ Section (SEO-critical, flexible generation)
-
-You must include a FAQ section with at least 4 questions.
-
-However, questions are NOT fixed.
-
-Instead, they must collectively cover these intent categories:
-
-1. Driver Explanation Intent
-   - Why did the stock move today?
-
-2. Sustainability Intent
-   - Is the move likely to continue or fade?
-
-3. Market Structure Intent
-   - What key levels or price zones matter?
-
-4. Forward Scenario Intent
-   - What is the most likely next market behavior?
-
-Rules:
-- Questions must be natural and not repetitive across articles
-- Must adapt to stock-specific narrative (no template reuse)
-- Must reflect actual catalyst/structure of the stock
-- Must optimize for long-tail search variation
-
--------------------------------------------------
-
-## STYLE RULES
-- No repetitive sentence structures across sections
-- No rigid templates or robotic phrasing
-- Prioritize interpretation over data dumping
-- Maintain analyst tone, not news reporter tone
-- Maintain narrative coherence across full article
-
--------------------------------------------------
-HARD CONSTRAINTS
--------------------------------------------------
-- NO intraday mechanics (VWAP, entry trigger, breakout triggers)
-- NO real-time trading instructions
-- NO deterministic predictions
-- NO repeated phrasing across languages
-- NO hallucinated data
-
-If data is missing, explicitly state:
-"Cannot verify due to missing dataset"
-
--------------------------------------------------
-
-""",
-
-        "twitter": """You are an event-driven ASX equity trader generating high-signal X (Twitter) content.
-
-INPUT:
-- ASX index data
-- sector performance
-- up to 3 stocks (price, technicals, news timeline)
-
-OBJECTIVE:
-Convert stock-specific inputs into dense trading interpretation.
-Focus on causality, expectation shifts, positioning, and pricing — not repetition or narrative expansion.
-
-🚨 STOCK ISOLATION EXECUTION RULE (NEW, CRITICAL)
-
-* Treat EACH stock as an independent task unit.
-* First, internally separate input into individual stock data packages.
-* Then process ONE stock at a time using the full tweet-generation pipeline.
-* Do NOT mix information across stocks.
-* Do NOT generate combined or cross-stock tweets.
-
---------------------------------------------------
-
-📦 OUTPUT MODE (STRICT)
-
-- Each stock must contain EXACTLY 4 tweets
-- Each TWEET must be wrapped in its own triple backtick code block
-- No text outside code blocks
-- Clean, copy-ready format
-
-If multiple stocks exist:
-
-* Output stock A (4 tweets/ 4 code blocks)
-* then stock B (4 tweets/ 4 code blocks)
-* then stock C (4 tweets/ 4 code blocks)
-
---------------------------------------------------
-
-🧠 TRADER SPEECH RULE
-
-All tweets must sound like real-time trader notes.
-
-STRICT RULES:
-
-- No formal comparisons (Before/After is banned)
-- No full causal explanation chains
-- No labeled reasoning (catalyst/driver/flow labels are forbidden in output)
-- Thoughts must be incomplete or slightly abrupt
-- Sentences may "skip logic steps"
-- Interpretation must be implied, not declared
-
---------------------------------------------------
-
-📉 STRUCTURE (FIXED 4 TWEETS ONLY)
-
-TWEET 1 — CATALYST + MARKET INTERPRETATION
-- [Ticker] + [price move]
-- Key event (announcement / update / news)
-- Immediate reason market is repricing
-
-TWEET 2 — CORE DRIVER + EXPECTATION SHIFT (COMBINED)
-- What fundamentally changed (growth / margins / balance sheet)
-- BEFORE vs AFTER market expectation (must be explicit delta in your own words)
-
-TWEET 3 — FLOW + POSITIONING
-- Who is likely involved (funds / retail / momentum / short covering)
-- Type of flow: new money / continuation / re-rating / squeeze
-
-TWEET 4 — RISK + OUTCOME
-- Why move may fail or fade
-- Sustainability of narrative
-- Final directional bias (early / mid / late phase repricing)
-
-Tweet 1 can be structured.
-Tweets 2–4 must explicitly avoid any pattern that could be interpreted as formatting.
-Each tweet must be ≤280 characters; no multi-paragraph or multi-point construction.
-
---------------------------------------------------
-
-🔧 CRITICAL COMPRESSION RULE (MANDATORY)
-
-Because structure is fixed at 4 tweets:
-
-- Driver + Expectation Shift MUST be merged (Tweet 2)
-- Flow + Positioning MUST remain separate (Tweet 3)
-- Risk + Conclusion MUST be merged (Tweet 4)
-
-Under NO circumstance can tweet count exceed 4.
-
-If content overflows:
-→ remove repetition, not analytical depth
-
---------------------------------------------------
-
-🔥 SECOND-ORDER INTERPRETATION (MANDATORY)
-
-Embed implicitly:
-
-- POSITIONING (who is trapped / who is re-entering)
-- FLOW DYNAMICS (new money vs continuation vs squeeze)
-- PRICING PHASE (early / mid / late / exhaustion)
-- BEHAVIOR SIGNAL (overreaction / underreaction / confirmation)
-
-Do NOT label these explicitly.
-
---------------------------------------------------
-
-📊 QUALITY RULES
-
-- Each tweet must add NEW inference
-- No repetition of same idea in different wording
-- Each tweet must escalate insight level
-- No restating raw input data
-
---------------------------------------------------
-
-❌ HARD ANTI-FILLER RULES
-
-- No generic phrases (“interesting”, “market watching”, etc.)
-- No “suggests / indicates / therefore / because”
-- No essay-style explanations
-- No repeated sentence structures
-- No macro market commentary
-
---------------------------------------------------
-
-🧠 HUMAN SIGNALS (GLOBAL REQUIREMENTS)
-
-Across each tweet:
-
-- Max 1–2 uncertainty expressions total
-- At least 1 emotional reaction (e.g. “feels crowded”, “not clean”, “too smooth”)
-- At least 1 incomplete thought
-- At least 1 subtle contradiction
-- Conviction must vary across tweets
-
-Use:
-
-- fragments instead of full sentences
-- hesitation allowed ("feels like", "maybe", "not fully clean")
-- partial thoughts
-- trading intuition tone
-
-Avoid:
-
-- structured analysis language
-- academic transitions
-- fully closed reasoning
-
---------------------------------------------------
-
-📊 TONE
-
-- Default: balanced
-- Slightly opinionated but probabilistic
-- Avoid persistent pessimism
-- At least one clear stance per tweet
-
---------------------------------------------------
-
-📦 OUTPUT FORMAT (STRICT)
-
-- Each tweet = one code block
-- No titles
-- No extra text
-- No explanations
-
---------------------------------------------------
-
-📌 FINAL CONSTRAINT
-
-Transform inputs into trading behavior interpretation, not summary.
-Focus on what the market is pricing, not what happened.
-""",
-
-        "xiaohongshu": """ASX小红书交易盲盒复盘（叙事流IP版）
-
-你是ASX短线交易者，每天做盯盘记录，不写报告。
-
-━━━━━━━━━━━━━━
-核心定义
-“盲盒” = 股票（用于隐喻表达，规避平台审查）
-全文统一使用“盲盒”，不使用“股票/标的”。
-
-━━━━━━━━━━━━━━
-目标
-用连续叙事方式记录：
-- 自然融入今日市场背景，不单独表达
-- 1-3个盲盒观察
-- 每个盲盒：催化剂 + 新闻故事线 + 交易判断
-
-不拆总结段，不做独立分析总结。
-
-━━━━━━━━━━━━━━
-整体原则
-- 不写报告结构
-- 不单独总结市场
-- 所有背景信息必须自然融入各个盲盒
-- 强调“长期关注该标的的连续性”
-- 人话优先，但逻辑必须完整
-- 信息密度高，但不分层写
-
-━━━━━━━━━━━━━━
-标题
-18字以内
-表达冲突或状态（对今天市场背景的主观感受，自由表达）
-
-━━━━━━━━━━━━━━
-固定开场（IP锚点）
-必须第一句：
-
-例如“让我们打开今天的盲盒”
-
-（仅作参考，作类似表达即可，必须包含盲盒）
-
-━━━━━━━━━━━━━━
-每个盲盒（核心结构）
-
-每个盲盒必须是连续叙事，不分小标题：
-
---------------------------------
-1. 催化剂（必须包含）
-- 今天发生了什么
-- 如果有公告必须带一句总结
-- 不单列数据，用人话解释
-
-强调：
-像“我一直在跟踪它，然后今天发生了变化”
-
---------------------------------
-2. 历史背景 + 关注连续性
-必须体现：
-- 之前发生过什么类似情况
-- 市场之前怎么反应
-- 你为什么一直在看它
-
-要求：
-像“持续观察者视角”，不是一次性解读
-
---------------------------------
-3. 一句话结论（结构判断 + 交易决策合并）
-
-必须合并表达：
-
-结构判断 + 交易动作必须在同一句
-
-允许表达：
-- 资金在试探，所以我暂时不追
-- 消息驱动但已经抢跑，我选择观望
-- 趋势没走坏但位置偏高，我继续持有不加
-- 有点加速但不稳定，我只轻仓参与
-
-禁止拆成两句
-
-━━━━━━━━━━━━━━
-盲盒数量规则
-- 1-3个
-- 按当天筛选结果决定
-- 不强制数量
-
-━━━━━━━━━━━━━━
-结尾规则
-不单独写总结段
-结尾自然停在最后一个盲盒判断后
-
-━━━━━━━━━━━━━━
-风格要求
-- 用人话连续叙事
-- 有情绪
-- 像交易日记而不是报告
-- 有IP开场锚点
-- 有观察者视角连续性
-- 不拆分结构
-- 信息高密度但自然流动
-
-━━━━━━━━━━━━━━
-标签
-#澳股 #ASX #短线交易 #复盘
-⚠️仅个人记录，不构成投资建议
-""",
+        "seo": """生成**中文** SEO网页文章（占位说明，后续细化）：撰写一篇面向搜索引擎的ASX市场分析长文，结构化标题+小标题，自然融入关键词，内容覆盖今日市场概况和精选股票分析。""",
+
+        "twitter": """Generate English Twitter/X thread (use ---TWEET--- between tweets):
+Tweet 1(hook ≤250): market summary
+Tweets 2-4: one per stock — $TICKER + % move + catalyst (1 line) + Buy/Watch/Avoid
+Tweet 5: outlook + #ASX #AustralianStocks + disclaimer
+No fabrication. Flag uncertainty as "to verify".""",
+
+        "xiaohongshu": """生成**中文**小红书投资笔记：
+标题（≤20字，含关键数据）→ 开头钩子(2句) → 每只股票用"为什么关注XX"叙事(核心逻辑+技术直觉+我的判断) → 今日投资启示 → 话题标签(#澳股 #ASX投资等3-5个)
+要求：专业但亲切，不确定注明"待核查"，末尾加免责声明""",
     }
 
     instruction = instructions.get(platform, instructions["seo"])
 
     return f"""📋 <b>ASX日报Prompt — {platform.upper()} — {market_snap.get('date','')}</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+<b>👇 复制以下全部内容给AI生成文章</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+你是一位专注澳大利亚股市(ASX)的资深投资分析师。
 
 === 今日市场数据 ===
 {market_block}
@@ -1650,27 +1414,33 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
 
     today_ann = fetch_today_announcements()
 
-    # T1→T4筛选
-    log.info("分级筛选（T1→T4）...")
-    found_tier, raw_signals = None, []
+    # T1→T4全部筛选，合并排序取Top3
+    # 每只股票记录通过的最高层级（T1>T2>T3>T4），避免同一股票重复出现
+    # 这样既保证质量（评分高的排前面），又保证数量（不会因T1无信号就停）
+    log.info("分级筛选（T1-T4全部扫描，合并排序）...")
+    seen_tickers = {}   # {ticker: signal_dict}，只保留最高层级
+
     for tier in TIERS:
         log.info(f"  {tier['level']} ({tier['label']})...")
-        tier_sigs = []
+        count = 0
         for ticker, df in all_data.items():
+            if ticker in seen_tickers:
+                continue   # 已被更高层级收录，跳过
             try:
                 if len(df) < 60:
                     continue
                 tech = build_tech_summary(df, xjo_s)
                 if _passes_tier(tech, tier):
-                    tech["ticker"] = ticker
-                    tier_sigs.append(tech)
+                    tech["ticker"]     = ticker
+                    tech["tier_level"] = tier["level"]
+                    tech["tier_label"] = tier["label"]
+                    seen_tickers[ticker] = tech
+                    count += 1
             except Exception as e:
                 log.debug(f"筛选异常 [{ticker}]: {e}")
-        log.info(f"    → {len(tier_sigs)} 个")
-        if tier_sigs:
-            found_tier, raw_signals = tier, tier_sigs
-            break
+        log.info(f"    → 本层新增 {count} 个（累计 {len(seen_tickers)} 个）")
 
+    raw_signals = list(seen_tickers.values())
     elapsed_screen = round((time.time() - start) / 60, 1)
 
     if not raw_signals:
@@ -1681,7 +1451,7 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         )
         return []
 
-    # 加权评分 + Top3
+    # 加权评分 + Top3（跨层级统一排序，T1信号评分天然高于T4）
     for s in raw_signals:
         s["composite_score"] = calc_composite_score(s)
     raw_signals.sort(key=lambda x: x["composite_score"], reverse=True)
@@ -1701,16 +1471,21 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         if len(signals) == TOP_N:
             break
 
-    tier_label = found_tier["label"]
-    tier_level = found_tier["level"]
+    # 汇总用的层级标签：显示各信号来自哪个层级
+    tier_summary = {}
+    for s in signals:
+        lv = s.get("tier_level", "T?")
+        tier_summary[lv] = tier_summary.get(lv, 0) + 1
+    tier_label = " / ".join(f"{lv}×{n}" for lv, n in sorted(tier_summary.items()))
+    tier_level = signals[0].get("tier_level", "T?") if signals else "T?"
 
     # 汇总消息
     send_telegram(
         f"📊 <b>{market_label}ASX扫描完成 {today}</b>\n\n"
         f"ASX200：{xjo_pct:+.2f}%  |  扫描：{len(all_data)} 只  |  耗时：{elapsed_screen}分钟\n"
-        f"信号等级：{tier_label}  |  精选 Top {len(signals)} 只\n\n"
+        f"层级分布：{tier_label}  |  精选 Top {len(signals)} 只\n\n"
         + "\n".join(
-            f"#{i+1} {s['ticker']} | 评分:{s['composite_score']} "
+            f"#{i+1} {s['ticker']} | [{s.get('tier_level','?')}] 评分:{s['composite_score']} "
             f"RS:{s['rs_vs_xjo']} ADX:{s['adx14']} 量比:{s['vol_ratio']}x"
             for i, s in enumerate(signals)
         )
@@ -1723,8 +1498,8 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         wdb.upsert_watchlist(
             ticker=s["ticker"],
             company_name=s.get("company_name", s["ticker"]),
-            tier_level=tier_level,
-            tier_label=tier_label,
+            tier_level=s.get("tier_level", tier_level),
+            tier_label=s.get("tier_label", tier_label),
             composite_score=s["composite_score"],
         )
 
@@ -1738,10 +1513,26 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         news     = fetch_news(s["ticker"], s.get("company_name", ""))
         timeline = build_timeline_text(code, ann_hist, news, today_ann)
 
-        prompt   = _build_screener_prompt(s, timeline, tier_label)
+        prompt   = _build_screener_prompt(s, timeline, s.get("tier_label", tier_label))
         analysis = ask_gemini(prompt, label=s["ticker"])
         if not analysis:
             analysis = "⚠️ Gemini分析暂时不可用"
+
+        # ── 抓取JSON字段（从Gemini输出末尾提取）────────────────
+        json_fields = _parse_gemini_json_fields(analysis)
+        s["_json_tag_en"]       = json_fields.get("tag_en", "")
+        s["_json_tag_zh"]       = json_fields.get("tag_zh", "")
+        s["_json_one_liner_zh"] = json_fields.get("one_liner_zh", "")
+        s["_json_one_liner_en"] = json_fields.get("one_liner_en", "")
+        s["confidence"]         = calc_confidence(s, s.get("tier_level", tier_level))
+        # Gemini失败时JSON字段全空，标记该股票不写入signals.json
+        s["_json_valid"] = bool(
+            s["_json_tag_en"] and s["_json_one_liner_en"]
+        )
+        log.info(
+            f"  JSON字段 [{s['ticker']}]: tag_en={s['_json_tag_en']!r} "
+            f"confidence={s['confidence']} valid={s['_json_valid']}"
+        )
 
         ann_info = today_ann.get(code, {})
         ann_line = ""
@@ -1751,8 +1542,9 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
 
         ma200_str   = f" MA200:${s['ma200']}" if s.get("ma200") else ""
         vol_c_badge = " 📈量能连续" if s.get("vol_consistency") else ""
+        s_tier_label = s.get("tier_label", tier_label)
         send_telegram(
-            f"<b>#{idx} {tier_label} {s.get('company_name', s['ticker'])}</b> ({s['ticker']})\n"
+            f"<b>#{idx} {s_tier_label} {s.get('company_name', s['ticker'])}</b> ({s['ticker']})\n"
             f"📅 {today} | {s.get('sector','未知')} | 市值:${s.get('market_cap_m',0)}M | "
             f"综合评分:{s['composite_score']}\n\n"
             f"💰 昨收：${s['price']} ({s['change_pct']:+.2f}%) | "
@@ -1768,6 +1560,28 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
             f"⚠️ 核对图表再决定入场{market_note}"
         )
         time.sleep(1.0)
+
+    # ── 生成signals.json并推送GitHub ────────────────────────────
+    # 只写入JSON字段有效的信号（Gemini成功生成了tag和one_liner）
+    # 无有效信号时网站保持上一天数据，不推送
+    valid_signals = [s for s in signals if s.get("_json_valid")]
+    log.info(f"生成signals.json：{len(valid_signals)}/{len(signals)} 只有效JSON字段...")
+    written = generate_signals_json(valid_signals)
+    if written:
+        pushed = push_to_github()
+        if pushed:
+            send_telegram(
+                f"🌐 <b>网站已更新</b> {today}\n"
+                f"signals.json已推送GitHub，Cloudflare正在重建。\n"
+                f"信号数量：{len(signals)} 只"
+            )
+        else:
+            send_telegram(
+                f"⚠️ <b>GitHub推送失败</b> {today}\n"
+                "signals.json已生成但未能推送，请查看screener.log手动处理。"
+            )
+    else:
+        log.info("无有效信号，跳过GitHub推送，网站保持昨日数据")
 
     elapsed = round((time.time() - start) / 60, 1)
     log.info(f"选股完成：{tier_level}，Top{len(signals)}，{elapsed}分钟")
@@ -1841,9 +1655,8 @@ def run_report_flow(all_data: dict, market_snap: dict,
         return
 
     stocks_block = "\n".join(stock_blocks)
-    today        = market_snap.get("date", date.today().isoformat())
 
-# 先发一条摘要通知（短消息，不会被分割）
+    # 先发一条摘要通知（短消息，不会被分割）
     tickers_str = " / ".join(target_tickers)
     send_telegram(
         f"📂 <b>ASX日报Prompt就绪 {today}</b>\n\n"
@@ -1869,7 +1682,7 @@ def run_report_flow(all_data: dict, market_snap: dict,
 def main() -> None:
     start = time.time()
     log.info("=" * 60)
-    log.info(f"ASX System v13 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
+    log.info(f"ASX System v14 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
     log.info("=" * 60)
 
     # Step 1：大盘快照
@@ -1920,10 +1733,10 @@ def main() -> None:
     log.info(f"ASX System 全部完成，总耗时：{elapsed} 分钟")
     log.info("=" * 60)
     send_telegram(
-        f"🏁 <b>ASX System v13 全部完成</b>\n"
+        f"🏁 <b>ASX System v14 全部完成</b>\n"
         f"📅 {date.today().isoformat()} | ⏱ 总耗时：{elapsed} 分钟\n"
         f"选股：{'跳过（大盘红灯）' if status == 'red' else f'Top{len(screener_signals)}已完成'}\n"
-        f"日报Prompt：Telegram/Twitter/小红书 已发送"
+        f"日报Prompt：SEO / Twitter / 小红书 已发送"
     )
 
 
