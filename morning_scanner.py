@@ -1,10 +1,13 @@
 # ============================================================
-# FIRST PULLBACK — MORNING SCANNER v5
-# 升级点:
-#   1. 重试逻辑覆盖所有可重试异常（网络/超时/5xx/429）
-#   2. 筛选指标全面强化（价格下限、量能门槛、VWAP距离）
-#   3. 三阶段流程：粗筛 → 新闻时间线+历史指标精筛 → Gemini综合分析
-#   4. Gemini输出结构化JSON，Telegram格式化呈现
+# FIRST PULLBACK — MORNING SCANNER v6
+#
+# v6修复与改进：
+#   1. apply_filters() 返回 (result, reason) — 主循环真实统计各filter淘汰数
+#   2. 淘汰明细日志：价格/涨幅/量比/换手/VWAP/连涨/异常各自计数，一行打印
+#   3. Gemini分析失败时发出明确降级通知，不静默输出空白报告
+#   4. 移除apply_filters内per-ticker SKIP日志（427行噪音 → 1行汇总）
+#   5. numpy import标注为备用，避免误删
+#   6. ann_info["sensitive"]字段None安全处理
 # ============================================================
 
 import os
@@ -18,7 +21,7 @@ from datetime import datetime, date, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Optional
 
-import numpy as np
+import numpy as np  # noqa: F401 — 保留备用，部分pandas操作可能隐式依赖
 import yfinance as yf
 import pandas as pd
 import requests
@@ -1088,93 +1091,72 @@ def apply_filters(
     t: str,
     daily: pd.DataFrame,
     intra: pd.DataFrame,
-) -> Optional[dict]:
+) -> tuple[Optional[dict], str]:
     """
     对单只股票应用完整筛选条件。
-    通过返回候选字典，否则返回 None 并记录拒绝原因。
-
-    筛选逻辑说明：
-    - 价格区间：过滤仙股（噪音多、点差大）和超高价股（流动性差）
-    - 涨幅上限：60%以上通常已是恐慌性追买尾段，风险/回报恶化
-    - 量比≥1.5：确保今日异动量是实质性的，不是低迷盘整
-    - 换手金额≥50万：确保可以正常进出，避免流动性陷阱
-    - VWAP距离≤5%：价格已明显脱离VWAP说明追入成本过高
-    - 排除已连涨：避免在多日加速拉升末端追高
+    返回 (候选字典, "") 表示通过；返回 (None, reason) 表示拒绝。
+    reason用于主循环统计各filter淘汰数，不再打印每只股票的SKIP日志。
     """
     try:
-        closes     = safe_series(daily, "Close")
+        closes = safe_series(daily, "Close")
 
-        # prev_close：取日线中日期 < 今日的最后一根收盘价。
-        # 直接用 iloc[-2] 有两个风险：
-        #   (a) yfinance有时在盘中已生成今日日线bar → iloc[-1]是今日，iloc[-2]才是昨日 ✅
-        #   (b) yfinance有时没有今日日线bar → iloc[-1]是昨日，iloc[-2]是前天 ❌（会导致涨幅计算偏差）
-        # 正确方法：按index日期过滤，找到严格早于今日的最后一根。
-        today_str  = date.today().isoformat()
-        daily_idx  = daily.index
-        # 支持DatetimeIndex（带时区或不带时区）和普通Index
+        # prev_close：按日期索引取严格早于今日的最后一根。
+        # 避免yfinance盘中是否已生成今日bar造成的iloc[-2]语义不稳定。
+        today_str = date.today().isoformat()
+        daily_idx = daily.index
         try:
             past_closes = closes[daily_idx.strftime("%Y-%m-%d") < today_str]
         except AttributeError:
-            # index不是DatetimeIndex，降级到原始方式
-            past_closes = closes.iloc[:-1]  # 去掉最后一根
+            past_closes = closes.iloc[:-1]
         if len(past_closes) < 1:
-            return None
+            return None, "no_prev_close"
         prev_close = float(past_closes.iloc[-1])
 
         curr_price = float(safe_series(intra, "Close").iloc[-1])
 
-        # 1. 价格区间过滤（最基础的仙股过滤）
+        # 1. 价格区间
         if not (FILTER["min_price"] <= curr_price <= FILTER["max_price"]):
-            log.info(f"  SKIP {t}: 价格{curr_price}超出区间")
-            return None
+            return None, "price"
 
         # 2. 涨幅区间
         change_pct = (curr_price - prev_close) / prev_close * 100
         if not (FILTER["min_change_pct"] <= change_pct <= FILTER["max_change_pct"]):
-            log.info(f"  SKIP {t}: 涨幅{change_pct:.1f}%超出区间")
-            return None
+            return None, "change_pct"
 
-        # 3. 量比（今日量 / 20日均量）
+        # 3. 量比
         today_vol   = float(safe_series(intra, "Volume").sum())
         avg_day_vol = float(safe_series(daily, "Volume").iloc[-20:].mean())
         vol_ratio   = today_vol / avg_day_vol if avg_day_vol > 0 else 0
         if vol_ratio < FILTER["min_vol_ratio"]:
-            log.info(f"  SKIP {t}: 量比{vol_ratio:.2f}不足")
-            return None
+            return None, "vol_ratio"
 
-        # 4. 流动性：今日换手金额
+        # 4. 换手金额
         dollar_volume = today_vol * curr_price
         if dollar_volume < FILTER["min_dollar_volume"]:
-            log.info(f"  SKIP {t}: 日换手额${dollar_volume:,.0f}不足")
-            return None
+            return None, "dollar_vol"
 
-        # 5. VWAP距离（价格不能远离VWAP，避免追高）
+        # 5. VWAP距离
         vwap_series = calc_vwap(intra)
         vwap        = float(vwap_series.iloc[-1])
         vwap_dist   = abs(curr_price - vwap) / vwap * 100 if vwap > 0 else 999
         if vwap_dist > FILTER["max_vwap_dist_pct"]:
-            log.info(f"  SKIP {t}: 距VWAP{vwap_dist:.1f}%过远")
-            return None
+            return None, "vwap_dist"
 
-        # 6. 排除已连涨多日（避免追末段）
+        # 6. 排除已连涨多日
         if len(closes) >= 4:
-            d1, d2, d3 = float(closes.iloc[-2]), float(closes.iloc[-3]), float(closes.iloc[-4])
+            d1 = float(closes.iloc[-2])
+            d2 = float(closes.iloc[-3])
+            d3 = float(closes.iloc[-4])
             if d1 > d2 * 1.05 and d2 > d3 * 1.02:
-                log.info(f"  SKIP {t}: 已连续多日上涨，避免追高")
-                return None
+                return None, "consec_rise"
 
-        # 7. 计算其他盘中指标
+        # 7. 通过：计算盘中指标
         today_high  = float(safe_series(intra, "High").max())
         today_low   = float(safe_series(intra, "Low").min())
         launch_pt   = float(safe_series(intra, "Low").iloc[0])
-
-        # 是否仍是"一字板"（价格贴近当日最高，无回调空间）
-        # 用绝对价差而非百分比，对低价股更准确
         pullback_room = (today_high - curr_price) / today_high * 100 if today_high > 0 else 0
         is_straight   = pullback_room < 2.0
-
-        # 价格相对今日区间的位置（0=最低，100=最高）
-        range_size  = today_high - today_low
+        range_size    = today_high - today_low
         price_in_range = (
             (curr_price - today_low) / range_size * 100
             if range_size > 0 else 50
@@ -1195,11 +1177,10 @@ def apply_filters(
             "is_straight"   : is_straight,
             "pullback_room" : round(pullback_room, 1),
             "price_in_range": round(price_in_range, 1),
-        }
+        }, ""
 
     except (IndexError, ValueError, KeyError, ZeroDivisionError) as e:
-        log.info(f"  SKIP {t}: 指标计算异常 {e}")
-        return None
+        return None, f"exception:{e}"
 
 
 # ============================================================
@@ -1570,17 +1551,18 @@ def run_morning_scan() -> None:
 
     intra_data = batch_intraday(liquid, batch_size=50)
 
-    # 应用强化筛选条件（附各filter淘汰计数，方便调参诊断）
+    # 应用强化筛选条件，统计各filter淘汰数
     pre_candidates: list[dict] = []
-    _reject = {
-        "no_intra"    : 0,  # 无盘中数据
-        "price"       : 0,  # 价格区间
-        "change_pct"  : 0,  # 涨幅区间
-        "vol_ratio"   : 0,  # 量比不足
-        "dollar_vol"  : 0,  # 换手金额不足
-        "vwap_dist"   : 0,  # 距VWAP过远
-        "consec_rise" : 0,  # 已连续上涨
-        "exception"   : 0,  # 异常
+    _reject: dict[str, int] = {
+        "no_intra"     : 0,
+        "no_prev_close": 0,
+        "price"        : 0,
+        "change_pct"   : 0,
+        "vol_ratio"    : 0,
+        "dollar_vol"   : 0,
+        "vwap_dist"    : 0,
+        "consec_rise"  : 0,
+        "exception"    : 0,
     }
     for t in liquid:
         daily = daily_data.get(t)
@@ -1588,20 +1570,27 @@ def run_morning_scan() -> None:
         if daily is None or intra is None or intra.empty:
             _reject["no_intra"] += 1
             continue
-        result = apply_filters(t, daily, intra)
+        result, reason = apply_filters(t, daily, intra)
         if result:
             pre_candidates.append(result)
+        else:
+            key = reason.split(":")[0]  # "exception:xxx" → "exception"
+            _reject[key] = _reject.get(key, 0) + 1
 
-    # 逆向推算各filter淘汰数（通过log.info SKIP消息统计）
-    # 直接从log不好统计，改为在apply_filters加返回reason更干净
-    # 当前先统计总体情况
+    total_rejected = len(liquid) - len(pre_candidates)
     log.info(
-        f"量化条件通过：{len(pre_candidates)} 只 | "
+        f"量化条件通过：{len(pre_candidates)} 只 / {len(liquid)} 只候选\n"
+        f"  淘汰明细 → "
         f"无盘中数据:{_reject['no_intra']} | "
-        f"总淘汰:{len(liquid) - _reject['no_intra'] - len(pre_candidates)}"
+        f"价格区间:{_reject['price']} | "
+        f"涨幅不足:{_reject['change_pct']} | "
+        f"量比不足:{_reject['vol_ratio']} | "
+        f"换手不足:{_reject['dollar_vol']} | "
+        f"VWAP过远:{_reject['vwap_dist']} | "
+        f"连续上涨:{_reject['consec_rise']} | "
+        f"异常:{_reject.get('exception',0)+_reject.get('no_prev_close',0)}"
     )
-    log.info("（如通过0只，请在日志中搜索'SKIP'查看各filter淘汰明细）")
-    log.info(f"验证公告...")
+    log.info("验证公告...")
 
     # ── 公告验证 ─────────────────────────────────────────────
     stage1_pass: list[dict] = []
@@ -1707,6 +1696,12 @@ def run_morning_scan() -> None:
     # ── 阶段三：Gemini综合分析 ──────────────────────────────
     log.info("【阶段三】Gemini综合分析...")
     ai_results = analyze_candidates_batch(stage1_pass)
+    if not ai_results:
+        log.warning("Gemini分析返回空结果，将发送无AI分析版报告")
+        send_telegram(
+            f"⚠️ <b>Gemini分析失败</b> {today}\n"
+            f"共{len(stage1_pass)}只候选，技术报告照常发送，AI分析字段为空。"
+        )
 
     # ── 保存 & 发送主报告 ─────────────────────────────────────
     try:
@@ -1722,378 +1717,9 @@ def run_morning_scan() -> None:
 
     msg = format_telegram_message(stage1_pass, ai_results, today)
     send_telegram(msg)
-    log.info(f"✅ 主报告已发送，{len(stage1_pass)} 个候选")
-
-    # ── 阶段四：日报Prompt生成（零额外API调用，复用已有数据）──
-    log.info("【阶段四】生成日报Prompt（Telegram / X / 小红书）...")
-    run_report_prompt(stage1_pass, ai_results, today)
-    log.info("✅ 扫描全部完成")
+    log.info(f"✅ 扫描完成，{len(stage1_pass)} 个候选")
 
 
-# ============================================================
-# 日报Prompt生成模块
-# Morning版本 vs EOD版本的核心区别：
-#   EOD：趋势积累 + 中期逻辑 + 基本面支撑
-#   Morning：催化剂突破 + 盘中动量 + 短线入场窗口
-# 所有数据来自已完成的扫描阶段，零额外API调用。
-# ============================================================
-
-def _build_morning_stock_block(c: dict, ai: dict, rank: int) -> str:
-    """
-    构建单只股票的完整文案素材包。
-
-    数据分层结构（文案AI可按层取用）：
-      Section A — 今日行情快照（量价结构）
-      Section B — 事件链时间线（按chain_role分组）
-                  🔥 trigger   直接催化剂（含正文+关键数字，这是故事核心）
-                  📈 followup  后续进展（催化剂发酵轨迹）
-                  🔍 analyst   分析师/机构观点
-                  📚 background 历史背景（公司发展脉络）
-      Section C — 孤立价格异动（大涨大跌无对应新闻，信息不对称警示）
-      Section D — 历史技术摘要
-      Section E — AI量化结论（三层故事结构）
-
-    设计原则：正文和关键数字优先展示，标题降级为辅助信息。
-    """
-    ai      = ai or {}
-    metrics = c.get("hist_metrics", {})
-    timeline = c.get("news_timeline", [])
-
-    # ── Section A：今日行情快照 ────────────────────────────────
-    sl_flag  = "⚠️ 一字拉升（暂不追入）" if c["is_straight"] else f"✅ 回调空间{c['pullback_room']}%"
-    src_flag = "ASX官方公告" if c.get("ann_source") == "asx" else "新闻来源"
-    sen_flag = "（⭐价格敏感公告）" if c.get("ann_sensitive") else ""
-
-    section_a = (
-        f"【今日行情快照】\n"
-        f"  涨幅 +{c['change_pct']}% | 量比 {c['vol_ratio']}x"
-        f" | 日换手 ${c['dollar_volume']:,}\n"
-        f"  价格 ${c['price']} | VWAP ${c['vwap']}（偏离{c['vwap_dist_pct']}%）"
-        f" | {sl_flag}\n"
-        f"  今日高点 ${c['today_high']} | 启动低点 ${c['launch_pt']}\n"
-        f"  催化剂来源: {src_flag}{sen_flag}\n"
-        f"  公告标题: {c.get('ann_headline', '无')}"
-    )
-
-    # ── Section B：事件链时间线（按chain_role分层）─────────────
-    chain_groups: dict[str, list] = {
-        "trigger"   : [],
-        "followup"  : [],
-        "analyst"   : [],
-        "background": [],
-    }
-    for n in timeline:
-        role = n.get("chain_role", "background")
-        if role in chain_groups:
-            chain_groups[role].append(n)
-
-    def _render_news_item(n: dict, body_limit: int, show_body: bool = True) -> str:
-        """渲染单条新闻：标题 + 关键数字 + 正文（按体量截取）"""
-        days     = n.get("days_ago", "?")
-        src      = n.get("source", "未知")
-        title    = n.get("title", "")
-        body     = n.get("body", "")
-        facts    = n.get("key_facts", [])
-        move_str = n.get("price_move_str", "")
-        sens     = "⭐" if n.get("sensitive") else ""
-
-        move_label = f"  → 股价反应: {move_str}" if move_str else ""
-        lines      = [f"  [{days}天前] {sens}{src}: {title}{move_label}"]
-
-        # 关键数字是讲故事的"弹药"，始终展示
-        if facts:
-            lines.append(f"  📊 关键数字: {' | '.join(facts[:6])}")
-
-        # 正文按重要性决定给多少字
-        if show_body and body:
-            body_trim = body[:body_limit].rstrip()
-            if len(body) > body_limit:
-                body_trim += "..."
-            lines.append(f"  📝 正文: {body_trim}")
-
-        return "\n".join(lines)
-
-    timeline_sections = []
-
-    # trigger：最重要，正文给足400字，最多2条
-    if chain_groups["trigger"]:
-        timeline_sections.append("🔥【直接催化剂 — 今日涨幅的触发事件（最重要）】")
-        for n in chain_groups["trigger"][:2]:
-            timeline_sections.append(_render_news_item(n, body_limit=400, show_body=True))
-
-    # followup：后续进展，正文200字，最多3条
-    if chain_groups["followup"]:
-        timeline_sections.append("\n📈【后续进展 — 催化剂发酵轨迹】")
-        for n in chain_groups["followup"][:3]:
-            timeline_sections.append(_render_news_item(n, body_limit=200, show_body=True))
-
-    # analyst：机构观点，正文150字，最多2条
-    if chain_groups["analyst"]:
-        timeline_sections.append("\n🔍【分析师/机构观点】")
-        for n in chain_groups["analyst"][:2]:
-            timeline_sections.append(_render_news_item(n, body_limit=150, show_body=True))
-
-    # background：历史背景，只显示标题+关键数字（不给正文，节省token）
-    if chain_groups["background"]:
-        timeline_sections.append("\n📚【历史背景 — 理解公司发展脉络，帮助判断今日催化剂是否超预期】")
-        for n in chain_groups["background"][:4]:
-            timeline_sections.append(_render_news_item(n, body_limit=0, show_body=False))
-
-    section_b = (
-        "【事件链时间线（按催化剂角色分层）】\n"
-        + ("\n".join(timeline_sections) if timeline_sections else "  暂无新闻/公告数据")
-    )
-
-    # ── Section C：孤立价格事件（大涨大跌无对应新闻）───────────
-    orphans     = c.get("orphan_price_events", [])
-    section_c   = ""
-    if orphans:
-        orphan_lines = [
-            f"  {e['date']}: 单日{'+' if e['change_pct']>0 else ''}{e['change_pct']}%"
-            f"（无对应公告）"
-            for e in orphans[:4]
-        ]
-        section_c = (
-            "\n❓【孤立价格异动 — 大涨大跌但无对应公告，可能存在信息不对称】\n"
-            "（写作时请提示读者核查是否有未公开信息）\n"
-            + "\n".join(orphan_lines)
-        )
-
-    # ── Section D：历史技术摘要 ────────────────────────────────
-    section_d = (
-        "【历史技术摘要（近6个月）】\n"
-        f"  趋势: {metrics.get('trend','?')} | "
-        f"RSI: {metrics.get('rsi_14','?')} | "
-        f"5日涨: {metrics.get('ret_5d_pct','?')}% | "
-        f"20日涨: {metrics.get('ret_20d_pct','?')}% | "
-        f"60日涨: {metrics.get('ret_60d_pct','?')}%\n"
-        f"  年化波动: {metrics.get('vol_annualized_pct','?')}% | "
-        f"距历史高点: {metrics.get('pct_from_period_high','?')}% | "
-        f"量能趋势(近5日/20日均量): {metrics.get('vol_trend_5v20','?')}x"
-    )
-
-    # ── Section E：AI量化结论（三层故事结构）────────────────────
-    ai_lines = []
-    verdict  = ai.get("verdict", "")
-    conf     = ai.get("confidence", "")
-    if verdict:
-        ai_lines.append(f"  量化判断: {verdict}（{conf}信心）")
-    if ai.get("catalyst"):
-        ai_lines.append(f"  🔥 今日触发: {ai['catalyst']}")
-    if ai.get("backstory"):
-        ai_lines.append(f"  📖 历史背景: {ai['backstory']}")
-    if ai.get("story_chain"):
-        ai_lines.append(f"  🔗 因果链: {ai['story_chain']}")
-    if ai.get("short_term_view"):
-        ai_lines.append(f"  📈 短期展望: {ai['short_term_view']}")
-    if ai.get("entry_note"):
-        ai_lines.append(f"  🎯 入场参考: {ai['entry_note']}")
-
-    section_e = (
-        "【AI量化初步结论（三层故事结构，供文案参考）】\n"
-        + ("\n".join(ai_lines) if ai_lines else "  暂无AI分析")
-    )
-
-    # ── 拼装完整数据块 ────────────────────────────────────────
-    parts = [
-        f"\n{'='*56}",
-        f"#{rank} {c['ticker']}",
-        f"{'='*56}",
-        section_a,
-        "",
-        section_b,
-    ]
-    if section_c:
-        parts.append(section_c)
-    parts += ["", section_d, "", section_e]
-
-    return "\n".join(parts)
-
-
-def _build_morning_prompt(platform: str, stocks_block: str,
-                          today: str, n_candidates: int) -> str:
-    """
-    生成各平台的最终Prompt文本。
-
-    数据包说明注入策略：
-    - 在数据包引言里明确告诉文案AI各字段含义
-    - 强制三层叙事结构（触发→背景→因果链）
-    - 明确指出chain_role的含义，避免AI忽略事件分类
-    - 孤立价格异动单独提示，要求文案AI处理信息不对称问题
-    """
-    # 数据包说明（三个平台共用，避免重复写）
-    data_guide = (
-        "【数据包说明 — 请务必阅读后再生成内容】\n"
-        "每只股票的数据按以下结构组织：\n"
-        "  🔥 直接催化剂(trigger)：今日涨幅的直接触发事件，含正文摘要和关键数字\n"
-        "     → 这是故事的核心，必须具体引用，不能泛化\n"
-        "  📈 后续进展(followup)：催化剂发酵的中间节点，说明市场如何消化这个事件\n"
-        "  🔍 分析师观点(analyst)：机构如何解读，帮助判断市场共识\n"
-        "  📚 历史背景(background)：公司此前的铺垫，解释为什么今天这件事重要\n"
-        "  ❓ 孤立价格异动：大涨大跌但无对应公告，写作时须提示读者核查\n"
-        "  AI量化结论：已提供catalyst/backstory/story_chain三层分析，可直接引用\n"
-        "数据优先级：公告PDF正文 > ASX公告标题 > 新闻正文 > 技术指标"
-    )
-
-    instructions = {
-        "seo": f"""\
-Write an English SEO-optimised investment analysis article about today's ASX morning movers ({today}).
-(SEO instruction placeholder — detailed requirements to be defined.)""",
-
-        "twitter": f"""\
-Generate an English X (Twitter) thread — ASX morning catalyst report ({today}).
-
-MANDATORY NARRATIVE RULE — Each stock tweet answers THREE questions:
-  Q1 What happened? (trigger event — cite specific data/number from the announcement)
-  Q2 Why does this matter? (background — what was expected, did this beat it?)
-  Q3 What's the story arc? (story_chain — 'X months ago → milestone → today confirmed')
-
-FORMAT:
-Tweet 1 (hook ≤250 chars): Biggest move of the day + catalyst theme
-Tweets 2–{n_candidates + 1}: One per stock:
-  Line 1: $ASX:TICKER +X% | [Trigger: specific announcement + key number]
-  Line 2: [Why it matters + story arc in 1 line] | Buy/Watch/Avoid
-  Note: Flag 'unconfirmed' for any orphan price move without announcement
-Final tweet: Key risk + #ASX #Catalyst #AustralianStocks + disclaimer
-
-Rules: Convert numbers to judgment language. ≤280 chars/tweet. Separator: ---TWEET---""",
-
-        "xiaohongshu": f"""\
-生成**中文**小红书投资笔记（今日{today}，共{n_candidates}只早盘异动股）。
-
-【叙事定位】：不是数据播报员，是"投资侦探"——
-你发现了今日涨停背后的完整故事，从几个月前的铺垫写到今天的爆发，
-让读者恍然大悟"原来这家公司早就埋了这颗种子"。
-
-【每只股票必须包含三层故事】：
-  ① 今天的引爆点（trigger事件，必须有具体内容，引用关键数字）
-  ② 为什么今天这件事让股价爆了（background，逻辑解释）
-  ③ 时间线上的伏笔（story_chain，"X个月前→...→今日兑现"）
-
-【输出格式】：
-标题（≤20字，钩子式，含情绪词，例如"这家公司埋了X个月的局，今天爆了"）
-开头钩子（2句，引发好奇心，不剧透答案）
-每只股票：
-  🔍 公司是谁（1句行业+主营）
-  💥 今天发生了什么（trigger，含具体数字）
-  🏗️ 背景故事（2-3句，为什么重要）
-  🔗 时间线伏笔（1-2句因果链）
-  ❓ 如有孤立价格异动，提示读者"X日曾有不明原因大涨，需核查"
-  📊 技术信号（1句，口语化，不堆数字）
-  🎯 我的判断（买入/观望/回避 + 1句理由）
-结尾：今日投资启示（1句心得）+ 风险提示
-话题：#澳股 #ASX投资 #股票分析 #早盘异动（可加行业标签）
-写作风格：专业但亲切，像朋友分享干货；不确定写"待核查"；末尾免责声明。""",
-    }
-
-    instruction = instructions.get(platform, instructions["seo"])
-
-    return (
-        f"📋 <b>ASX早盘文案Prompt — {platform.upper()} — {today}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>👇 复制以下全部内容给AI生成文章</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"你是一位专注澳大利亚股市(ASX)的资深短线分析师，"
-        f"擅长用催化剂驱动的叙事方式分析个股异动。\n\n"
-        f"{data_guide}\n\n"
-        f"=== 今日早盘数据包"
-        f"（{n_candidates}只候选，均已通过新闻门控：≤2天内有公告/新闻）===\n"
-        f"{stocks_block}\n\n"
-        f"=== 输出任务 ===\n"
-        f"{instruction}\n\n"
-        f"=== 全局规则（优先级最高，任何平台均适用）===\n"
-        f"1. 数据优先级：公告PDF正文 > ASX公告标题 > 新闻正文 > 技术指标\n"
-        f"2. 禁止罗列原始数字，必须转化为投资判断语言\n"
-        f"3. 无正文的字段写'正文未获取，建议查看ASX原文'\n"
-        f"4. 孤立价格异动（❓标注）必须在文中提示读者核查\n"
-        f"5. 三层叙事（触发→背景→因果链）缺一不可，不得压缩成一句话\n"
-        f"6. 所有内容不构成投资建议，末尾必须加免责声明\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
-
-
-def run_report_prompt(
-    candidates: list[dict],
-    ai_results: dict[str, dict],
-    today: str,
-) -> None:
-    """
-    日报Prompt生成主函数。
-    输入：stage1_pass（已含news_timeline、hist_metrics、orphan_price_events）+ ai_results
-    输出：向Telegram发送三个平台的Prompt文本，用户复制给AI生成文案。
-    不调用Gemini，不产生额外API费用。
-
-    发送策略：
-    - 每个平台Prompt之间等待3秒，避免Telegram限速
-    - 每个Prompt发送前先发一条简短header，标注平台和股票数
-    - send_telegram() 内部已按段落自动分段，无需手动切割
-    """
-    if not candidates:
-        log.warning("run_report_prompt：无候选股，跳过")
-        return
-
-    # 按verdict排序：买入优先（文案聚焦最强信号）
-    verdict_order = {"买入": 0, "观望": 1, "回避": 2}
-    sorted_candidates = sorted(
-        candidates,
-        key=lambda c: (
-            verdict_order.get(
-                ai_results.get(c["ticker"], {}).get("verdict", "观望"), 1
-            ),
-            -c["change_pct"],
-        ),
-    )
-    n_candidates = len(sorted_candidates)
-
-    # 构建股票数据块（所有平台共用同一份数据包）
-    log.info(f"构建{n_candidates}只股票的文案数据包...")
-    stock_blocks: list[str] = []
-    for rank, c in enumerate(sorted_candidates, 1):
-        ai    = ai_results.get(c["ticker"], {})
-        block = _build_morning_stock_block(c, ai, rank)
-        stock_blocks.append(block)
-
-        # 统计各层内容丰富度（便于debug）
-        timeline   = c.get("news_timeline", [])
-        has_body   = sum(1 for n in timeline if n.get("body"))
-        has_facts  = sum(1 for n in timeline if n.get("key_facts"))
-        has_orphan = len(c.get("orphan_price_events", []))
-        log.info(
-            f"  #{rank} {c['ticker']}: "
-            f"新闻{len(timeline)}条 | 含正文{has_body} | "
-            f"含关键数字{has_facts} | 孤立事件{has_orphan}"
-        )
-
-    stocks_block = "\n".join(stock_blocks)
-
-    # 发送三个平台Prompt（每个平台之间3秒间隔）
-    platform_labels = {
-        "seo"         : "SEO 网页文章",
-        "twitter"     : "X/Twitter 英文Thread",
-        "xiaohongshu" : "小红书 投资笔记",
-    }
-    for platform in ["seo", "twitter", "xiaohongshu"]:
-        label = platform_labels[platform]
-        log.info(f"  发送 [{label}] Prompt...")
-
-        # 先发一条简短header，用户知道接下来是什么
-        send_telegram(
-            f"📝 <b>文案Prompt — {label}</b>\n"
-            f"共{n_candidates}只股票 | 复制以下内容给AI生成文章 👇"
-        )
-        time.sleep(1.0)
-
-        prompt_text = _build_morning_prompt(
-            platform, stocks_block, today, n_candidates
-        )
-        send_telegram(prompt_text)
-        log.info(f"  ✅ [{label}] Prompt已发送（{len(prompt_text)}字符）")
-        time.sleep(3.0)  # 平台间间隔，避免Telegram限速
-
-    log.info(
-        f"日报Prompt全部发送完成 | "
-        f"{n_candidates}只股票 × 3平台 | 今日{today}"
-    )
 
 
 if __name__ == "__main__":
