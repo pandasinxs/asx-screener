@@ -147,11 +147,12 @@ PDF_KEY_TERMS = [
 
 # 加权评分权重
 SCORE_WEIGHTS = {
-    "rs_vs_xjo":      0.35,
-    "adx14":          0.25,
-    "vol_ratio":      0.20,
-    "close_pos_pct":  0.10,
-    "price_pct_1y":   0.10,
+    "rs_vs_xjo":      0.30,
+    "adx14":          0.20,
+    "vol_ratio":      0.15,
+    "close_pos_pct":  0.08,
+    "price_pct_1y":   0.07,
+    "catalyst":       0.20,
 }
 
 TIERS = [
@@ -355,6 +356,7 @@ def calc_composite_score(tech: dict) -> float:
         "vol_ratio"     : norm(tech.get("vol_ratio", 1.0),  1.0, 4.0),
         "close_pos_pct" : norm(tech.get("close_pos_pct", 50), 40, 100),
         "price_pct_1y"  : norm(tech.get("price_pct_1y", 50), 50, 100),
+        "catalyst"      : tech.get("catalyst", 0.0), 
     }
     return round(sum(SCORE_WEIGHTS[k] * v for k, v in scores.items()), 4)
 
@@ -1881,6 +1883,20 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
                     tech["ticker"]     = ticker
                     tech["tier_level"] = tier["level"]
                     tech["tier_label"] = tier["label"]
+                    code = ticker.replace(".AX", "")
+                    ann  = today_ann.get(code, {})
+                    ann_date = ann.get("date", "") if ann else ""
+                    today_str = date.today().isoformat()
+                    week_ago  = (date.today() - timedelta(days=7)).isoformat()
+                    month_ago = (date.today() - timedelta(days=30)).isoformat()
+                    if ann.get("sensitive") and ann_date == today_str:
+                        tech["catalyst"] = 1.0   # 今日price-sensitive公告
+                    elif ann.get("sensitive") and ann_date >= week_ago:
+                        tech["catalyst"] = 0.7   # 近7天price-sensitive公告
+                    elif ann_date >= month_ago:
+                        tech["catalyst"] = 0.3   # 近30天有任意公告
+                    else:
+                        tech["catalyst"] = 0.0   # 无近期公告
                     seen_tickers[ticker] = tech
                     count += 1
             except Exception as e:
