@@ -506,6 +506,7 @@ def push_to_github() -> bool:
         log.info(f"push_to_github: 使用branch={branch}")
 
         cmds = [
+            ["git", "-C", ASXBOX_REPO, "pull", "--no-rebase", "origin", branch],
             ["git", "-C", ASXBOX_REPO, "add",
              "src/data/signals/en.json",
              "src/data/signals/zh.json"],
