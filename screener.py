@@ -1317,9 +1317,9 @@ def serialize_to_prompt(market_snap: dict, stocks_block: str,
         f"今日领涨板块：{sector_str}"
     )
 
-    instructions
+    
 
-instructions = {
+    instructions = {
         "seo": """You are a professional ASX equity research analyst and SEO content engine.
 
 Your task is to generate a high-quality END-OF-DAY (EOD) stock analysis article based on structured market data.
