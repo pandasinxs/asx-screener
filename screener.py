@@ -1,5 +1,5 @@
 # ============================================================
-# ASX SYSTEM — screener.py  v14
+# ASX SYSTEM — screener.py  v15
 #
 # 流程一：EOD选股
 #   全市场K线 → T1-T4筛选 → Top3加权评分 → 新闻/公告时间线
@@ -9,15 +9,12 @@
 #   Top3 Movers → 技术面+精选新闻+公告+PDF关键段落
 #   → 构建三平台Prompt → Telegram附件（SEO/Twitter/小红书）
 #
-# v14新增（相对v13）：
-#   - calc_confidence()：基于层级的置信度算法（替代composite_score当confidence用）
-#   - _parse_gemini_json_fields()：正则抓取Gemini输出的JSON字段
-#   - generate_signals_json()：生成en.json/zh.json写入asxbox仓库
-#   - push_to_github()：自动检测branch，推送signals到Cloudflare Pages
-#   - Gemini Prompt末尾强制输出JSON_TAG/ONE_LINER四字段
-#   - _json_valid标志：Gemini失败时跳过该股票不写入JSON
-#   - send_document()：日报Prompt改为.txt附件发送（解决消息过长分割问题）
-#   - 日报平台矩阵：SEO文章 / Twitter / 小红书（替代原Telegram简报）
+# v15新增（相对v14）：
+#   - signals_history表：记录全部T1-T4候选股（含落选），用于回测
+#   - save_signal_to_history()：ATR倍数止盈止损，is_selected区分Top3/候选
+#   - update_signal_outcomes()：每次运行自动更新历史信号结果（WIN/LOSS/TIMEOUT）
+#   - 催化剂评分注入筛选循环
+#   - T1-T4全部扫描合并排序（保证数量同时保证质量）
 # ============================================================
 
 import os, io, re, sys, time, logging, json, subprocess
@@ -60,75 +57,46 @@ GEMINI_CFG_DEEP = {"thinking_config": {"thinking_budget": 512}}
 RETRY_MAX       = 20
 RETRY_WAIT      = 30
 TIMEOUT         = 15
-TOP_N           = 3     # 精选Top 3
+TOP_N           = 3
 
-# ── GitHub网站仓库配置 ────────────────────────────────────────
-ASXBOX_REPO     = os.path.expanduser("~/asxbox")
-SIGNALS_DIR     = os.path.join(ASXBOX_REPO, "src", "data", "signals")
+ASXBOX_REPO  = os.path.expanduser("~/asxbox")
+SIGNALS_DIR  = os.path.join(ASXBOX_REPO, "src", "data", "signals")
 
 ASX_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
     "Accept":     "application/json",
     "Referer":    "https://www.asx.com.au",
 }
-ASX_ANN_ALL    = "https://asx.api.markitdigital.com/asx-research/1.0/markets/announcements"
-# ASX单股历史公告API已确认不存在（404）。
-# 经测试所有参数变体均被服务器忽略，无法按ticker过滤。
-# 历史公告通过 fetch_announcements() 从今日公告缓存积累，见下方说明。
-PDF_DL_BASE    = "https://cdn-api.markitdigital.com/apiman-gateway/ASX/asx-research/1.0/file/{doc_key}?access_token=83ff96335c2d45a094df02a206a39ff4"
-GOOGLE_RSS     = "https://news.google.com/rss/search?q={q}&hl=en-AU&gl=AU&ceid=AU:en"
+ASX_ANN_ALL  = "https://asx.api.markitdigital.com/asx-research/1.0/markets/announcements"
+PDF_DL_BASE  = "https://cdn-api.markitdigital.com/apiman-gateway/ASX/asx-research/1.0/file/{doc_key}?access_token=83ff96335c2d45a094df02a206a39ff4"
+GOOGLE_RSS   = "https://news.google.com/rss/search?q={q}&hl=en-AU&gl=AU&ceid=AU:en"
 
-PDF_MAX_CHARS    = 2000   # 每个PDF关键段落合计上限（关键词提取后更精准）
+PDF_MAX_CHARS     = 2000
 PDF_MAX_PER_STOCK = 2
-NEWS_MAX         = 5
+NEWS_MAX          = 5
 
-# ── 公告白名单（保留有实质意义的类型，过滤合规噪音）──────────
-# ASX documentType完整列表中，以下类型对股价有实质影响
+# 回测参数（一旦开始记录不要修改，修改后前后数据不可比）
+BT_STOP_ATR_MULT   = 2   # 止损 = 入场价 - 2×ATR14
+BT_TARGET_ATR_MULT = 4   # 止盈 = 入场价 + 4×ATR14
+BT_TIMEOUT_DAYS    = 20  # 超过20个交易日算TIMEOUT
+
 ANN_WHITELIST = {
-    # 业绩 & 财务
-    "Quarterly Activities Report",
-    "Quarterly Cashflow Report",
-    "Half Yearly Report",
-    "Preliminary Final Report",
-    "Annual Report",
-    "Full Year Results",
-    "Half Year Results",
-    "Appendix 4C",
-    "Appendix 4D",
-    "Appendix 4E",
-    # 资源 & 勘探（矿业/能源关键）
-    "Quarterly Production Report",
-    "Resource/Reserve Update",
-    "Exploration Results",
-    "Drilling Results",
-    "Mining Results",
-    "Results of Operations",
-    # 重大事件
-    "Merger/Acquisition",
-    "Takeover",
-    "Scheme of Arrangement",
-    "Strategic Review",
-    "Major Contract",
-    "Material Contract",
-    "Capital Raising",
-    "Placement",
-    "Rights Issue",
-    "Share Purchase Plan",
-    "CEO/Chairman Change",
-    "Director Change",
-    "Suspension",
-    "Trading Halt",
-    "Trading Halt Lifted",
-    # 指引 & 展望
-    "Guidance",
-    "Market Update",
-    "Business Update",
-    "Investor Presentation",
-    "Progress Report",
-    "Project Update",
+    "Quarterly Activities Report", "Quarterly Cashflow Report",
+    "Half Yearly Report", "Preliminary Final Report", "Annual Report",
+    "Full Year Results", "Half Year Results",
+    "Appendix 4C", "Appendix 4D", "Appendix 4E",
+    "Quarterly Production Report", "Resource/Reserve Update",
+    "Exploration Results", "Drilling Results", "Mining Results",
+    "Results of Operations", "Merger/Acquisition", "Takeover",
+    "Scheme of Arrangement", "Strategic Review",
+    "Major Contract", "Material Contract",
+    "Capital Raising", "Placement", "Rights Issue", "Share Purchase Plan",
+    "CEO/Chairman Change", "Director Change",
+    "Suspension", "Trading Halt", "Trading Halt Lifted",
+    "Guidance", "Market Update", "Business Update",
+    "Investor Presentation", "Progress Report", "Project Update",
 }
 
-# 噪音类型关键词（documentType包含这些词则过滤）
 ANN_NOISE_KEYWORDS = [
     "appendix 3", "change of address", "change of registered",
     "notice of meeting", "proxy form", "lodge", "constitution",
@@ -137,7 +105,6 @@ ANN_NOISE_KEYWORDS = [
     "shareholder", "top 20", "section 708",
 ]
 
-# PDF关键词：命中这些词的段落才提取
 PDF_KEY_TERMS = [
     "revenue", "production", "guidance", "result", "profit", "loss",
     "cash", "ebitda", "npat", "highlights", "outlook", "summary",
@@ -145,7 +112,6 @@ PDF_KEY_TERMS = [
     "milestone", "update", "completion", "approval", "forecast",
 ]
 
-# 加权评分权重
 SCORE_WEIGHTS = {
     "rs_vs_xjo":      0.30,
     "adx14":          0.20,
@@ -234,29 +200,17 @@ def calc_rs(close: pd.Series, bench: pd.Series, period: int = 20) -> float:
 
 
 def calc_price_events(close: pd.Series, threshold_pct: float = 5.0) -> list:
-    """
-    过去126个交易日（约6个月）内，单日涨跌幅超过阈值的事件。
-    让AI能把价格行为和新闻事件对应起来。
-    返回：[{"date": "YYYY-MM-DD", "change_pct": float}]
-    """
     pct    = close.pct_change() * 100
     recent = pct.iloc[-126:]
     events = []
     for dt, val in recent.items():
         if abs(val) >= threshold_pct:
-            events.append({
-                "date":       str(dt)[:10],
-                "change_pct": round(float(val), 1),
-            })
+            events.append({"date": str(dt)[:10], "change_pct": round(float(val), 1)})
     return sorted(events, key=lambda x: x["date"], reverse=True)[:10]
 
 
 def build_tech_summary(df: pd.DataFrame,
                        xjo: Optional[pd.Series] = None) -> dict:
-    """
-    完整技术指标摘要。选股筛选和日报均调用此函数。
-    新增：price_percentile_1y / vol_consistency / price_events
-    """
     close  = df["Close"].squeeze()
     high   = df["High"].squeeze()
     low    = df["Low"].squeeze()
@@ -283,35 +237,27 @@ def build_tech_summary(df: pd.DataFrame,
     w52_hi = float(high.rolling(min(252, len(high))).max().iloc[-1])
     w52_lo = float(low.rolling(min(252, len(low))).min().iloc[-1])
 
-    roll_max   = close.rolling(126).max()
-    max_dd     = float(((close - roll_max) / roll_max * 100).min())
-    day_range  = lh - ll
-    close_pos  = (lc - ll) / day_range if day_range > 0 else 0.5
+    roll_max  = close.rolling(126).max()
+    max_dd    = float(((close - roll_max) / roll_max * 100).min())
+    day_range = lh - ll
+    close_pos = (lc - ll) / day_range if day_range > 0 else 0.5
 
-    # ── 新增：价格1年历史分位 ─────────────────────────────────
-    # 当前价格在过去252日收盘价中的百分位
-    # 90%分位突破 vs 50%分位反弹，意义完全不同
-    hist_close  = close.iloc[-252:] if len(close) >= 252 else close
+    hist_close   = close.iloc[-252:] if len(close) >= 252 else close
     price_pct_1y = round(float((hist_close <= lc).sum() / len(hist_close) * 100), 1)
 
-    # ── 新增：量能连续性 ─────────────────────────────────────
-    # 近5日成交量是否逐步递增（连续温和放量比单日爆量质量更高）
     vol5 = volume.iloc[-5:]
     vol_consistency = bool(all(
         vol5.iloc[i] <= vol5.iloc[i + 1] for i in range(len(vol5) - 1)
     ))
 
-    # ── 新增：价格事件（6个月内单日±5%的节点）────────────────
     price_events = calc_price_events(close)
 
     return {
-        # 基础价格
         "price"          : round(lc, 3),
         "change_pct"     : round((lc / prev - 1) * 100, 2),
         "volume"         : round(lv),
         "vol_ratio"      : round(lv / vm20, 2) if vm20 > 0 else 1.0,
         "close_pos_pct"  : round(close_pos * 100, 1),
-        # 趋势指标
         "rsi14"          : round(float(rsi_s.iloc[-1]), 1),
         "adx14"          : round(float(adx_s.iloc[-1]), 1),
         "plus_di"        : round(float(pdi_s.iloc[-1]), 1),
@@ -319,22 +265,18 @@ def build_tech_summary(df: pd.DataFrame,
         "vwap20"         : round(vwap_val, 3),
         "vwap_up"        : vwap_slope > 0,
         "rs_vs_xjo"      : calc_rs(close, xjo) if xjo is not None else 1.0,
-        # 均线
         "ma20"           : round(float(ma20.iloc[-1]), 3),
         "ma50"           : round(float(ma50.iloc[-1]), 3),
         "ma50_up"        : float(ma50.iloc[-1]) > float(ma50.iloc[-11]),
         "ma200"          : round(float(ma200.iloc[-1]), 3) if len(close) >= 200 else None,
-        # 波动 & 风险
         "atr14_pct"      : round(atr14 / lc * 100, 2),
         "w52_hi"         : round(w52_hi, 3),
         "w52_lo"         : round(w52_lo, 3),
         "dist_52w_hi_pct": round((lc / w52_hi - 1) * 100, 1),
         "max_dd_6m_pct"  : round(max_dd, 1),
-        # ── v13新增 ──────────────────────────────────────────
-        "price_pct_1y"   : price_pct_1y,      # 价格1年历史分位（%）
-        "vol_consistency": vol_consistency,    # 近5日量能是否逐步递增
-        "price_events"   : price_events,       # 6个月内大涨大跌节点
-        # 原始序列（供筛选逻辑使用，不进Prompt）
+        "price_pct_1y"   : price_pct_1y,
+        "vol_consistency": vol_consistency,
+        "price_events"   : price_events,
         "_close"  : close,
         "_high"   : high,
         "_low"    : low,
@@ -343,77 +285,36 @@ def build_tech_summary(df: pd.DataFrame,
 
 
 def calc_composite_score(tech: dict) -> float:
-    """
-    加权综合评分，用于Top3排序。
-    各指标先归一化到0-1再加权，避免量纲不同造成的偏差。
-    """
     def norm(val, lo, hi):
         return max(0.0, min(1.0, (val - lo) / (hi - lo))) if hi > lo else 0.0
-
     scores = {
         "rs_vs_xjo"     : norm(tech.get("rs_vs_xjo", 1.0), 0.8, 1.5),
         "adx14"         : norm(tech.get("adx14", 0),        15, 50),
         "vol_ratio"     : norm(tech.get("vol_ratio", 1.0),  1.0, 4.0),
         "close_pos_pct" : norm(tech.get("close_pos_pct", 50), 40, 100),
         "price_pct_1y"  : norm(tech.get("price_pct_1y", 50), 50, 100),
-        "catalyst"      : tech.get("catalyst", 0.0), 
+        "catalyst"      : tech.get("catalyst", 0.0),
     }
     return round(sum(SCORE_WEIGHTS[k] * v for k, v in scores.items()), 4)
 
 
 def calc_confidence(tech: dict, tier_level: str) -> float:
-    """
-    置信度（0.0-1.0），用于signals.json的confidence字段。
-
-    不同于composite_score（相对排序分），confidence是对信号有效性
-    的概率估计，有实际含义：0.85表示该信号约有85%的概率延续趋势。
-
-    计算逻辑：
-    - 基准分由筛选层级决定（T1质量最高，T4最低）
-    - ADX趋势强度加成（ADX>40视为强趋势）
-    - 相对强度加成（RS跑赢大盘越多越好）
-    - 量能连续性小幅加成
-    - 距52周高点越近折扣越小（已接近突破位）
-    - 硬上限0.92（无完美信号），硬下限0.50
-    """
-    base_map = {"T1": 0.85, "T2": 0.75, "T3": 0.65, "T4": 0.55}
-    base = base_map.get(tier_level, 0.60)
-
-    # ADX加成：ADX在25-50之间线性加成，最多+0.05
-    adx   = tech.get("adx14", 20)
+    base_map  = {"T1": 0.85, "T2": 0.75, "T3": 0.65, "T4": 0.55}
+    base      = base_map.get(tier_level, 0.60)
+    adx       = tech.get("adx14", 20)
+    rs        = tech.get("rs_vs_xjo", 1.0)
     adx_bonus = min(0.05, max(0.0, (adx - 25) / (50 - 25) * 0.05))
-
-    # RS加成：RS在1.0-1.3之间线性加成，最多+0.05
-    rs    = tech.get("rs_vs_xjo", 1.0)
-    rs_bonus = min(0.05, max(0.0, (rs - 1.0) / 0.3 * 0.05))
-
-    # 量能连续性加成
+    rs_bonus  = min(0.05, max(0.0, (rs - 1.0) / 0.3 * 0.05))
     vol_bonus = 0.02 if tech.get("vol_consistency") else 0.0
-
-    # 距52周高点折扣：dist_52w_hi_pct是负数（如-5%表示距高点5%）
-    # 越接近高点（绝对值越小）折扣越小
-    dist = abs(tech.get("dist_52w_hi_pct", -20))
-    dist_penalty = min(0.05, dist / 20 * 0.05)
-
-    confidence = base + adx_bonus + rs_bonus + vol_bonus - dist_penalty
-    return round(min(0.92, max(0.50, confidence)), 2)
-
+    dist      = abs(tech.get("dist_52w_hi_pct", -20))
+    dist_pen  = min(0.05, dist / 20 * 0.05)
+    return round(min(0.92, max(0.50, base + adx_bonus + rs_bonus + vol_bonus - dist_pen)), 2)
 
 # ════════════════════════════════════════════════════════════
 # JSON字段提取 & signals.json生成 & GitHub推送
 # ════════════════════════════════════════════════════════════
 
 def _parse_gemini_json_fields(text: str) -> dict:
-    """
-    从Gemini分析文本里用正则抓取四个固定字段。
-    Gemini被要求在分析末尾输出：
-        【JSON_TAG_EN】Bullish Momentum
-        【JSON_TAG_ZH】强势突破
-        【JSON_ONE_LINER_ZH】一句中文解释
-        【JSON_ONE_LINER_EN】One line English explanation
-
-    字段缺失时返回空字符串，不抛异常。
-    """
     patterns = {
         "tag_en":       r"【JSON_TAG_EN】(.+)",
         "tag_zh":       r"【JSON_TAG_ZH】(.+)",
@@ -425,116 +326,73 @@ def _parse_gemini_json_fields(text: str) -> dict:
         m = re.search(pat, text)
         result[key] = m.group(1).strip() if m else ""
         if not result[key]:
-            log.warning(f"_parse_gemini_json_fields: [{key}] 未找到，Gemini输出可能不完整")
+            log.warning(f"_parse_gemini_json_fields: [{key}] 未找到")
     return result
 
 
 def generate_signals_json(signals: list) -> bool:
-    """
-    从signals列表生成en.json和zh.json并写入~/asxbox/src/data/signals/。
-
-    signals列表里每个元素需包含：
-        ticker, confidence, _json_tag_en, _json_tag_zh,
-        _json_one_liner_en, _json_one_liner_zh
-
-    有信号才写文件，无信号直接返回False（网站保持上一天数据）。
-    """
     if not signals:
-        log.info("generate_signals_json: 无信号，跳过写文件")
+        log.info("generate_signals_json: 无信号，跳过")
         return False
-
-    today_str = date.today().isoformat()
-
-    # 构建英文版
+    today_str  = date.today().isoformat()
     en_payload = {
         "date": today_str,
-        "signals": [
-            {
-                "symbol":     s["ticker"],
-                "tag":        s.get("_json_tag_en", ""),
-                "confidence": s.get("confidence", 0.60),
-                "one_liner":  s.get("_json_one_liner_en", ""),
-            }
-            for s in signals
-        ]
+        "signals": [{"symbol": s["ticker"], "tag": s.get("_json_tag_en", ""),
+                      "confidence": s.get("confidence", 0.60),
+                      "one_liner": s.get("_json_one_liner_en", "")} for s in signals]
     }
-
-    # 构建中文版
     zh_payload = {
         "date": today_str,
-        "signals": [
-            {
-                "symbol":     s["ticker"],
-                "tag":        s.get("_json_tag_zh", ""),
-                "confidence": s.get("confidence", 0.60),
-                "one_liner":  s.get("_json_one_liner_zh", ""),
-            }
-            for s in signals
-        ]
+        "signals": [{"symbol": s["ticker"], "tag": s.get("_json_tag_zh", ""),
+                      "confidence": s.get("confidence", 0.60),
+                      "one_liner": s.get("_json_one_liner_zh", "")} for s in signals]
     }
-
     try:
         os.makedirs(SIGNALS_DIR, exist_ok=True)
-        en_path = os.path.join(SIGNALS_DIR, "en.json")
-        zh_path = os.path.join(SIGNALS_DIR, "zh.json")
-
-        with open(en_path, "w", encoding="utf-8") as f:
-            json.dump(en_payload, f, ensure_ascii=False, indent=2)
-        with open(zh_path, "w", encoding="utf-8") as f:
-            json.dump(zh_payload, f, ensure_ascii=False, indent=2)
-
+        for path, payload in [
+            (os.path.join(SIGNALS_DIR, "en.json"), en_payload),
+            (os.path.join(SIGNALS_DIR, "zh.json"), zh_payload),
+        ]:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
         log.info(f"signals.json写入成功：{len(signals)} 个信号")
         return True
     except Exception as e:
-        log.error(f"generate_signals_json写文件失败: {e}")
+        log.error(f"generate_signals_json失败: {e}")
         return False
 
 
 def push_to_github() -> bool:
-    """
-    将asxbox仓库的变更推送到GitHub。
-    只推送src/data/signals/目录，不影响其他文件。
-    自动检测默认branch（避免main/master硬编码失败）。
-    失败时写log，不中断主流程。
-    """
     today_str = date.today().isoformat()
     try:
-        # 自动检测默认branch
         r = subprocess.run(
             ["git", "-C", ASXBOX_REPO, "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True, text=True, timeout=10
         )
         branch = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "main"
         log.info(f"push_to_github: 使用branch={branch}")
-
         cmds = [
             ["git", "-C", ASXBOX_REPO, "pull", "--no-rebase", "origin", branch],
             ["git", "-C", ASXBOX_REPO, "add",
-             "src/data/signals/en.json",
-             "src/data/signals/zh.json"],
+             "src/data/signals/en.json", "src/data/signals/zh.json"],
             ["git", "-C", ASXBOX_REPO, "commit",
              "-m", f"chore: update signals {today_str}"],
             ["git", "-C", ASXBOX_REPO, "push", "origin", branch],
         ]
         for cmd in cmds:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=30
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if result.returncode != 0:
                 if "nothing to commit" in result.stdout + result.stderr:
                     log.info("push_to_github: 无变更，跳过commit")
                     return True
-                log.error(
-                    f"push_to_github git命令失败: {' '.join(cmd)}\n"
-                    f"stdout: {result.stdout}\nstderr: {result.stderr}"
-                )
+                log.error(f"push_to_github失败: {' '.join(cmd)}\n"
+                          f"stdout:{result.stdout}\nstderr:{result.stderr}")
                 return False
             log.info(f"git: {' '.join(cmd[2:])} → OK")
-
         log.info(f"push_to_github: 推送成功 [{today_str}] branch={branch}")
         return True
     except subprocess.TimeoutExpired:
-        log.error("push_to_github: git命令超时（30秒）")
+        log.error("push_to_github: git超时")
         return False
     except Exception as e:
         log.error(f"push_to_github异常: {e}")
@@ -545,7 +403,6 @@ def push_to_github() -> bool:
 # ════════════════════════════════════════════════════════════
 
 def _get(url: str, params: dict = None, label: str = "") -> Optional[dict]:
-    """统一GET，所有HTTP错误分类写入log"""
     try:
         r = requests.get(url, params=params, headers=ASX_HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
@@ -571,8 +428,8 @@ def get_asx_universe() -> list:
         if not col:
             log.error("ASX列表列名未找到")
             return []
-        codes = df[col].dropna().astype(str).str.strip()
-        valid = codes[codes.str.match(r"^[A-Z]{1,5}$")]
+        codes  = df[col].dropna().astype(str).str.strip()
+        valid  = codes[codes.str.match(r"^[A-Z]{1,5}$")]
         result = [f"{c}.AX" for c in valid]
         log.info(f"ASX股票池：{len(result)} 只")
         return result
@@ -667,7 +524,6 @@ def get_market_snapshot() -> dict:
 
 
 def get_top_movers(all_data: dict, top_n: int = TOP_N) -> list:
-    """从已有K线算当日涨幅，返回Top N。不重新下载。"""
     changes = {}
     for ticker, df in all_data.items():
         try:
@@ -705,9 +561,7 @@ def fetch_fundamentals(ticker: str) -> dict:
 
 
 def _ann_significance(headline: str, sensitive: bool,
-                      doc_type: str, pdf_text: str,
-                      pub_date: str) -> int:
-    """公告重要性评分（0-10）"""
+                      doc_type: str, pdf_text: str, pub_date: str) -> int:
     score = 0
     if sensitive:
         score += 4
@@ -721,42 +575,82 @@ def _ann_significance(headline: str, sensitive: bool,
 
 
 def _is_noise_announcement(doc_type: str, headline: str) -> bool:
-    """判断公告是否为噪音（合规/行政类，对股价无实质影响）"""
     combined = (doc_type + " " + headline).lower()
     return any(kw in combined for kw in ANN_NOISE_KEYWORDS)
 
 
-# ── 今日公告缓存（进程内有效，避免多次重复请求）──────────────
-# ── SQLite公告数据库（本地历史积累）────────────────────────
-# ASX没有任何可用的单股历史公告API（经详尽测试确认）。
-# 解决方案：每次运行时把今日全市场公告存入本地SQLite。
-# 第1天只有今日数据，30天后有30天历史，180天后有完整半年时间线。
-# 这比任何第三方API都可靠，因为数据是自己积累的。
 ANN_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "announcements.db")
-
 _today_ann_cache: dict = {}
 
 
 def _init_ann_db() -> None:
-    """初始化SQLite公告数据库（首次运行自动建表）"""
+    """初始化SQLite（announcements + signals_history两张表）"""
     import sqlite3
     try:
         with sqlite3.connect(ANN_DB_PATH) as conn:
+            # ── 公告表 ──────────────────────────────────────────
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS announcements (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol      TEXT    NOT NULL,
-                    date        TEXT    NOT NULL,
-                    headline    TEXT,
-                    sensitive   INTEGER DEFAULT 0,
-                    doc_type    TEXT,
-                    doc_key     TEXT,
-                    pdf_text    TEXT,
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol       TEXT    NOT NULL,
+                    date         TEXT    NOT NULL,
+                    headline     TEXT,
+                    sensitive    INTEGER DEFAULT 0,
+                    doc_type     TEXT,
+                    doc_key      TEXT,
+                    pdf_text     TEXT,
                     significance INTEGER DEFAULT 0,
                     UNIQUE(symbol, date, headline)
                 )
             """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_date ON announcements(symbol, date)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbol_date "
+                "ON announcements(symbol, date)"
+            )
+            # ── 回测信号历史表 ────────────────────────────────────
+            # 记录每日全部T1-T4候选股（含未入选），用于统计真实胜率
+            # 止盈止损基于ATR倍数（BT_TARGET_ATR_MULT / BT_STOP_ATR_MULT）
+            # ⚠️ 参数一旦开始记录不要修改，否则前后数据不可比
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS signals_history (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker          TEXT    NOT NULL,
+                    signal_date     TEXT    NOT NULL,
+                    tier_level      TEXT,
+                    composite_score REAL,
+                    catalyst        REAL,
+                    has_today_ann   INTEGER DEFAULT 0,
+                    ann_sensitive   INTEGER DEFAULT 0,
+                    rs_vs_xjo       REAL,
+                    adx14           REAL,
+                    vol_consistency INTEGER DEFAULT 0,
+                    price_pct_1y    REAL,
+                    dist_52w_hi_pct REAL,
+                    market_status   TEXT,
+                    xjo_change_pct  REAL,
+                    sector          TEXT,
+                    entry_price     REAL,
+                    stop_loss_atr   REAL,
+                    take_profit_atr REAL,
+                    is_selected     INTEGER DEFAULT 0,
+                    outcome         TEXT    DEFAULT 'PENDING',
+                    outcome_date    TEXT,
+                    outcome_price   REAL,
+                    outcome_pct     REAL,
+                    holding_days    INTEGER,
+                    max_gain_pct    REAL,
+                    max_loss_pct    REAL,
+                    UNIQUE(ticker, signal_date)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sh_date "
+                "ON signals_history(signal_date)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sh_outcome "
+                "ON signals_history(outcome)"
+            )
             conn.commit()
         log.info(f"公告数据库就绪：{ANN_DB_PATH}")
     except Exception as e:
@@ -764,7 +658,6 @@ def _init_ann_db() -> None:
 
 
 def _save_announcements_to_db(ann_dict: dict) -> None:
-    """将今日公告字典批量写入SQLite（IGNORE重复）"""
     import sqlite3
     if not ann_dict:
         return
@@ -794,7 +687,6 @@ def _save_announcements_to_db(ann_dict: dict) -> None:
 
 
 def _load_announcements_from_db(code: str, days: int = 180) -> list:
-    """从SQLite读取单股近N天历史公告，按significance+date降序"""
     import sqlite3
     cutoff = (date.today() - timedelta(days=days)).isoformat()
     try:
@@ -807,14 +699,8 @@ def _load_announcements_from_db(code: str, days: int = 180) -> list:
                 LIMIT  20
             """, (code, cutoff)).fetchall()
         result = [
-            {
-                "date":        r[0],
-                "headline":    r[1],
-                "sensitive":   bool(r[2]),
-                "doc_type":    r[3],
-                "pdf_text":    r[4] or "",
-                "significance": r[5],
-            }
+            {"date": r[0], "headline": r[1], "sensitive": bool(r[2]),
+             "doc_type": r[3], "pdf_text": r[4] or "", "significance": r[5]}
             for r in rows
         ]
         log.info(f"公告DB [{code}]: {len(result)} 条历史记录（近{days}天）")
@@ -824,12 +710,164 @@ def _load_announcements_from_db(code: str, days: int = 180) -> list:
         return []
 
 
+# ── 回测：写入信号历史 ────────────────────────────────────────
+
+def save_signal_to_history(signal: dict, market_snap: dict,
+                           is_selected: bool) -> None:
+    """
+    将单只候选股票写入signals_history。
+    is_selected=True  → 当天进入Top3推送
+    is_selected=False → 候选但未入选（同样记录，用于对比回测）
+
+    止盈止损用ATR倍数：
+      止损 = entry - BT_STOP_ATR_MULT  × ATR14
+      止盈 = entry + BT_TARGET_ATR_MULT × ATR14
+    风险收益比固定为 1:2，不依赖主观判断。
+    """
+    import sqlite3
+    try:
+        lc       = signal.get("price", 0)
+        atr      = lc * signal.get("atr14_pct", 2.0) / 100
+        sl       = round(lc - BT_STOP_ATR_MULT * atr, 4)
+        tp       = round(lc + BT_TARGET_ATR_MULT * atr, 4)
+        code     = signal.get("ticker", "").replace(".AX", "")
+        today_ann = _today_ann_cache.get(date.today().isoformat(), {})
+        ann       = today_ann.get(code, {})
+
+        with sqlite3.connect(ANN_DB_PATH) as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO signals_history (
+                    ticker, signal_date, tier_level, composite_score,
+                    catalyst, has_today_ann, ann_sensitive,
+                    rs_vs_xjo, adx14, vol_consistency,
+                    price_pct_1y, dist_52w_hi_pct,
+                    market_status, xjo_change_pct, sector,
+                    entry_price, stop_loss_atr, take_profit_atr,
+                    is_selected
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                signal.get("ticker"),
+                date.today().isoformat(),
+                signal.get("tier_level", ""),
+                signal.get("composite_score", 0),
+                signal.get("catalyst", 0),
+                1 if ann else 0,
+                1 if ann.get("sensitive") else 0,
+                signal.get("rs_vs_xjo", 0),
+                signal.get("adx14", 0),
+                1 if signal.get("vol_consistency") else 0,
+                signal.get("price_pct_1y", 0),
+                signal.get("dist_52w_hi_pct", 0),
+                market_snap.get("market_status", ""),
+                market_snap.get("xjo_change_pct", 0),
+                signal.get("sector", ""),
+                lc, sl, tp,
+                1 if is_selected else 0,
+            ))
+            conn.commit()
+    except Exception as e:
+        log.error(f"save_signal_to_history失败 [{signal.get('ticker')}]: {e}")
+
+
+def update_signal_outcomes(all_data: dict) -> None:
+    """
+    用当天最新K线更新历史PENDING信号的结果。
+    逐日检查是否触发止盈/止损，超过BT_TIMEOUT_DAYS算TIMEOUT。
+    在main()的K线下载完成后立即调用，确保数据最新。
+    """
+    import sqlite3
+    try:
+        with sqlite3.connect(ANN_DB_PATH) as conn:
+            pending = conn.execute("""
+                SELECT id, ticker, signal_date, entry_price,
+                       stop_loss_atr, take_profit_atr
+                FROM   signals_history
+                WHERE  outcome = 'PENDING'
+            """).fetchall()
+    except Exception as e:
+        log.error(f"update_signal_outcomes读取失败: {e}")
+        return
+
+    if not pending:
+        log.info("update_signal_outcomes: 无PENDING记录")
+        return
+
+    today_str = date.today().isoformat()
+    updates   = []
+
+    for row in pending:
+        sid, ticker, sig_date, entry, sl, tp = row
+        df = all_data.get(ticker)
+        if df is None:
+            continue
+        try:
+            close = df["Close"].squeeze()
+            high  = df["High"].squeeze()
+            low   = df["Low"].squeeze()
+
+            # 转换index为日期字符串，只看信号日之后的数据
+            idx       = close.index.astype(str).str[:10]
+            close_idx = pd.Series(close.values, index=idx)
+            high_idx  = pd.Series(high.values,  index=idx)
+            low_idx   = pd.Series(low.values,   index=idx)
+
+            after_close = close_idx[close_idx.index > sig_date]
+            after_high  = high_idx[high_idx.index   > sig_date]
+            after_low   = low_idx[low_idx.index     > sig_date]
+
+            if after_close.empty:
+                continue
+
+            holding  = len(after_close)
+            max_gain = round((float(after_high.max()) / entry - 1) * 100, 2)
+            max_loss = round((float(after_low.min())  / entry - 1) * 100, 2)
+            latest   = float(after_close.iloc[-1])
+
+            outcome   = None
+            out_date  = None
+            out_price = None
+
+            # 逐日检查触发顺序（止损优先，同日同时触发算止损）
+            for dt in after_close.index:
+                l = float(after_low.get(dt,  entry))
+                h = float(after_high.get(dt, entry))
+                if l <= sl:
+                    outcome, out_date, out_price = "LOSS", dt, sl
+                    break
+                if h >= tp:
+                    outcome, out_date, out_price = "WIN",  dt, tp
+                    break
+
+            if outcome is None:
+                if holding >= BT_TIMEOUT_DAYS:
+                    outcome, out_date, out_price = "TIMEOUT", today_str, latest
+
+            if outcome:
+                out_pct = round((out_price / entry - 1) * 100, 2)
+                updates.append((
+                    outcome, out_date, out_price, out_pct,
+                    holding, max_gain, max_loss, sid
+                ))
+        except Exception as e:
+            log.debug(f"update_signal_outcomes处理失败 [{ticker}]: {e}")
+
+    if updates:
+        try:
+            with sqlite3.connect(ANN_DB_PATH) as conn:
+                conn.executemany("""
+                    UPDATE signals_history
+                    SET outcome=?, outcome_date=?, outcome_price=?,
+                        outcome_pct=?, holding_days=?,
+                        max_gain_pct=?, max_loss_pct=?
+                    WHERE id=?
+                """, updates)
+                conn.commit()
+            log.info(f"update_signal_outcomes: 更新 {len(updates)} 条结果")
+        except Exception as e:
+            log.error(f"update_signal_outcomes写入失败: {e}")
+
+
 def fetch_today_announcements() -> dict:
-    """
-    拉取今日全市场公告，过滤噪音，price-sensitive公告提取PDF。
-    结果：① 写入SQLite积累历史 ② 进程内缓存避免重复请求。
-    返回：{code: {headline, sensitive, doc_type, documentKey, pdf_text, significance}}
-    """
     global _today_ann_cache
     today = date.today().isoformat()
     if today in _today_ann_cache:
@@ -860,13 +898,10 @@ def fetch_today_announcements() -> dict:
             is_sens  = item.get("isPriceSensitive", False)
             doc_key  = item.get("documentKey", "")
             pdf_txt  = ""
-
             if not sym:
                 continue
             if _is_noise_announcement(doc_type, headline):
                 continue
-
-            # price-sensitive公告用documentKey下载PDF（每股限1份）
             if is_sens and doc_key and sym not in pdf_done:
                 pdf_url = PDF_DL_BASE.format(doc_key=doc_key)
                 log.info(f"  PDF提取 [{sym}]: {headline[:40]}...")
@@ -874,74 +909,41 @@ def fetch_today_announcements() -> dict:
                 if pdf_txt:
                     pdf_done.add(sym)
                 time.sleep(0.2)
-
             if sym not in result:
                 sig = _ann_significance(headline, is_sens, doc_type, pdf_txt, today)
                 result[sym] = {
-                    "headline":    headline,
-                    "sensitive":   is_sens,
-                    "doc_type":    doc_type,
-                    "documentKey": doc_key,
-                    "pdf_text":    pdf_txt,
-                    "significance": sig,
+                    "headline": headline, "sensitive": is_sens,
+                    "doc_type": doc_type, "documentKey": doc_key,
+                    "pdf_text": pdf_txt, "significance": sig,
                 }
         if got_old or len(items) < 100:
             break
         page += 1
         time.sleep(0.3)
 
-    # 写入SQLite（积累历史）
     _save_announcements_to_db(result)
     _today_ann_cache[today] = result
     log.info(f"今日公告：{len(result)} 只（有效），PDF {len(pdf_done)} 份")
     return result
 
 
-def fetch_announcements(code: str,
-                        today_ann: Optional[dict] = None) -> list:
-    """
-    获取单股公告列表（今日 + SQLite历史积累）。
-
-    数据来源说明：
-    - ASX单股历史公告API经详尽测试确认不可用（所有端点404或忽略过滤参数）
-    - 本函数从本地SQLite读取历史数据（每日自动积累）
-    - 第1天：仅有今日数据；运行30天后：有30天历史；180天后：完整半年
-    - 今日公告若已在DB中则自动合并，不重复
-
-    返回：按significance+date降序的公告列表（最多20条）
-    """
-    # 从SQLite读取历史（包含今日已写入的）
+def fetch_announcements(code: str, today_ann: Optional[dict] = None) -> list:
     history = _load_announcements_from_db(code, days=180)
-
-    # 若今日公告尚未在DB中（极少数情况：DB写入失败），从内存补充
     if today_ann and code in today_ann:
         today_str = date.today().isoformat()
         already   = any(a["date"] == today_str for a in history)
         if not already:
-            ann  = today_ann[code]
-            item = {
-                "date":        today_str,
-                "headline":    ann["headline"],
-                "sensitive":   ann["sensitive"],
-                "doc_type":    ann.get("doc_type", ""),
-                "pdf_text":    ann.get("pdf_text", ""),
-                "significance": ann.get("significance", 0),
-            }
-            history.insert(0, item)
+            ann = today_ann[code]
+            history.insert(0, {
+                "date": today_str, "headline": ann["headline"],
+                "sensitive": ann["sensitive"], "doc_type": ann.get("doc_type", ""),
+                "pdf_text": ann.get("pdf_text", ""), "significance": ann.get("significance", 0),
+            })
             log.info(f"公告 [{code}]: 今日公告从内存补充（DB未命中）")
-
     return history
 
 
-
 def _extract_pdf_keywords(url: str) -> str:
-    """
-    关键词段落提取（替代截取前N字符）：
-    1. 用pdfplumber提取全文
-    2. 找包含PDF_KEY_TERMS的段落
-    3. 合并这些段落，截取PDF_MAX_CHARS上限
-    比前N字符方法更准确：跳过封面/目录，直接找数字和结论
-    """
     try:
         resp = requests.get(url, timeout=TIMEOUT, headers=ASX_HEADERS, stream=True)
         resp.raise_for_status()
@@ -949,41 +951,29 @@ def _extract_pdf_keywords(url: str) -> str:
         if "pdf" not in ct.lower() and not url.lower().endswith(".pdf"):
             log.warning(f"_extract_pdf_keywords: 非PDF [{url[:60]}] CT:{ct}")
             return ""
-
         pages_text = []
         with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-            for page in pdf.pages[:12]:   # 最多读12页
+            for page in pdf.pages[:12]:
                 t = page.extract_text()
                 if t:
                     pages_text.append(t)
-
-        full_text = "\n".join(pages_text)
-
-        # 按段落切割，提取包含关键词的段落
-        paragraphs     = re.split(r"\n{2,}", full_text)
-        key_paragraphs = []
+        full_text  = "\n".join(pages_text)
+        paragraphs = re.split(r"\n{2,}", full_text)
+        key_paras  = []
         for para in paragraphs:
-            para_lower = para.lower()
-            hits = sum(1 for kw in PDF_KEY_TERMS if kw in para_lower)
+            hits = sum(1 for kw in PDF_KEY_TERMS if kw in para.lower())
             if hits >= 1 and len(para.strip()) > 30:
-                key_paragraphs.append((hits, para.strip()))
-
-        # 按命中数降序排列，取最相关的段落
-        key_paragraphs.sort(key=lambda x: x[0], reverse=True)
-        extracted = "\n\n".join(p for _, p in key_paragraphs[:8])
-
-        # 清理 + 截取
-        extracted = re.sub(r"[ \t]+", " ", extracted).strip()
+                key_paras.append((hits, para.strip()))
+        key_paras.sort(key=lambda x: x[0], reverse=True)
+        extracted = re.sub(r"[ \t]+", " ",
+                           "\n\n".join(p for _, p in key_paras[:8])).strip()
         if len(extracted) > PDF_MAX_CHARS:
             extracted = extracted[:PDF_MAX_CHARS] + "\n...[截断]"
-
         if not extracted:
             log.debug(f"PDF无关键词命中，返回前500字符 [{url[:60]}]")
             return full_text[:500]
-
-        log.debug(f"PDF关键段落提取成功 [{url[:60]}]: {len(extracted)} 字符")
+        log.debug(f"PDF提取成功 [{url[:60]}]: {len(extracted)} 字符")
         return extracted
-
     except requests.HTTPError as e:
         log.error(f"PDF下载HTTP错误 [{url[:60]}]: {e}")
     except requests.ConnectionError as e:
@@ -996,12 +986,11 @@ def _extract_pdf_keywords(url: str) -> str:
 
 
 def fetch_news(ticker: str, company_name: str = "") -> list:
-    """Google RSS + yfinance双源，去重，最多NEWS_MAX条"""
     code   = ticker.replace(".AX", "")
     cutoff = (date.today() - timedelta(days=30)).isoformat()
     raw    = []
-
-    for q in [f"ASX:{code}", f"{company_name} ASX" if company_name else f"{code} ASX Australia"]:
+    for q in [f"ASX:{code}",
+               f"{company_name} ASX" if company_name else f"{code} ASX Australia"]:
         try:
             url  = GOOGLE_RSS.format(q=requests.utils.quote(q))
             resp = requests.get(url, timeout=TIMEOUT,
@@ -1029,7 +1018,6 @@ def fetch_news(ticker: str, company_name: str = "") -> list:
         except Exception as e:
             log.error(f"Google RSS 未知错误 [{q}]: {e}")
         time.sleep(0.4)
-
     try:
         for n in (yf.Ticker(ticker).news or [])[:10]:
             content = n.get("content", {})
@@ -1043,14 +1031,12 @@ def fetch_news(ticker: str, company_name: str = "") -> list:
                 })
     except Exception as e:
         log.error(f"yfinance新闻失败 [{ticker}]: {e}")
-
     seen, deduped = set(), []
     for n in sorted(raw, key=lambda x: x["date"], reverse=True):
         key = n["title"][:40].lower()
         if key not in seen:
             seen.add(key)
             deduped.append(n)
-
     result = deduped[:NEWS_MAX]
     log.info(f"新闻 [{ticker}]: {len(result)} 条（原始{len(raw)}条）")
     return result
@@ -1058,59 +1044,37 @@ def fetch_news(ticker: str, company_name: str = "") -> list:
 
 def build_timeline_text(code: str, announcements: list, news: list,
                         today_ann: Optional[dict] = None) -> str:
-    """
-    构建精选时间线文本：
-    - 公告按significance评分排序，优先显示高价值公告
-    - 公告标注significance分和是否price-sensitive
-    - ★ price-sensitive公告若有PDF关键段落，附在标题下方
-    - 新闻和公告合并，按日期降序
-    """
     events = []
-
     for a in announcements:
-        sig  = a.get("significance", 0)
-        flag = "⭐" if a["sensitive"] else "📋"
+        sig      = a.get("significance", 0)
+        flag     = "⭐" if a["sensitive"] else "📋"
         sig_label = f"[重要度:{sig}]" if sig >= 5 else ""
-        line = f"{flag}{sig_label}[公告] {a['headline']}"
-
-        # PDF关键段落附加在公告标题下方（缩进显示，与新闻区分）
-        pdf_txt = a.get("pdf_text", "")
+        line      = f"{flag}{sig_label}[公告] {a['headline']}"
+        pdf_txt   = a.get("pdf_text", "")
         if pdf_txt:
             line += f"\n    📄PDF关键内容: {pdf_txt[:400]}"
-
-        events.append({
-            "date": a["date"],
-            "text": line,
-            "sort_key": (a["date"], sig),
-        })
-
+        events.append({"date": a["date"], "text": line,
+                        "sort_key": (a["date"], sig)})
     for n in news:
-        events.append({
-            "date": n["date"],
-            "text": f"📰[新闻] {n['title']} ({n['source']})",
-            "sort_key": (n["date"], 0),
-        })
-
+        events.append({"date": n["date"],
+                        "text": f"📰[新闻] {n['title']} ({n['source']})",
+                        "sort_key": (n["date"], 0)})
     if today_ann and code in today_ann:
         ta   = today_ann[code]
         flag = "⭐" if ta["sensitive"] else "📋"
-        events.append({
-            "date": date.today().isoformat(),
-            "text": f"{flag}[今日公告] {ta['headline']}",
-            "sort_key": (date.today().isoformat(), 10),
-        })
-
+        events.append({"date": date.today().isoformat(),
+                        "text": f"{flag}[今日公告] {ta['headline']}",
+                        "sort_key": (date.today().isoformat(), 10)})
     seen, lines = set(), []
     for e in sorted(events, key=lambda x: x["sort_key"], reverse=True):
         key = e["date"] + e["text"][:50]
         if key not in seen:
             seen.add(key)
             lines.append(f"{e['date']}  {e['text']}")
-
     return "\n".join(lines[:20]) if lines else "暂无近期公告/新闻"
 
 # ════════════════════════════════════════════════════════════
-# 4. Gemini（仅选股分析调用）
+# 4. Gemini
 # ════════════════════════════════════════════════════════════
 
 def ask_gemini(prompt: str, label: str = "") -> str:
@@ -1163,13 +1127,8 @@ def send_telegram(text: str) -> None:
         time.sleep(0.5)
 
 
-
 def send_document(filename: str, content: str, caption: str = "") -> None:
-    """
-    通过Telegram sendDocument接口发送.txt文件附件。
-    用于发送日报Prompt——内容太长不适合直接贴消息，
-    手机端可直接下载文件，复制粘贴给AI生成文章。
-    """
+    """Prompt以.txt附件发送，避免长消息被Telegram分割"""
     if not TELEGRAM_TOKEN or not CHAT_ID:
         log.warning("Telegram未配置，跳过send_document")
         return
@@ -1192,17 +1151,13 @@ def send_document(filename: str, content: str, caption: str = "") -> None:
 # 6. Prompt构建
 # ════════════════════════════════════════════════════════════
 
-def _build_screener_prompt(signal: dict, timeline: str,
-                           tier_label: str) -> str:
-    """选股深度分析Prompt（Gemini调用用）"""
+def _build_screener_prompt(signal: dict, timeline: str, tier_label: str) -> str:
     t = signal
-    ma200_str    = f"MA200:{t['ma200']}" if t.get("ma200") else "MA200:数据不足"
-    vol_c_str    = "✅ 近5日量能逐步递增" if t.get("vol_consistency") else "量能无持续性"
-    pct_1y_str   = f"{t.get('price_pct_1y', 50)}%分位（1年历史）"
-
-    # 价格事件文本
-    pe = t.get("price_events", [])
-    pe_str = "\n".join(
+    ma200_str  = f"MA200:{t['ma200']}" if t.get("ma200") else "MA200:数据不足"
+    vol_c_str  = "✅ 近5日量能逐步递增" if t.get("vol_consistency") else "量能无持续性"
+    pct_1y_str = f"{t.get('price_pct_1y', 50)}%分位（1年历史）"
+    pe         = t.get("price_events", [])
+    pe_str     = "\n".join(
         f"  {e['date']} 单日{'+' if e['change_pct'] > 0 else ''}{e['change_pct']}%"
         for e in pe[:6]
     ) if pe else "  近6个月无±5%单日大幅波动"
@@ -1257,17 +1212,13 @@ def _build_screener_prompt(signal: dict, timeline: str,
 【JSON_ONE_LINER_EN】（One English sentence, ≤20 words, same meaning as ZH above）"""
 
 
-def _build_report_stock_block(ticker: str, tech: dict,
-                               fund: dict, timeline: str,
-                               pdf_texts: list,
-                               rank: int) -> str:
-    """日报Prompt中单只股票的数据块（包含全部材料）"""
+def _build_report_stock_block(ticker: str, tech: dict, fund: dict,
+                               timeline: str, pdf_texts: list, rank: int) -> str:
     ma200_str  = f"MA200:{tech['ma200']}" if tech.get("ma200") else "MA200:N/A"
     vol_c_str  = "量能连续递增✅" if tech.get("vol_consistency") else "量能无持续性"
     pct_1y_str = f"{tech.get('price_pct_1y', 50)}%分位(1年)"
-
-    pe = tech.get("price_events", [])
-    pe_str = " | ".join(
+    pe         = tech.get("price_events", [])
+    pe_str     = " | ".join(
         f"{e['date']}:{'+' if e['change_pct'] > 0 else ''}{e['change_pct']}%"
         for e in pe[:5]
     ) if pe else "近6个月无大幅波动"
@@ -1289,22 +1240,13 @@ def _build_report_stock_block(ticker: str, tech: dict,
         f"【技术面数据】\n{tech_line}\n\n"
         f"【精选新闻/公告时间线（含PDF关键段落，已过滤噪音）】\n{timeline}"
     )
-
-    # 日报场景PDF需要完整版（不截断），供你写文章引用原文数据。
-    # timeline里已嵌入400字符精简版供AI快速参考；这里补充完整全文。
     for i, txt in enumerate(pdf_texts[:PDF_MAX_PER_STOCK], 1):
-        if len(txt) > 400:   # 只有完整版比timeline里的摘要更长时才补充
+        if len(txt) > 400:
             block += f"\n\n【价格敏感公告完整原文#{i}（供撰文引用）】\n{txt}"
-
     return block
 
 
-def serialize_to_prompt(market_snap: dict, stocks_block: str,
-                        platform: str) -> str:
-    """
-    生成最终Prompt文本，直接发Telegram给你。
-    你收到后复制给AI生成文章，不经过Gemini API。
-    """
+def serialize_to_prompt(market_snap: dict, stocks_block: str, platform: str) -> str:
     sector_str = "、".join(
         f"{s}({p:+.1f}%)" for s, p in market_snap.get("sector_leaders", [])
     ) or "数据暂缺"
@@ -1319,8 +1261,6 @@ def serialize_to_prompt(market_snap: dict, stocks_block: str,
         f"{status_map.get(market_snap.get('market_status','normal'),'正常')})\n"
         f"今日领涨板块：{sector_str}"
     )
-
-    
 
     instructions = {
         "seo": """You are a professional ASX equity research analyst and SEO content engine.
@@ -1380,297 +1320,87 @@ Each article MUST include:
 
 Include:
 - title (SEO optimized, natural language)
-- description (1–2 sentences, search oriented)
+- description (1-2 sentences, search oriented)
 - pubDate (YYYY-MM-DD)
-
--------------------------------------------------
 
 ## 2. Market Context Section
 - ASX200 performance
 - sector leadership
 - macro tone (risk-on / risk-off / rotation)
 
--------------------------------------------------
-
 ## 3. Stock Overview
-- company name
-- sector
-- market cap (if provided)
-- positioning summary (1 paragraph)
-
--------------------------------------------------
+- company name, sector, market cap, positioning summary (1 paragraph)
 
 ## 4. Technical Analysis (EOD-based)
-Must include:
 - MA50 / MA200 trend structure
-- RSI interpretation (not just value)
-- ADX trend strength interpretation
-- volume confirmation or lack of it
+- RSI interpretation
+- ADX trend strength
+- volume confirmation
 - proximity to 52-week high/low
-
-IMPORTANT:
-- This is NOT a trading signal section
-- Do NOT include entry/exit triggers
-- Do NOT use VWAP or intraday logic
-
--------------------------------------------------
+IMPORTANT: No entry/exit triggers, no VWAP, no intraday logic
 
 ## 5. Catalyst & Narrative Flow (MOST IMPORTANT)
-You must build a STORY, not a list.
-
-Structure:
-- Catalyst → Market reaction → Confirmation → Interpretation
-
-Rules:
-- Prioritize narrative continuity
-- If no direct catalyst exists, explain macro/sector/flow-driven narrative
-- Always explain "why now"
-
--------------------------------------------------
+Build a STORY: Catalyst → Market reaction → Confirmation → Interpretation
+Always explain "why now"
 
 ## 6. EOD Outlook
 - continuation vs exhaustion vs consolidation
-- next session bias (soft directional expectation)
-- key resistance/support zones (NOT trigger-based)
-
--------------------------------------------------
+- next session bias
+- key resistance/support zones
 
 ## 7. Conclusion
 - one paragraph synthesis
-- classify stock behavior (e.g. trend continuation / range-bound / breakout attempt)
+- classify stock behavior
+
+## 8. FAQ Section (SEO-critical, at least 4 questions)
+Cover: Driver Explanation / Sustainability / Market Structure / Forward Scenario
+Questions must adapt to stock-specific narrative
 
 -------------------------------------------------
-
-## 8. FAQ Section (SEO-critical, flexible generation)
-
-You must include a FAQ section with at least 4 questions.
-
-However, questions are NOT fixed.
-
-Instead, they must collectively cover these intent categories:
-
-1. Driver Explanation Intent
-   - Why did the stock move today?
-
-2. Sustainability Intent
-   - Is the move likely to continue or fade?
-
-3. Market Structure Intent
-   - What key levels or price zones matter?
-
-4. Forward Scenario Intent
-   - What is the most likely next market behavior?
-
-Rules:
-- Questions must be natural and not repetitive across articles
-- Must adapt to stock-specific narrative (no template reuse)
-- Must reflect actual catalyst/structure of the stock
-- Must optimize for long-tail search variation
-
--------------------------------------------------
-
-## STYLE RULES
-- No repetitive sentence structures across sections
+STYLE RULES
+- Analyst tone, not news reporter tone
 - No rigid templates or robotic phrasing
-- Prioritize interpretation over data dumping
-- Maintain analyst tone, not news reporter tone
-- Maintain narrative coherence across full article
-
--------------------------------------------------
-HARD CONSTRAINTS
--------------------------------------------------
-- NO intraday mechanics (VWAP, entry trigger, breakout triggers)
-- NO real-time trading instructions
-- NO deterministic predictions
-- NO repeated phrasing across languages
-- NO hallucinated data
-
-If data is missing, explicitly state:
-"Cannot verify due to missing dataset"
+- No hallucinated data
 
 -------------------------------------------------
 Backtest Before Final Output (Mandatory Execution)
 
-First, generate an initial draft of the copy for self-backtesting. Verify that it meets all prompt requirements, complies with SEO best practices, delivers a strong personal perspective, and contains no regulatory or legal violations. Double check the format of the content and make sure 1 English article and 1 Chinese article for each stock. Skip any explanations of your process—output only the final version of the copy.
+First generate an initial draft for self-backtesting. Verify all requirements met, 1 English + 1 Chinese article per stock. Output only the final version.
 """,
 
         "twitter": """You are an event-driven ASX equity trader generating high-signal X (Twitter) content.
 
-INPUT:
-- ASX index data
-- sector performance
-- up to 3 stocks (price, technicals, news timeline)
+INPUT: ASX index data, sector performance, up to 3 stocks
 
-OBJECTIVE:
-Convert stock-specific inputs into dense trading interpretation.
-Focus on causality, expectation shifts, positioning, and pricing — not repetition or narrative expansion.
-
-🚨 STOCK ISOLATION EXECUTION RULE (NEW, CRITICAL)
-
-* Treat EACH stock as an independent task unit.
-* First, internally separate input into individual stock data packages.
-* Then process ONE stock at a time using the full tweet-generation pipeline.
-* Do NOT mix information across stocks.
-* Do NOT generate combined or cross-stock tweets.
-
---------------------------------------------------
+🚨 STOCK ISOLATION RULE: Treat EACH stock as independent. Process ONE stock at a time. Do NOT mix stocks.
 
 📦 OUTPUT MODE (STRICT)
+- Each stock: EXACTLY 4 tweets
+- Each tweet in its own triple backtick code block
+- Stock A (4 blocks) → Stock B (4 blocks) → Stock C (4 blocks)
 
-- Each stock must contain EXACTLY 4 tweets
-- Each TWEET must be wrapped in its own triple backtick code block
-- No text outside code blocks
-- Clean, copy-ready format
+📉 FIXED 4-TWEET STRUCTURE
+TWEET 1: Catalyst + Market Interpretation ($TICKER + price move + key event + repricing reason)
+TWEET 2: Core Driver + Expectation Shift (what changed + BEFORE vs AFTER delta)
+TWEET 3: Flow + Positioning (who is involved + flow type)
+TWEET 4: Risk + Outcome (why move may fail + directional bias)
 
-If multiple stocks exist:
+🧠 TRADER SPEECH RULES
+- No formal comparisons, no full causal chains, no labeled reasoning
+- Thoughts incomplete or abrupt, logic steps skipped
+- Fragments over full sentences, hesitation allowed
+- Each tweet ≤280 chars, no multi-paragraph
 
-* Output stock A (4 tweets/ 4 code blocks)
-* then stock B (4 tweets/ 4 code blocks)
-* then stock C (4 tweets/ 4 code blocks)
+❌ HARD ANTI-FILLER
+- No "interesting", "market watching", "suggests/indicates/therefore"
+- No essay-style, no repeated structures, no macro commentary
 
---------------------------------------------------
+🧠 HUMAN SIGNALS (per tweet set)
+- Max 1-2 uncertainty expressions total
+- At least 1 emotional reaction, 1 incomplete thought, 1 subtle contradiction
+- Conviction varies across tweets
 
-🧠 TRADER SPEECH RULE
-
-All tweets must sound like real-time trader notes.
-
-STRICT RULES:
-
-- No formal comparisons (Before/After is banned)
-- No full causal explanation chains
-- No labeled reasoning (catalyst/driver/flow labels are forbidden in output)
-- Thoughts must be incomplete or slightly abrupt
-- Sentences may "skip logic steps"
-- Interpretation must be implied, not declared
-
---------------------------------------------------
-
-📉 STRUCTURE (FIXED 4 TWEETS ONLY)
-
-TWEET 1 — CATALYST + MARKET INTERPRETATION
-- [Ticker] + [price move]
-- Key event (announcement / update / news)
-- Immediate reason market is repricing
-
-TWEET 2 — CORE DRIVER + EXPECTATION SHIFT (COMBINED)
-- What fundamentally changed (growth / margins / balance sheet)
-- BEFORE vs AFTER market expectation (must be explicit delta in your own words)
-
-TWEET 3 — FLOW + POSITIONING
-- Who is likely involved (funds / retail / momentum / short covering)
-- Type of flow: new money / continuation / re-rating / squeeze
-
-TWEET 4 — RISK + OUTCOME
-- Why move may fail or fade
-- Sustainability of narrative
-- Final directional bias (early / mid / late phase repricing)
-
-Tweet 1 can be structured.
-Tweets 2–4 must explicitly avoid any pattern that could be interpreted as formatting.
-Each tweet must be ≤280 characters; no multi-paragraph or multi-point construction.
-
---------------------------------------------------
-
-🔧 CRITICAL COMPRESSION RULE (MANDATORY)
-
-Because structure is fixed at 4 tweets:
-
-- Driver + Expectation Shift MUST be merged (Tweet 2)
-- Flow + Positioning MUST remain separate (Tweet 3)
-- Risk + Conclusion MUST be merged (Tweet 4)
-
-Under NO circumstance can tweet count exceed 4.
-
-If content overflows:
-→ remove repetition, not analytical depth
-
---------------------------------------------------
-
-🔥 SECOND-ORDER INTERPRETATION (MANDATORY)
-
-Embed implicitly:
-
-- POSITIONING (who is trapped / who is re-entering)
-- FLOW DYNAMICS (new money vs continuation vs squeeze)
-- PRICING PHASE (early / mid / late / exhaustion)
-- BEHAVIOR SIGNAL (overreaction / underreaction / confirmation)
-
-Do NOT label these explicitly.
-
---------------------------------------------------
-
-📊 QUALITY RULES
-
-- Each tweet must add NEW inference
-- No repetition of same idea in different wording
-- Each tweet must escalate insight level
-- No restating raw input data
-
---------------------------------------------------
-
-❌ HARD ANTI-FILLER RULES
-
-- No generic phrases (“interesting”, “market watching”, etc.)
-- No “suggests / indicates / therefore / because”
-- No essay-style explanations
-- No repeated sentence structures
-- No macro market commentary
-
---------------------------------------------------
-
-🧠 HUMAN SIGNALS (GLOBAL REQUIREMENTS)
-
-Across each tweet:
-
-- Max 1–2 uncertainty expressions total
-- At least 1 emotional reaction (e.g. “feels crowded”, “not clean”, “too smooth”)
-- At least 1 incomplete thought
-- At least 1 subtle contradiction
-- Conviction must vary across tweets
-
-Use:
-
-- fragments instead of full sentences
-- hesitation allowed ("feels like", "maybe", "not fully clean")
-- partial thoughts
-- trading intuition tone
-
-Avoid:
-
-- structured analysis language
-- academic transitions
-- fully closed reasoning
-
---------------------------------------------------
-
-📊 TONE
-
-- Default: balanced
-- Slightly opinionated but probabilistic
-- Avoid persistent pessimism
-- At least one clear stance per tweet
-
---------------------------------------------------
-
-📦 OUTPUT FORMAT 
-
-- Each tweet = one code block
-- No titles
-- No extra text
-- No explanations
-
---------------------------------------------------
-
-📌 FINAL CONSTRAINT
-
-Transform inputs into trading behavior interpretation, not summary.
-Focus on what the market is pricing, not what happened.
-
---------------------------------------------------
-
-Backtest Before Final Output (Mandatory)
-
-First, generate an initial draft of the copy for self-backtesting to ensure it meets all prompt requirements. Verify that it delivers a strong personal perspective. Finally, double-check that the output formatting is entirely correct. Do not explain your process—output only the final version of the copy.
+Backtest Before Final Output (Mandatory): Generate draft, verify format correct, output only final version.
 """,
 
         "xiaohongshu": """ASX小红书交易盲盒复盘（叙事流IP版）
@@ -1679,8 +1409,8 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 
 ━━━━━━━━━━━━━━
 核心定义
-“盲盒” = 股票（用于隐喻表达，规避平台审查）
-全文统一使用“盲盒”，不使用“股票/标的”。
+"盲盒" = 股票（用于隐喻表达，规避平台审查）
+全文统一使用"盲盒"，不使用"股票/标的"。
 盲盒使用的股票代码，不能包含后缀.AX
 
 ━━━━━━━━━━━━━━
@@ -1695,91 +1425,51 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 - 信息密度高，但不分层写
 - 内容不能提及股票市场相关字眼以规避平台限制
 - 用自然语言像写日记一样表达
+
 ━━━━━━━━━━━━━━
 一、标题
-18字以内
-表达冲突或状态（对今天的选股的主观感受，自由表达）
+18字以内，表达冲突或状态（对今天的选股的主观感受，自由表达）
 
 ━━━━━━━━━━━━━━
 二、固定开场（IP锚点）
-第一句必须是：
-
-类似“让我们打开今天的盲盒”的一句话，然后直接进入每一个盲盒的点评。
-
-（仅作参考，作类似表达即可，但第一句话必须包含盲盒）
+第一句必须类似"让我们打开今天的盲盒"，然后直接进入每一个盲盒的点评。
 
 ━━━━━━━━━━━━━━
-三、每个盲盒各写一段点评（核心结构）
+三、每个盲盒各写一段点评
 
---------------------------------
 1. 催化剂（必须包含）
 - 今天发生了什么（必须带上股票代码）
 - 如果有公告必须带一句总结
 - 不单列数据，用人话解释
 
---------------------------------
 2. 历史背景 + 关注连续性
-可以体现：
-- 之前发生过什么类似情况
-- 市场之前怎么反应
-- 你为什么一直在看它
+- 参考表达"我上月看它发生哪一件事，结果是怎么样，然后今天发生了什么事"
+- 像"持续观察者视角"，不是一次性解读
 
-要求：
-
-- 参考表达“我上月看它发生哪一件事，结果是怎么样，然后今天发生了什么事，有什么变化”
-
-- 像“持续观察者视角”，不是一次性解读
-
---------------------------------
 3. 一句话分析（结构判断 + 交易决策合并）
-
-结构判断 + 交易动作+趋势分析
-
-允许乐观表达，和有条件的乐观表达，类似：
--等回撤就冲，决定试水，看好，趋势向好，必须追
-
-不允许悲观表达，类似：
--不追，不买，不看好
+- 允许乐观表达：等回撤就冲、决定试水、看好、趋势向好
+- 不允许悲观表达：不追、不买、不看好
 
 ━━━━━━━━━━━━━━
-备注1、盲盒数量规则
-- 最多3个
-- 按当天筛选结果（上面的输入数据）决定
-
-━━━━━━━━━━━━━━
-备注2、开头，结尾规则
-不单独写开头总结段和结尾总结段
-
-━━━━━━━━━━━━━━
-备注3、风格要求
-- 用人话叙事
-- 有情绪
-- 像交易日记而不是报告
-- 有IP开场锚点
-- 有观察者视角连续性
-- 不拆分结构
-- 信息高密度但自然流动
+备注1、盲盒数量：最多3个，按输入数据决定
+备注2、不单独写开头总结段和结尾总结段
+备注3、风格：人话叙事，有情绪，像交易日记
 
 ━━━━━━━━━━━━━━
 备注4、回测再二次输出（必须执行）
-
-1、先出一版文案给自己回测，看是否符合prompt的要求。
-2、每一个盲盒（股票）用150字以内的字数用备注3的语言风格复述一次，作为输出的文案。
-3、筛选并替换所有股票和投资和市场的相关用词。
-4、检查文章是否有强烈个人观点，没有就加上观点返回第2步
-4、检查文章是否有逻辑错误。
-5、检查字数限制是否正确。字数超过就返回第3步。
-6、特别检查输出格式
-7、不用交代过程，只给出最终版文案。
+1、先出一版文案给自己回测
+2、每个盲盒用150字以内复述（备注3语言风格）
+3、筛选替换所有股票和投资相关用词
+4、检查是否有强烈个人观点，没有就加上返回第2步
+5、检查逻辑错误
+6、检查字数限制
+7、不用交代过程，只给出最终版文案
 
 ━━━━━━━━━━━━━━
-
-备注5、结尾后加上标签
+结尾后加上标签：
 #ASX #复盘
 ⚠️仅个人记录，不构成投资建议
-
-- 标签不算在字数限制以内
-- 标签与正文之间空两行
+（标签不算在字数限制以内，标签与正文之间空两行）
 """,
     }
 
@@ -1818,16 +1508,13 @@ def _passes_tier(tech: dict, tier: dict) -> bool:
         return False
     if float(volume_s.iloc[-20:].mean()) * lc < 300_000:
         return False
-
     r15 = pd.concat([high_s, low_s], axis=1).iloc[-15:]
     pr  = (float(r15.iloc[:, 0].max()) - float(r15.iloc[:, 1].min())) / lc
     if pr > tier["consol"]:
         return False
-
     if tier["vol_decline"]:
         if float(volume_s.iloc[-10:].mean()) >= float(volume_s.iloc[-20:-10].mean()):
             return False
-
     if tier["near_52w_hi"] and lc < w52_hi * 0.90:
         return False
     if tech["adx14"] < tier["adx_min"]:
@@ -1848,14 +1535,10 @@ def _passes_tier(tech: dict, tier: dict) -> bool:
 
 
 def run_screener_flow(all_data: dict, market_snap: dict) -> list:
-    """
-    T1→T4分级筛选 → 加权评分 → Top3。
-    返回最终Top3 signals列表（供日报复用）。
-    """
-    today  = date.today().strftime("%Y-%m-%d")
-    start  = time.time()
-    status = market_snap.get("market_status", "normal")
-    xjo_s  = market_snap.get("xjo_series")
+    today   = date.today().strftime("%Y-%m-%d")
+    start   = time.time()
+    status  = market_snap.get("market_status", "normal")
+    xjo_s   = market_snap.get("xjo_series")
     xjo_pct = market_snap.get("xjo_change_pct", 0)
 
     market_note  = "\n\n⚠️ <b>大盘提示</b>：ASX200轻微跌破50日均线，建议适当缩减仓位。" if status == "yellow" else ""
@@ -1863,18 +1546,16 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
 
     today_ann = fetch_today_announcements()
 
-    # T1→T4全部筛选，合并排序取Top3
-    # 每只股票记录通过的最高层级（T1>T2>T3>T4），避免同一股票重复出现
-    # 这样既保证质量（评分高的排前面），又保证数量（不会因T1无信号就停）
+    # T1→T4全部扫描，每只股票只记录通过的最高层级
     log.info("分级筛选（T1-T4全部扫描，合并排序）...")
-    seen_tickers = {}   # {ticker: signal_dict}，只保留最高层级
+    seen_tickers = {}
 
     for tier in TIERS:
         log.info(f"  {tier['level']} ({tier['label']})...")
         count = 0
         for ticker, df in all_data.items():
             if ticker in seen_tickers:
-                continue   # 已被更高层级收录，跳过
+                continue
             try:
                 if len(df) < 60:
                     continue
@@ -1883,27 +1564,28 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
                     tech["ticker"]     = ticker
                     tech["tier_level"] = tier["level"]
                     tech["tier_label"] = tier["label"]
-                    code = ticker.replace(".AX", "")
-                    ann  = today_ann.get(code, {})
-                    ann_date = ann.get("date", "") if ann else ""
+                    # 催化剂评分注入
+                    code      = ticker.replace(".AX", "")
+                    ann       = today_ann.get(code, {})
+                    ann_date  = ann.get("date", "") if ann else ""
                     today_str = date.today().isoformat()
                     week_ago  = (date.today() - timedelta(days=7)).isoformat()
                     month_ago = (date.today() - timedelta(days=30)).isoformat()
                     if ann.get("sensitive") and ann_date == today_str:
-                        tech["catalyst"] = 1.0   # 今日price-sensitive公告
+                        tech["catalyst"] = 1.0
                     elif ann.get("sensitive") and ann_date >= week_ago:
-                        tech["catalyst"] = 0.7   # 近7天price-sensitive公告
+                        tech["catalyst"] = 0.7
                     elif ann_date >= month_ago:
-                        tech["catalyst"] = 0.3   # 近30天有任意公告
+                        tech["catalyst"] = 0.3
                     else:
-                        tech["catalyst"] = 0.0   # 无近期公告
+                        tech["catalyst"] = 0.0
                     seen_tickers[ticker] = tech
                     count += 1
             except Exception as e:
                 log.debug(f"筛选异常 [{ticker}]: {e}")
         log.info(f"    → 本层新增 {count} 个（累计 {len(seen_tickers)} 个）")
 
-    raw_signals = list(seen_tickers.values())
+    raw_signals    = list(seen_tickers.values())
     elapsed_screen = round((time.time() - start) / 60, 1)
 
     if not raw_signals:
@@ -1914,11 +1596,11 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         )
         return []
 
-    # 加权评分 + Top3（跨层级统一排序，T1信号评分天然高于T4）
+    # 加权评分 + Top3
     for s in raw_signals:
         s["composite_score"] = calc_composite_score(s)
     raw_signals.sort(key=lambda x: x["composite_score"], reverse=True)
-    raw_signals = raw_signals[:10]  # 先取Top10做基本面过滤
+    raw_signals = raw_signals[:10]
 
     signals = []
     for s in raw_signals:
@@ -1934,13 +1616,22 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         if len(signals) == TOP_N:
             break
 
-    # 汇总用的层级标签：显示各信号来自哪个层级
+    # 层级汇总
     tier_summary = {}
     for s in signals:
         lv = s.get("tier_level", "T?")
         tier_summary[lv] = tier_summary.get(lv, 0) + 1
     tier_label = " / ".join(f"{lv}×{n}" for lv, n in sorted(tier_summary.items()))
     tier_level = signals[0].get("tier_level", "T?") if signals else "T?"
+
+    # ── 回测：记录全部候选（含未入选）────────────────────────────
+    selected_tickers = {s["ticker"] for s in signals}
+    for s in raw_signals:
+        save_signal_to_history(
+            s, market_snap,
+            is_selected=(s["ticker"] in selected_tickers)
+        )
+    log.info(f"signals_history写入：{len(raw_signals)} 条候选（Top3已标记）")
 
     # 汇总消息
     send_telegram(
@@ -1955,7 +1646,7 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         + market_note
     )
 
-    # 写入长期监测队列（供 intraday_monitor.py 使用）
+    # 写入watchlist监测队列
     wdb.init_watchlist_db()
     for s in signals:
         wdb.upsert_watchlist(
@@ -1981,17 +1672,13 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         if not analysis:
             analysis = "⚠️ Gemini分析暂时不可用"
 
-        # ── 抓取JSON字段（从Gemini输出末尾提取）────────────────
-        json_fields = _parse_gemini_json_fields(analysis)
+        json_fields             = _parse_gemini_json_fields(analysis)
         s["_json_tag_en"]       = json_fields.get("tag_en", "")
         s["_json_tag_zh"]       = json_fields.get("tag_zh", "")
         s["_json_one_liner_zh"] = json_fields.get("one_liner_zh", "")
         s["_json_one_liner_en"] = json_fields.get("one_liner_en", "")
         s["confidence"]         = calc_confidence(s, s.get("tier_level", tier_level))
-        # Gemini失败时JSON字段全空，标记该股票不写入signals.json
-        s["_json_valid"] = bool(
-            s["_json_tag_en"] and s["_json_one_liner_en"]
-        )
+        s["_json_valid"]        = bool(s["_json_tag_en"] and s["_json_one_liner_en"])
         log.info(
             f"  JSON字段 [{s['ticker']}]: tag_en={s['_json_tag_en']!r} "
             f"confidence={s['confidence']} valid={s['_json_valid']}"
@@ -2003,8 +1690,8 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
             flag     = "⭐ " if ann_info["sensitive"] else ""
             ann_line = f"\n📋 今日公告：{flag}{ann_info['headline']}"
 
-        ma200_str   = f" MA200:${s['ma200']}" if s.get("ma200") else ""
-        vol_c_badge = " 📈量能连续" if s.get("vol_consistency") else ""
+        ma200_str    = f" MA200:${s['ma200']}" if s.get("ma200") else ""
+        vol_c_badge  = " 📈量能连续" if s.get("vol_consistency") else ""
         s_tier_label = s.get("tier_label", tier_label)
         send_telegram(
             f"<b>#{idx} {s_tier_label} {s.get('company_name', s['ticker'])}</b> ({s['ticker']})\n"
@@ -2024,9 +1711,7 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         )
         time.sleep(1.0)
 
-    # ── 生成signals.json并推送GitHub ────────────────────────────
-    # 只写入JSON字段有效的信号（Gemini成功生成了tag和one_liner）
-    # 无有效信号时网站保持上一天数据，不推送
+    # signals.json → GitHub
     valid_signals = [s for s in signals if s.get("_json_valid")]
     log.info(f"生成signals.json：{len(valid_signals)}/{len(signals)} 只有效JSON字段...")
     written = generate_signals_json(valid_signals)
@@ -2036,7 +1721,7 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
             send_telegram(
                 f"🌐 <b>网站已更新</b> {today}\n"
                 f"signals.json已推送GitHub，Cloudflare正在重建。\n"
-                f"信号数量：{len(signals)} 只"
+                f"信号数量：{len(valid_signals)} 只"
             )
         else:
             send_telegram(
@@ -2054,24 +1739,17 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
     return signals
 
 # ════════════════════════════════════════════════════════════
-# 8. 日报Prompt流程（不调用Gemini）
+# 8. 日报Prompt流程
 # ════════════════════════════════════════════════════════════
 
 def run_report_flow(all_data: dict, market_snap: dict,
                     screener_signals: Optional[list] = None) -> None:
-    """
-    日报Prompt生成：
-    - 优先使用screener已选出的Top3（避免重复数据抓取）
-    - 若screener未运行（大盘红灯），改用涨幅Top3 Movers
-    - 全程不调用Gemini
-    """
-    today  = date.today().isoformat()
-    xjo_s  = market_snap.get("xjo_series")
+    today     = date.today().isoformat()
+    xjo_s     = market_snap.get("xjo_series")
     today_ann = fetch_today_announcements()
 
     log.info("=== 日报Prompt流程启动 ===")
 
-    # 确定目标股票：优先screener结果，其次涨幅Movers
     if screener_signals:
         target_tickers = [s["ticker"] for s in screener_signals]
         log.info(f"使用screener结果：{target_tickers}")
@@ -2084,7 +1762,6 @@ def run_report_flow(all_data: dict, market_snap: dict,
         send_telegram("⚠️ 日报生成失败：无法确定目标股票，请查看 screener.log")
         return
 
-    # 逐只构建完整数据包
     stock_blocks = []
     for rank, ticker in enumerate(target_tickers, 1):
         code = ticker.replace(".AX", "")
@@ -2094,16 +1771,12 @@ def run_report_flow(all_data: dict, market_snap: dict,
             continue
 
         log.info(f"  [#{rank}] {ticker} 构建日报数据包...")
-
-        # 技术面（若screener已算则复用，否则重新计算）
         existing = next((s for s in (screener_signals or []) if s["ticker"] == ticker), None)
-        tech = existing if existing else build_tech_summary(df, xjo_s)
+        tech     = existing if existing else build_tech_summary(df, xjo_s)
         if "composite_score" not in tech:
             tech["composite_score"] = calc_composite_score(tech)
 
-        fund = existing if (existing and existing.get("company_name")) else fetch_fundamentals(ticker)
-
-        # 历史公告（含PDF关键段落提取）+ 新闻
+        fund      = existing if (existing and existing.get("company_name")) else fetch_fundamentals(ticker)
         ann_hist  = fetch_announcements(code, today_ann=today_ann)
         news      = fetch_news(ticker, fund.get("company_name", ""))
         timeline  = build_timeline_text(code, ann_hist, news, today_ann)
@@ -2118,16 +1791,13 @@ def run_report_flow(all_data: dict, market_snap: dict,
         return
 
     stocks_block = "\n".join(stock_blocks)
-
-    # 先发一条摘要通知（短消息，不会被分割）
-    tickers_str = " / ".join(target_tickers)
+    tickers_str  = " / ".join(target_tickers)
     send_telegram(
         f"📂 <b>ASX日报Prompt就绪 {today}</b>\n\n"
         f"股票：{tickers_str}\n"
         f"以下3个文件已发送，复制文件内容给AI生成文章👇"
     )
 
-    # 每个平台发一个.txt附件（不分割，手机直接下载复制）
     for platform in ["seo", "twitter", "xiaohongshu"]:
         log.info(f"发送 [{platform}] Prompt文件...")
         prompt_text = serialize_to_prompt(market_snap, stocks_block, platform)
@@ -2145,7 +1815,7 @@ def run_report_flow(all_data: dict, market_snap: dict,
 def main() -> None:
     start = time.time()
     log.info("=" * 60)
-    log.info(f"ASX System v14 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
+    log.info(f"ASX System v15 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
     log.info("=" * 60)
 
     # Step 1：大盘快照
@@ -2161,7 +1831,7 @@ def main() -> None:
             "日报Prompt将改用涨幅Top3生成，供参考。"
         )
 
-    # Step 2：全市场K线（一次下载，两个流程共享）
+    # Step 2：全市场K线
     log.info("【Step 2】下载全市场K线（1年数据）...")
     universe = get_asx_universe()
     if not universe:
@@ -2178,7 +1848,11 @@ def main() -> None:
     elapsed_dl = round((time.time() - start) / 60, 1)
     log.info(f"【Step 2】K线完成：{len(all_data)} 只，{elapsed_dl} 分钟")
 
-    # Step 3：选股流程（大盘红灯时跳过）
+    # Step 2.5：更新历史信号回测结果
+    log.info("【Step 2.5】更新历史信号回测结果...")
+    update_signal_outcomes(all_data)
+
+    # Step 3：选股流程
     screener_signals = []
     if status != "red":
         log.info("【Step 3】选股筛选流程...")
@@ -2186,7 +1860,7 @@ def main() -> None:
     else:
         log.info("【Step 3】大盘红灯，跳过选股")
 
-    # Step 4：日报Prompt（始终运行，复用screener结果）
+    # Step 4：日报Prompt
     log.info("【Step 4】日报Prompt生成流程...")
     run_report_flow(all_data, market_snap,
                     screener_signals=screener_signals if screener_signals else None)
@@ -2196,7 +1870,7 @@ def main() -> None:
     log.info(f"ASX System 全部完成，总耗时：{elapsed} 分钟")
     log.info("=" * 60)
     send_telegram(
-        f"🏁 <b>ASX System v14 全部完成</b>\n"
+        f"🏁 <b>ASX System v15 全部完成</b>\n"
         f"📅 {date.today().isoformat()} | ⏱ 总耗时：{elapsed} 分钟\n"
         f"选股：{'跳过（大盘红灯）' if status == 'red' else f'Top{len(screener_signals)}已完成'}\n"
         f"日报Prompt：SEO / Twitter / 小红书 已发送"
