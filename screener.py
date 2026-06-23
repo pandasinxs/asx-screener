@@ -1324,11 +1324,10 @@ Include:
 - description (1–2 sentences, search oriented)
 - pubDate (YYYY-MM-DD)
 
-Format for each item: (for example)
-
-1, title: "content"
-2, description: "content"
-3, pubDate: yyyy-mm-dd
+note: ensuring the content is wrapped in double quotes
+(for example)
+1, title: "[Insert Title Here]"
+2, description: "[Insert Description Here]"
 
 -------------------------------------------------
 
