@@ -2,9 +2,10 @@
 # ASX TRADING BOT v3
 # 新API：asx.api.markitdigital.com
 # 修复：yfinance新闻字段 content.title
+# v3.1：新增 /backtest 命令，查询signals_history回测统计
 # ============================================================
 
-import os, subprocess, logging, re, time
+import os, subprocess, logging, re, time, sqlite3
 import yfinance as yf
 import requests
 from datetime import datetime, date, timezone, timedelta
@@ -31,6 +32,9 @@ GEMINI_KEY     = os.environ.get("GEMINI_API_KEY", "")
 
 gemini_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 AEST = timezone(timedelta(hours=10))
+
+# signals_history和announcements在同一个DB
+ANN_DB_PATH = "/home/ubuntu/asx/announcements.db"
 
 ASX_ANN_URL = "https://asx.api.markitdigital.com/asx-research/1.0/markets/announcements"
 ASX_HEADERS = {
@@ -61,7 +65,6 @@ def auth(update: Update) -> bool:
 def ask_gemini(prompt: str) -> str:
     if not gemini_client:
         return ""
-
     try:
         r = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
@@ -71,11 +74,10 @@ def ask_gemini(prompt: str) -> str:
     except Exception as e:
         if '429' in str(e):
             print("Gemini限速，跳过AI分析")
-            return ""   # 静默跳过，不报错给用户
+            return ""
         return ""
 
 def get_stock_announcements(code: str) -> list:
-    """获取某只股票的最近公告（从今日全量公告中筛选）"""
     code  = code.upper().replace('.AX', '')
     today = date.today().isoformat()
     items = []
@@ -95,7 +97,6 @@ def get_stock_announcements(code: str) -> list:
                         'sensitive': item.get('isPriceSensitive', False)
                     })
                 if len(items) >= 5: break
-            # 如果页面里最旧的条目已经是3天前，停止翻页
             if all_items and all_items[-1].get('date','')[:10] < (
                     date.today().isoformat()[:8] + '01'):
                 break
@@ -106,7 +107,6 @@ def get_stock_announcements(code: str) -> list:
     return items[:5]
 
 def get_yf_news(code: str) -> list:
-    """获取yfinance新闻（修复content.title）"""
     try:
         stock  = yf.Ticker(f"{code.upper().replace('.AX','')}.AX")
         today  = date.today().isoformat()
@@ -128,16 +128,6 @@ def get_yf_news(code: str) -> list:
         return []
 
 def get_stock_price(code: str, retries: int = 3) -> dict:
-    """
-    获取实时价格。带短重试（最多3次，间隔递增），
-    避免Yahoo Finance瞬时限流/超时被误判成"股票代码不存在"。
-    （此前裸except一次失败即返回{}，导致/watch命令在瞬时网络抖动时
-    错误提示"代码可能不存在"，BHP这种真实存在的股票也会被误报）
-
-    涨跌幅手动计算：fast_info已确认不存在regular_market_day_change_percent
-    这个属性（实测AttributeError），改用previous_close和last_price相除算出，
-    并对previous_close为None/0做防御，避免除零或无意义结果。
-    """
     ticker = f"{code.upper().replace('.AX','')}.AX"
     for attempt in range(1, retries + 1):
         try:
@@ -145,18 +135,13 @@ def get_stock_price(code: str, retries: int = 3) -> dict:
             price = fi.last_price
             if price is None:
                 raise ValueError("last_price为空")
-
             prev_close = fi.previous_close
             if prev_close and float(prev_close) != 0:
                 change = round((float(price) / float(prev_close) - 1) * 100, 2)
             else:
                 change = 0.0
                 log.warning(f"get_stock_price [{ticker}]: previous_close无效({prev_close})，change设为0")
-
-            return {
-                'price' : round(float(price), 3),
-                'change': change
-            }
+            return {'price': round(float(price), 3), 'change': change}
         except Exception as e:
             if attempt < retries:
                 log.warning(f"get_stock_price重试 [{ticker}] {attempt}/{retries}: {e}")
@@ -182,6 +167,218 @@ def format_stock_info(code: str, anns: list, news: list, price: dict) -> str:
             lines.append(f"  • {today_flag}{n['title']}")
     return "\n".join(lines)
 
+# ── 回测查询函数 ──────────────────────────────────────────────
+
+def _query_backtest(mode: str) -> str:
+    """
+    从signals_history查询回测统计。
+    mode: "overall" | "tier" | "catalyst"
+    返回格式化文本，供Telegram发送。
+    """
+    if not os.path.exists(ANN_DB_PATH):
+        return "⚠️ 暂无回测数据，signals_history数据库尚未创建。\n请确认screener.py v15已运行至少一次。"
+
+    try:
+        with sqlite3.connect(ANN_DB_PATH) as conn:
+
+            # ── 先检查表是否存在 + 记录总数 ──────────────────────
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()]
+            if "signals_history" not in tables:
+                return "⚠️ signals_history表尚未创建，请确认screener.py v15已运行至少一次。"
+
+            total_all = conn.execute(
+                "SELECT COUNT(*) FROM signals_history"
+            ).fetchone()[0]
+            total_pending = conn.execute(
+                "SELECT COUNT(*) FROM signals_history WHERE outcome='PENDING'"
+            ).fetchone()[0]
+            total_done = total_all - total_pending
+
+            if total_all == 0:
+                return "📊 signals_history暂无记录，等待screener.py运行后积累数据。"
+
+            if total_done == 0:
+                return (
+                    f"📊 回测数据积累中\n\n"
+                    f"总记录：{total_all} 条\n"
+                    f"PENDING（持仓中）：{total_pending} 条\n"
+                    f"已结算：0 条\n\n"
+                    f"⏳ 信号尚未触发止盈/止损/超时，等待更多交易日积累结果。"
+                )
+
+            # ── 期望值计算函数 ────────────────────────────────────
+            def calc_ev(rows):
+                """rows: [(outcome, outcome_pct), ...]"""
+                wins    = [r[1] for r in rows if r[0] == "WIN"     and r[1] is not None]
+                losses  = [r[1] for r in rows if r[0] == "LOSS"    and r[1] is not None]
+                timeouts= [r[1] for r in rows if r[0] == "TIMEOUT" and r[1] is not None]
+                n       = len(wins) + len(losses) + len(timeouts)
+                if n == 0:
+                    return None, None, None, None, 0
+                win_rate   = round(len(wins) / n * 100, 1)
+                avg_win    = round(sum(wins)    / len(wins),    2) if wins    else 0
+                avg_loss   = round(sum(losses)  / len(losses),  2) if losses  else 0
+                ev         = round(
+                    (len(wins) / n * avg_win) + (len(losses) / n * avg_loss), 2
+                ) if wins or losses else None
+                return win_rate, avg_win, avg_loss, ev, n
+
+            # ════════════════════════════════════════════════════
+            if mode == "overall":
+                # 整体 + Top3 vs 落选候选 对比
+                rows_all = conn.execute("""
+                    SELECT outcome, outcome_pct FROM signals_history
+                    WHERE outcome != 'PENDING'
+                """).fetchall()
+                rows_sel = conn.execute("""
+                    SELECT outcome, outcome_pct FROM signals_history
+                    WHERE outcome != 'PENDING' AND is_selected = 1
+                """).fetchall()
+                rows_not = conn.execute("""
+                    SELECT outcome, outcome_pct FROM signals_history
+                    WHERE outcome != 'PENDING' AND is_selected = 0
+                """).fetchall()
+
+                # 分布统计
+                dist = {}
+                for r in rows_all:
+                    dist[r[0]] = dist.get(r[0], 0) + 1
+
+                wr_all, aw_all, al_all, ev_all, n_all = calc_ev(rows_all)
+                wr_sel, aw_sel, al_sel, ev_sel, n_sel = calc_ev(rows_sel)
+                wr_not, aw_not, al_not, ev_not, n_not = calc_ev(rows_not)
+
+                ev_str = f"{ev_all:+.2f}%" if ev_all is not None else "N/A"
+                lines  = [
+                    f"📊 <b>回测整体统计</b>",
+                    f"总记录：{total_all} 条（含{total_pending}个PENDING）",
+                    f"已结算：{total_done} 条",
+                    f"",
+                    f"<b>结果分布：</b>",
+                ]
+                for outcome, cnt in sorted(dist.items()):
+                    pct = round(cnt / total_done * 100, 1)
+                    lines.append(f"  {outcome}: {cnt}条 ({pct}%)")
+
+                lines += [
+                    f"",
+                    f"<b>整体期望值分析（{n_all}条已结算）：</b>",
+                    f"  胜率：{wr_all}%  平均盈利：{aw_all:+.2f}%  平均亏损：{al_all:+.2f}%",
+                    f"  期望值：{ev_str}",
+                    f"  （期望值>0说明系统长期有正收益）",
+                    f"",
+                    f"<b>Top3精选 vs 落选候选对比：</b>",
+                    f"  Top3（{n_sel}条）：胜率{wr_sel}%  EV:{f'{ev_sel:+.2f}%' if ev_sel is not None else 'N/A'}",
+                    f"  落选（{n_not}条）：胜率{wr_not}%  EV:{f'{ev_not:+.2f}%' if ev_not is not None else 'N/A'}",
+                ]
+                if ev_sel is not None and ev_not is not None:
+                    diff = round(ev_sel - ev_not, 2)
+                    if diff > 0:
+                        lines.append(f"  ✅ Top3评分系统有效：精选比落选高{diff:+.2f}%")
+                    elif diff < 0:
+                        lines.append(f"  ⚠️ Top3评分系统待改进：精选比落选低{abs(diff):.2f}%")
+                    else:
+                        lines.append(f"  ➡️ Top3与落选期望值相近，评分区分度不足")
+
+                return "\n".join(lines)
+
+            # ════════════════════════════════════════════════════
+            elif mode == "tier":
+                rows_by_tier = conn.execute("""
+                    SELECT tier_level, outcome, outcome_pct
+                    FROM signals_history
+                    WHERE outcome != 'PENDING'
+                    ORDER BY tier_level
+                """).fetchall()
+
+                if not rows_by_tier:
+                    return "📊 暂无已结算记录，等待积累数据。"
+
+                # 按层级分组
+                from collections import defaultdict
+                tier_rows = defaultdict(list)
+                for r in rows_by_tier:
+                    tier_rows[r[0]].append((r[1], r[2]))
+
+                lines = [f"📊 <b>回测按层级分组</b>（已结算{total_done}条）\n"]
+                for tier in ["T1", "T2", "T3", "T4"]:
+                    if tier not in tier_rows:
+                        continue
+                    tr    = [(o, p) for o, p in tier_rows[tier]]
+                    wr, aw, al, ev, n = calc_ev([(o, p) for o, p in tr])
+                    ev_str = f"{ev:+.2f}%" if ev is not None else "N/A"
+                    dist_t = {}
+                    for o, _ in tr:
+                        dist_t[o] = dist_t.get(o, 0) + 1
+                    dist_str = " ".join(f"{k}:{v}" for k, v in sorted(dist_t.items()))
+                    lines.append(
+                        f"<b>{tier}</b>（{n}条）：{dist_str}\n"
+                        f"  胜率:{wr}%  盈:{aw:+.2f}%  亏:{al:+.2f}%  EV:{ev_str}"
+                    )
+
+                lines.append(f"\n⚠️ 样本量&lt;30条时结论仅供参考，建议积累更多数据后判断。")
+                return "\n".join(lines)
+
+            # ════════════════════════════════════════════════════
+            elif mode == "catalyst":
+                rows_cat = conn.execute("""
+                    SELECT
+                        CASE WHEN catalyst >= 0.5 THEN '有催化剂' ELSE '无催化剂' END as cat,
+                        outcome, outcome_pct
+                    FROM signals_history
+                    WHERE outcome != 'PENDING'
+                """).fetchall()
+
+                if not rows_cat:
+                    return "📊 暂无已结算记录，等待积累数据。"
+
+                from collections import defaultdict
+                cat_rows = defaultdict(list)
+                for r in rows_cat:
+                    cat_rows[r[0]].append((r[1], r[2]))
+
+                lines = [f"📊 <b>回测：催化剂有无对比</b>（已结算{total_done}条）\n"]
+                for cat_name in ["有催化剂", "无催化剂"]:
+                    if cat_name not in cat_rows:
+                        lines.append(f"<b>{cat_name}</b>：暂无数据")
+                        continue
+                    tr    = cat_rows[cat_name]
+                    wr, aw, al, ev, n = calc_ev(tr)
+                    ev_str = f"{ev:+.2f}%" if ev is not None else "N/A"
+                    dist_t = {}
+                    for o, _ in tr:
+                        dist_t[o] = dist_t.get(o, 0) + 1
+                    dist_str = " ".join(f"{k}:{v}" for k, v in sorted(dist_t.items()))
+                    lines.append(
+                        f"<b>{cat_name}</b>（{n}条）：{dist_str}\n"
+                        f"  胜率:{wr}%  盈:{aw:+.2f}%  亏:{al:+.2f}%  EV:{ev_str}"
+                    )
+
+                # 结论
+                ev_with = calc_ev(cat_rows.get("有催化剂", []))[3]
+                ev_without = calc_ev(cat_rows.get("无催化剂", []))[3]
+                if ev_with is not None and ev_without is not None:
+                    lines.append("")
+                    diff = round(ev_with - ev_without, 2)
+                    if diff > 0:
+                        lines.append(f"✅ 催化剂有效：有催化剂比无催化剂期望值高{diff:+.2f}%")
+                    elif diff < 0:
+                        lines.append(f"⚠️ 催化剂暂无明显优势，差距{abs(diff):.2f}%")
+                    else:
+                        lines.append(f"➡️ 催化剂有无暂无明显差距")
+
+                lines.append(f"\n⚠️ 样本量&lt;30条时结论仅供参考。")
+                return "\n".join(lines)
+
+            else:
+                return "未知查询模式"
+
+    except Exception as e:
+        log.error(f"_query_backtest失败 [{mode}]: {e}")
+        return f"❌ 查询失败：{e}"
+
 # ── 命令处理 ──────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
@@ -197,6 +394,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               /watch BHP 15  — 添加BHP到长期监测，15天
               /unwatch BHP   — 移出监测队列
               /watchlist     — 查看当前监测队列
+              /backtest           — 整体胜率和期望值
+              /backtest tier      — 按T1-T4层级分组
+              /backtest catalyst  — 有无催化剂对比
 
            💬 直接用中文问我，例：
               "BHP最近有什么公告？"
@@ -277,30 +477,40 @@ async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"读取失败：{e}")
 
-async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    /watch BHP 15
-    添加股票到长期盘中监测队列，并指定监测天数。
-    重复添加同一股票 → 累加天数（封顶45天，由watchlist_db.MAX_MONITOR_DAYS控制）。
+    /backtest           → 整体胜率 + 期望值 + Top3 vs 落选候选对比
+    /backtest tier      → 按T1-T4层级分组统计
+    /backtest catalyst  → 有无催化剂对比
     """
     if not auth(update): return
 
+    mode_map = {
+        "tier":     "tier",
+        "catalyst": "catalyst",
+    }
+    arg  = ctx.args[0].lower() if ctx.args else ""
+    mode = mode_map.get(arg, "overall")
+
+    await update.message.reply_text("📊 查询回测数据中...")
+    result = _query_backtest(mode)
+    await update.message.reply_text(result[:4000], parse_mode="HTML")
+
+async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not auth(update): return
     if len(ctx.args) < 2:
         await update.message.reply_text(
             "用法：/watch 代码 天数\n例如：/watch BHP 15\n"
             "（重复添加同一股票会累加监测天数，最长45天）"
         )
         return
-
     code_raw = ctx.args[0].upper().replace(".AX", "")
     ticker = f"{code_raw}.AX"
-
     try:
         days = int(ctx.args[1])
     except ValueError:
         await update.message.reply_text(f"❌ 天数必须是整数，你输入的是：{ctx.args[1]}")
         return
-
     if days < 1:
         await update.message.reply_text("❌ 天数至少为1天")
         return
@@ -310,7 +520,6 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"已自动调整为{wdb.MAX_MONITOR_DAYS}天"
         )
         days = wdb.MAX_MONITOR_DAYS
-
     await update.message.reply_text(f"🔍 正在验证 {ticker} ...")
     price_info = get_stock_price(code_raw)
     if not price_info:
@@ -322,23 +531,18 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"（例如 BHP、CBA、WES 等不含后缀的代码）。"
         )
         return
-
     company_name = ticker
     try:
         info = yf.Ticker(ticker).info
         company_name = info.get("longName", ticker)
     except Exception:
         pass
-
     wdb.init_watchlist_db()
     result = wdb.upsert_watchlist_manual(ticker, company_name, days)
-
     if result.get("action") == "error":
         await update.message.reply_text(f"❌ 添加失败：{result.get('error', '未知错误')}")
         return
-
     price_line = f"💰 现价：${price_info.get('price', 'N/A')}"
-
     if result["action"] == "created":
         await update.message.reply_text(
             f"✅ <b>已加入监测队列</b>\n\n"
@@ -363,13 +567,10 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/unwatch BHP —— 从监测队列移出指定股票"""
     if not auth(update): return
-
     if not ctx.args:
         await update.message.reply_text("用法：/unwatch 代码\n例如：/unwatch BHP")
         return
-
     ticker = f"{ctx.args[0].upper().replace('.AX', '')}.AX"
     ok = wdb.remove_from_watchlist(ticker)
     if ok:
@@ -378,30 +579,26 @@ async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ {ticker} 当前不在监测队列中")
 
 async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/watchlist —— 查看当前所有正在监测的股票"""
     if not auth(update): return
-
     items = wdb.list_watchlist_for_display(include_exited=False)
     if not items:
         await update.message.reply_text("📭 当前监测队列为空\n用 /watch 代码 天数 添加股票")
         return
-
     lines = [f"📋 <b>当前监测队列（{len(items)}只）</b>\n"]
     for it in items:
-        remain = it["total_days"] - it["days_elapsed"]
+        remain     = it["total_days"] - it["days_elapsed"]
         source_tag = "🤖EOD" if it["source"] == "eod" else "✋手动"
-        score_str = f" 评分:{it['composite_score']}" if it.get("composite_score") is not None else ""
-        last_sig = (f" | 上次信号:{it['last_signal_mode']}({it['last_signal_date']})"
-                    if it.get("last_signal_mode") else "")
+        score_str  = f" 评分:{it['composite_score']}" if it.get("composite_score") is not None else ""
+        last_sig   = (f" | 上次信号:{it['last_signal_mode']}({it['last_signal_date']})"
+                      if it.get("last_signal_mode") else "")
         lines.append(
             f"{source_tag} <b>{it['ticker']}</b> {it.get('company_name','')}\n"
             f"   进度:{it['days_elapsed']}/{it['total_days']}天（剩{remain}天）"
             f"{score_str}{last_sig}"
         )
-
     text = "\n".join(lines)
     if len(text) > 4000:
-        text = text[:3900] + "\n\n…（队列较长，已截断，完整数据见watchlist.db）"
+        text = text[:3900] + "\n\n…（队列较长，已截断）"
     await update.message.reply_text(text, parse_mode="HTML")
 
 async def cmd_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -431,18 +628,19 @@ async def cmd_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── 主程序 ───────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("morning", cmd_morning))
-    app.add_handler(CommandHandler("eod",     cmd_eod))
-    app.add_handler(CommandHandler("news",    cmd_news))
-    app.add_handler(CommandHandler("status",  cmd_status))
-    app.add_handler(CommandHandler("logs",    cmd_logs))
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("morning",   cmd_morning))
+    app.add_handler(CommandHandler("eod",       cmd_eod))
+    app.add_handler(CommandHandler("news",      cmd_news))
+    app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("logs",      cmd_logs))
+    app.add_handler(CommandHandler("backtest",  cmd_backtest))
     app.add_handler(CommandHandler("watch",     cmd_watch))
     app.add_handler(CommandHandler("unwatch",   cmd_unwatch))
     app.add_handler(CommandHandler("watchlist", cmd_watchlist))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_ai))
-    print("Bot v3 启动中...")
+    print("Bot v3.1 启动中...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
