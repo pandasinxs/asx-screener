@@ -1285,6 +1285,7 @@ You MUST:
 - Focus on closing behavior, not triggers
 - Avoid VWAP, entry signals, or intraday mechanics
 - Avoid any "real-time execution framing"
+- Disregard word count limits. Deliver high-density, comprehensive content without any fluff.
 
 -------------------------------------------------
 OUTPUT REQUIREMENT (STRICT)
