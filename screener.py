@@ -1,5 +1,5 @@
 # ============================================================
-# ASX SYSTEM — screener.py  v15
+# ASX SYSTEM — screener.py  v17
 #
 # 流程一：EOD选股
 #   全市场K线 → T1-T4筛选 → Top3加权评分 → 新闻/公告时间线
@@ -15,6 +15,25 @@
 #   - update_signal_outcomes()：每次运行自动更新历史信号结果（WIN/LOSS/TIMEOUT）
 #   - 催化剂评分注入筛选循环
 #   - T1-T4全部扫描合并排序（保证数量同时保证质量）
+#
+# v16新增（相对v15）：
+#   - 新增 _check_volume_quality()：量能质量检查，替代原硬性缩量要求
+#   - 允许「缩量整理」和「温和持续递增」两种量能模式通过T1-T3
+#   - 拒绝「单日脉冲爆量」和「随机震荡无方向」两种无效量能模式
+#   - 动能延续型强势股（资源类、小盘成长股）不再被系统性过滤
+#
+# v17新增（相对v16）：
+#   - 新增 _check_trend_persistence()：趋势持续性验证
+#     ADX/+DI连续维持天数比例 + MA50斜率方向性，返回0~1分值
+#     注入 tech["persistence_score"]，参与composite_score排序
+#   - 新增 _check_higher_highs_lows()：价格结构验证
+#     近40日「高点抬高+低点抬高」双重确认，作为T1/T2硬性条件
+#   - 新增 _check_ma_alignment()：均线多头排列验证
+#     MA20>MA50（全层级）+ T1/T2要求MA50>MA200，作为硬性条件
+#   - build_tech_summary() 新增 _adx_s/_pdi_s/_mdi_s 三个内部字段
+#     供 _check_trend_persistence() 使用，不对外展示
+#   - SCORE_WEIGHTS 新增 persistence 维度（权重0.10）
+#     其余权重等比下调，总和仍为1.0
 # ============================================================
 
 import os, io, re, sys, time, logging, json, subprocess
@@ -112,13 +131,15 @@ PDF_KEY_TERMS = [
     "milestone", "update", "completion", "approval", "forecast",
 ]
 
+# v17：新增 persistence 维度（0.10），其余权重等比下调，总和=1.0
 SCORE_WEIGHTS = {
-    "rs_vs_xjo":      0.30,
-    "adx14":          0.20,
-    "vol_ratio":      0.15,
-    "close_pos_pct":  0.08,
-    "price_pct_1y":   0.07,
-    "catalyst":       0.20,
+    "rs_vs_xjo"     : 0.28,
+    "adx14"         : 0.18,
+    "vol_ratio"     : 0.13,
+    "close_pos_pct" : 0.07,
+    "price_pct_1y"  : 0.06,
+    "catalyst"      : 0.18,
+    "persistence"   : 0.10,
 }
 
 TIERS = [
@@ -277,10 +298,15 @@ def build_tech_summary(df: pd.DataFrame,
         "price_pct_1y"   : price_pct_1y,
         "vol_consistency": vol_consistency,
         "price_events"   : price_events,
+        # ── 原始Series（供筛选函数使用，不对外展示）──────────────
         "_close"  : close,
         "_high"   : high,
         "_low"    : low,
         "_volume" : volume,
+        # ── v17新增：ADX/DI原始Series供趋势持续性检测使用 ─────────
+        "_adx_s"  : adx_s,
+        "_pdi_s"  : pdi_s,
+        "_mdi_s"  : mdi_s,
     }
 
 
@@ -294,6 +320,8 @@ def calc_composite_score(tech: dict) -> float:
         "close_pos_pct" : norm(tech.get("close_pos_pct", 50), 40, 100),
         "price_pct_1y"  : norm(tech.get("price_pct_1y", 50), 50, 100),
         "catalyst"      : tech.get("catalyst", 0.0),
+        # v17新增：趋势持续性分值，已在筛选循环中注入
+        "persistence"   : tech.get("persistence_score", 0.0),
     }
     return round(sum(SCORE_WEIGHTS[k] * v for k, v in scores.items()), 4)
 
@@ -309,6 +337,233 @@ def calc_confidence(tech: dict, tier_level: str) -> float:
     dist      = abs(tech.get("dist_52w_hi_pct", -20))
     dist_pen  = min(0.05, dist / 20 * 0.05)
     return round(min(0.92, max(0.50, base + adx_bonus + rs_bonus + vol_bonus - dist_pen)), 2)
+
+
+# ════════════════════════════════════════════════════════════
+# v16新增：量能质量检查（替代原硬性缩量要求）
+# ════════════════════════════════════════════════════════════
+
+def _check_volume_quality(volume_s: pd.Series) -> bool:
+    """
+    量能质量检查，替代原来的 vol_decline 硬性缩量要求。
+
+    允许两种模式通过（对应两类ASX强势股）：
+
+      模式A — 缩量整理（原逻辑保留）
+        近10日均量 < 前10日均量
+        → 典型场景：大盘股、基本面驱动的蓄势突破
+
+      模式B — 温和持续递增（v16新增）
+        近10日均量适度高于前期（增幅 ≤ 80%），且：
+        1. 近3日内无单日异常爆量（单日量 ≤ 近期均量3倍）
+        2. 近5日量能方向性向上（线性回归斜率为正且斜率/均值 > 1%）
+        → 典型场景：资源股、小盘成长股的动能延续型上涨
+
+    拒绝的情况：
+      - 单日脉冲爆量后快速萎缩（量能不可持续）
+      - 近期量能随机震荡、无方向性
+      - 近期均量增幅超过80%（可能是异常事件驱动而非趋势性放量）
+
+    注意：T4层级的 vol_decline=False，不调用此函数，完全不检查量能模式。
+    """
+    if len(volume_s) < 20:
+        return False
+
+    vol_recent = volume_s.iloc[-10:]
+    vol_prior  = volume_s.iloc[-20:-10]
+    vol_last3  = volume_s.iloc[-3:]
+    vol_last5  = volume_s.iloc[-5:]
+
+    recent_mean = float(vol_recent.mean())
+    prior_mean  = float(vol_prior.mean())
+
+    if prior_mean <= 0 or recent_mean <= 0:
+        return False
+
+    ratio = recent_mean / prior_mean
+
+    # ── 模式A：缩量整理（原逻辑，直接通过）──────────────────────
+    if ratio < 1.0:
+        return True
+
+    # ── 模式B：温和递增，以下三个条件必须全部满足 ────────────────
+
+    # 条件1：增幅上限80%，排除异常事件驱动的爆量
+    if ratio > 1.8:
+        log.debug(f"_check_volume_quality: 量能增幅过大({ratio:.2f}x)，拒绝")
+        return False
+
+    # 条件2：近3日内无单日爆量脉冲
+    max_single = float(vol_last3.max())
+    if recent_mean > 0 and max_single > recent_mean * 3.0:
+        log.debug(f"_check_volume_quality: 单日脉冲检测触发({max_single:.0f} > {recent_mean*3:.0f})，拒绝")
+        return False
+
+    # 条件3：近5日量能方向性检查（线性回归斜率）
+    vol5   = vol_last5.values.astype(float)
+    x_vals = list(range(5))
+    mean_x = 2.0
+    mean_y = float(sum(vol5) / 5)
+
+    if mean_y <= 0:
+        return False
+
+    numerator   = sum((x_vals[i] - mean_x) * (vol5[i] - mean_y) for i in range(5))
+    denominator = sum((x_vals[i] - mean_x) ** 2 for i in range(5))
+
+    if denominator == 0:
+        return False
+
+    slope     = numerator / denominator
+    slope_pct = slope / mean_y
+
+    if slope <= 0 or slope_pct <= 0.01:
+        log.debug(f"_check_volume_quality: 量能方向性不足(slope_pct={slope_pct:.3f})，拒绝")
+        return False
+
+    return True
+
+
+# ════════════════════════════════════════════════════════════
+# v17新增：趋势持续性验证 / 价格结构验证 / 均线多头排列验证
+# ════════════════════════════════════════════════════════════
+
+def _check_trend_persistence(close: pd.Series,
+                              adx_s: pd.Series,
+                              pdi_s: pd.Series,
+                              mdi_s: pd.Series) -> float:
+    """
+    趋势持续性验证：不是看今天的快照，而是看这个趋势维持了多久。
+
+    逻辑：
+      同样 ADX=30 的两只股票，一只刚刚突破28，另一只已持续3周在30以上，
+      后者的趋势可靠性远高于前者。
+
+    计分维度（满分1.0）：
+      1. ADX过去10日持续高于20的天数比例  → 最高贡献0.40
+      2. +DI过去10日持续大于-DI的天数比例 → 最高贡献0.40
+      3. MA50过去20日斜率方向性（线性回归）→ 最高贡献0.20
+
+    返回值：persistence_score（0.0~1.0），注入composite_score参与排序。
+    不作为硬性过滤条件，避免过度收窄信号池。
+    """
+    score = 0.0
+
+    # ── 维度1：ADX持续性（过去10日）────────────────────────────
+    try:
+        adx_10 = adx_s.iloc[-10:].dropna()
+        if len(adx_10) >= 5:
+            adx_persistence = float((adx_10 > 20).sum()) / len(adx_10)
+            score += adx_persistence * 0.40
+    except Exception:
+        pass
+
+    # ── 维度2：+DI > -DI 持续性（过去10日）──────────────────────
+    try:
+        pdi_10 = pdi_s.iloc[-10:].dropna()
+        mdi_10 = mdi_s.iloc[-10:].dropna()
+        min_len = min(len(pdi_10), len(mdi_10))
+        if min_len >= 5:
+            di_persistence = float(
+                sum(1 for i in range(min_len)
+                    if float(pdi_10.iloc[-(min_len - i)]) >
+                       float(mdi_10.iloc[-(min_len - i)]))
+            ) / min_len
+            score += di_persistence * 0.40
+    except Exception:
+        pass
+
+    # ── 维度3：MA50斜率方向性（过去20日线性回归）────────────────
+    try:
+        ma50        = close.rolling(50).mean()
+        ma50_recent = ma50.iloc[-20:].dropna()
+        if len(ma50_recent) >= 10:
+            vals   = ma50_recent.values.astype(float)
+            n      = len(vals)
+            mean_x = (n - 1) / 2.0
+            mean_y = float(vals.mean())
+            if mean_y > 0:
+                num = sum((i - mean_x) * (vals[i] - mean_y) for i in range(n))
+                den = sum((i - mean_x) ** 2 for i in range(n))
+                if den > 0:
+                    slope     = num / den
+                    slope_pct = slope / mean_y
+                    # 斜率为正且有实质意义（>0.05%/日）才加分
+                    if slope > 0 and slope_pct > 0.0005:
+                        score += 0.20
+    except Exception:
+        pass
+
+    return round(min(1.0, score), 3)
+
+
+def _check_higher_highs_lows(high: pd.Series,
+                              low: pd.Series,
+                              lookback: int = 40) -> bool:
+    """
+    价格结构验证：近40日是否存在「高点抬高 + 低点抬高」双重确认。
+
+    这是上升趋势的价格本质定义（道氏理论）：
+      - Higher High：后20日最高点 > 前20日最高点
+      - Higher Low ：后20日最低点 > 前20日最低点
+      两者必须同时满足，排除单边拉升后低点下移的假趋势。
+
+    作为T1/T2的硬性过滤条件。
+    T3/T4不要求，避免过度收窄信号池。
+    """
+    if len(high) < lookback or len(low) < lookback:
+        return False
+
+    mid = lookback // 2  # = 20
+
+    recent_high = high.iloc[-mid:]
+    prior_high  = high.iloc[-lookback:-mid]
+    recent_low  = low.iloc[-mid:]
+    prior_low   = low.iloc[-lookback:-mid]
+
+    higher_high = float(recent_high.max()) > float(prior_high.max())
+    higher_low  = float(recent_low.min())  > float(prior_low.min())
+
+    result = higher_high and higher_low
+    if not result:
+        log.debug(
+            f"_check_higher_highs_lows: 结构不满足 "
+            f"HH={higher_high}(recent_hi={recent_high.max():.3f} vs prior_hi={prior_high.max():.3f}) "
+            f"HL={higher_low}(recent_lo={recent_low.min():.3f} vs prior_lo={prior_low.min():.3f})"
+        )
+    return result
+
+
+def _check_ma_alignment(tech: dict, tier_level: str) -> bool:
+    """
+    均线多头排列验证：MA20 > MA50 > MA200（层级递进要求）。
+
+    多头排列是机构资金持续流入的结构性证明，比单看价格和MA50更可靠。
+
+    规则：
+      全层级（T1-T4）：MA20 > MA50（短期趋势确认）
+      T1/T2额外要求  ：MA50 > MA200（中长期趋势确认，MA200数据不足时豁免）
+
+    MA200数据不足200日时，T1/T2不因此被拒绝，仅豁免该条件，
+    避免上市不足一年的优质新股被系统性过滤。
+    """
+    ma20  = tech.get("ma20",  0.0)
+    ma50  = tech.get("ma50",  0.0)
+    ma200 = tech.get("ma200")  # 可能为None（数据不足200日）
+
+    # 基础条件：MA20 > MA50（全层级硬性要求）
+    if ma20 <= ma50:
+        log.debug(f"_check_ma_alignment: MA20({ma20:.3f}) <= MA50({ma50:.3f})，拒绝")
+        return False
+
+    # T1/T2额外要求：MA50 > MA200
+    if tier_level in ("T1", "T2") and ma200 is not None:
+        if ma50 <= ma200:
+            log.debug(f"_check_ma_alignment [{tier_level}]: MA50({ma50:.3f}) <= MA200({ma200:.3f})，拒绝")
+            return False
+
+    return True
+
 
 # ════════════════════════════════════════════════════════════
 # JSON字段提取 & signals.json生成 & GitHub推送
@@ -588,7 +843,6 @@ def _init_ann_db() -> None:
     import sqlite3
     try:
         with sqlite3.connect(ANN_DB_PATH) as conn:
-            # ── 公告表 ──────────────────────────────────────────
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS announcements (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -607,10 +861,6 @@ def _init_ann_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_symbol_date "
                 "ON announcements(symbol, date)"
             )
-            # ── 回测信号历史表 ────────────────────────────────────
-            # 记录每日全部T1-T4候选股（含未入选），用于统计真实胜率
-            # 止盈止损基于ATR倍数（BT_TARGET_ATR_MULT / BT_STOP_ATR_MULT）
-            # ⚠️ 参数一旦开始记录不要修改，否则前后数据不可比
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS signals_history (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -710,27 +960,15 @@ def _load_announcements_from_db(code: str, days: int = 180) -> list:
         return []
 
 
-# ── 回测：写入信号历史 ────────────────────────────────────────
-
 def save_signal_to_history(signal: dict, market_snap: dict,
                            is_selected: bool) -> None:
-    """
-    将单只候选股票写入signals_history。
-    is_selected=True  → 当天进入Top3推送
-    is_selected=False → 候选但未入选（同样记录，用于对比回测）
-
-    止盈止损用ATR倍数：
-      止损 = entry - BT_STOP_ATR_MULT  × ATR14
-      止盈 = entry + BT_TARGET_ATR_MULT × ATR14
-    风险收益比固定为 1:2，不依赖主观判断。
-    """
     import sqlite3
     try:
-        lc       = signal.get("price", 0)
-        atr      = lc * signal.get("atr14_pct", 2.0) / 100
-        sl       = round(lc - BT_STOP_ATR_MULT * atr, 4)
-        tp       = round(lc + BT_TARGET_ATR_MULT * atr, 4)
-        code     = signal.get("ticker", "").replace(".AX", "")
+        lc        = signal.get("price", 0)
+        atr       = lc * signal.get("atr14_pct", 2.0) / 100
+        sl        = round(lc - BT_STOP_ATR_MULT * atr, 4)
+        tp        = round(lc + BT_TARGET_ATR_MULT * atr, 4)
+        code      = signal.get("ticker", "").replace(".AX", "")
         today_ann = _today_ann_cache.get(date.today().isoformat(), {})
         ann       = today_ann.get(code, {})
 
@@ -770,11 +1008,6 @@ def save_signal_to_history(signal: dict, market_snap: dict,
 
 
 def update_signal_outcomes(all_data: dict) -> None:
-    """
-    用当天最新K线更新历史PENDING信号的结果。
-    逐日检查是否触发止盈/止损，超过BT_TIMEOUT_DAYS算TIMEOUT。
-    在main()的K线下载完成后立即调用，确保数据最新。
-    """
     import sqlite3
     try:
         with sqlite3.connect(ANN_DB_PATH) as conn:
@@ -805,7 +1038,6 @@ def update_signal_outcomes(all_data: dict) -> None:
             high  = df["High"].squeeze()
             low   = df["Low"].squeeze()
 
-            # 转换index为日期字符串，只看信号日之后的数据
             idx       = close.index.astype(str).str[:10]
             close_idx = pd.Series(close.values, index=idx)
             high_idx  = pd.Series(high.values,  index=idx)
@@ -827,7 +1059,6 @@ def update_signal_outcomes(all_data: dict) -> None:
             out_date  = None
             out_price = None
 
-            # 逐日检查触发顺序（止损优先，同日同时触发算止损）
             for dt in after_close.index:
                 l = float(after_low.get(dt,  entry))
                 h = float(after_high.get(dt, entry))
@@ -1046,8 +1277,8 @@ def build_timeline_text(code: str, announcements: list, news: list,
                         today_ann: Optional[dict] = None) -> str:
     events = []
     for a in announcements:
-        sig      = a.get("significance", 0)
-        flag     = "⭐" if a["sensitive"] else "📋"
+        sig       = a.get("significance", 0)
+        flag      = "⭐" if a["sensitive"] else "📋"
         sig_label = f"[重要度:{sig}]" if sig >= 5 else ""
         line      = f"{flag}{sig_label}[公告] {a['headline']}"
         pdf_txt   = a.get("pdf_text", "")
@@ -1171,7 +1402,8 @@ def _build_screener_prompt(signal: dict, timeline: str, tier_label: str) -> str:
         f"RS(vsXJO):{t['rs_vs_xjo']} ATR:{t['atr14_pct']}% "
         f"52W高:{t['w52_hi']}(距{t['dist_52w_hi_pct']}%) 低:{t['w52_lo']}\n"
         f"近6月最大回撤:{t['max_dd_6m_pct']}%\n"
-        f"综合评分:{t.get('composite_score', 'N/A')}"
+        f"综合评分:{t.get('composite_score', 'N/A')} "
+        f"趋势持续性:{t.get('persistence_score', 0.0)}"
     )
 
     return f"""你是一位专注ASX市场的资深机构分析师。今天是{date.today().isoformat()}。
@@ -1228,7 +1460,8 @@ def _build_report_stock_block(ticker: str, tech: dict, fund: dict,
         f"MA50:{tech['ma50']} {ma200_str} RSI:{tech['rsi14']} ADX:{tech['adx14']} "
         f"量比:{tech['vol_ratio']}x RS:{tech['rs_vs_xjo']} "
         f"ATR:{tech['atr14_pct']}% 52W高:{tech['w52_hi']}(距{tech['dist_52w_hi_pct']}%)\n"
-        f"近6月最大回撤:{tech['max_dd_6m_pct']}% | 综合评分:{tech.get('composite_score','N/A')}\n"
+        f"近6月最大回撤:{tech['max_dd_6m_pct']}% | 综合评分:{tech.get('composite_score','N/A')} "
+        f"趋势持续性:{tech.get('persistence_score', 0.0)}\n"
         f"大涨大跌节点：{pe_str}"
     )
 
@@ -1437,7 +1670,10 @@ If data is missing, explicitly state:
 -------------------------------------------------
 Backtest Before Final Output (Mandatory Execution)
 
-First, generate an initial draft of the copy for self-backtesting. Verify that it meets all prompt requirements, complies with SEO best practices, delivers a strong personal perspective, and contains no regulatory or legal violations. Double check the format of the content and make sure 1 English article and 1 Chinese article for each stock. Skip any explanations of your process—output only the final version of the copy.
+1, First, generate an initial draft of the copy for self-backtesting. 
+2, Verify that it meets all prompt requirements, complies with SEO best practices, delivers a strong personal perspective, and contains no regulatory or legal violations. 
+3, Double check the format of the content and make sure 1 English article and 1 Chinese article for each stock. 
+4, Skip any explanations of your process—output only the final version of the copy.
 """,
 
         "twitter": """You are an event-driven ASX equity trader generating high-signal X (Twitter) content.
@@ -1503,13 +1739,13 @@ TWEET 2 — CORE DRIVER + EXPECTATION SHIFT (COMBINED)
 - BEFORE vs AFTER market expectation (must be explicit delta in your own words)
 
 TWEET 3 — FLOW + POSITIONING
-- Who is likely involved (funds / retail / momentum / short covering)
-- Type of flow: new money / continuation / re-rating / squeeze
+- Who is likely involved (for example: funds / retail / momentum / short covering)
+- Type of flow （for example: new money / continuation / re-rating / squeeze）
 
-TWEET 4 — RISK + OUTCOME
-- Why move may fail or fade
+TWEET 4 — OUTCOME + TREND
 - Sustainability of narrative
 - Final directional bias (early / mid / late phase repricing)
+- Short/Medium/Long-Term Trend Analysis
 
 Tweet 1 can be structured.
 Tweets 2–4 must explicitly avoid any pattern that could be interpreted as formatting.
@@ -1644,19 +1880,12 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 - 用自然语言像写日记一样表达
 ━━━━━━━━━━━━━━
 一、标题
-18字以内
-表达冲突或状态（对今天的选股的主观感受，自由表达）
+
+类似“让我们打开今天的盲盒”的一句话
+（仅作参考，类似表达即可，但必须包含盲盒）
 
 ━━━━━━━━━━━━━━
-二、固定开场（IP锚点）
-第一句必须是：
-
-类似“让我们打开今天的盲盒”的一句话，然后直接进入每一个盲盒的点评。
-
-（仅作参考，作类似表达即可，但第一句话必须包含盲盒）
-
-━━━━━━━━━━━━━━
-三、每个盲盒各写一段点评（核心结构）
+二、每个盲盒各写一段点评（核心结构）
 
 --------------------------------
 1. 催化剂（必须包含）
@@ -1678,12 +1907,12 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 - 像“持续观察者视角”，不是一次性解读
 
 --------------------------------
-3. 一句话分析（结构判断 + 交易决策合并）
+3. 一句话分析
 
-结构判断 + 交易动作+趋势分析
+结构判断 +趋势分析
 
-允许乐观表达，和有条件的乐观表达，类似：
--等回撤就冲，决定试水，看好，趋势向好，必须追
+允许乐观表达，类似：
+-短期/中期/长期趋势向好
 
 不允许悲观表达，类似：
 -不追，不买，不看好
@@ -1708,7 +1937,7 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 - 信息高密度但自然流动
 
 ━━━━━━━━━━━━━━
-备注4、回测再二次输出（必须执行）
+三、回测再二次输出（必须执行）
 
 1、先出一版文案给自己回测，看是否符合prompt的要求。
 2、每一个盲盒（股票）用150字以内的字数用备注3的语言风格复述一次，作为输出的文案。
@@ -1761,33 +1990,66 @@ def _passes_tier(tech: dict, tier: dict) -> bool:
     high_s    = tech["_high"]
     low_s     = tech["_low"]
 
+    # ── 基础条件：MA50趋势 ───────────────────────────────────────
     if lc < tech["ma50"] or not tech["ma50_up"]:
         return False
+
+    # ── 基础条件：最低流动性 ─────────────────────────────────────
     if float(volume_s.iloc[-20:].mean()) * lc < 300_000:
         return False
+
+    # ── 整理幅度 ────────────────────────────────────────────────
     r15 = pd.concat([high_s, low_s], axis=1).iloc[-15:]
     pr  = (float(r15.iloc[:, 0].max()) - float(r15.iloc[:, 1].min())) / lc
     if pr > tier["consol"]:
         return False
+
+    # ── v16：量能质量检查（替代原硬性缩量要求）──────────────────
     if tier["vol_decline"]:
-        if float(volume_s.iloc[-10:].mean()) >= float(volume_s.iloc[-20:-10].mean()):
+        if not _check_volume_quality(volume_s):
             return False
+
+    # ── v17新增：均线多头排列验证（全层级）──────────────────────
+    if not _check_ma_alignment(tech, tier["level"]):
+        return False
+
+    # ── v17新增：价格结构验证（T1/T2硬性条件）───────────────────
+    if tier["level"] in ("T1", "T2"):
+        if not _check_higher_highs_lows(high_s, low_s):
+            return False
+
+    # ── 52周高点距离 ─────────────────────────────────────────────
     if tier["near_52w_hi"] and lc < w52_hi * 0.90:
         return False
+
+    # ── ADX趋势强度 ──────────────────────────────────────────────
     if tech["adx14"] < tier["adx_min"]:
         return False
+
+    # ── DI方向 ───────────────────────────────────────────────────
     if tier["di_cross"] and tech["plus_di"] <= tech["minus_di"]:
         return False
+
+    # ── VWAP位置与方向 ───────────────────────────────────────────
     if tier["vwap_above"] and (lc < tech["vwap20"] or not tech["vwap_up"]):
         return False
+
+    # ── 相对强弱 ─────────────────────────────────────────────────
     if tech["rs_vs_xjo"] < tier["rs_min"]:
         return False
+
+    # ── 成交量倍数 ───────────────────────────────────────────────
     if vol_ratio < tier["vol_mult"]:
         return False
+
+    # ── RSI区间 ──────────────────────────────────────────────────
     if not (tier["rsi_lo"] <= tech["rsi14"] <= tier["rsi_hi"]):
         return False
+
+    # ── 收盘位置 ─────────────────────────────────────────────────
     if close_pos < tier["close_pos"]:
         return False
+
     return True
 
 
@@ -1821,7 +2083,16 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
                     tech["ticker"]     = ticker
                     tech["tier_level"] = tier["level"]
                     tech["tier_label"] = tier["label"]
-                    # 催化剂评分注入
+
+                    # ── v17新增：趋势持续性分值注入 ──────────────
+                    tech["persistence_score"] = _check_trend_persistence(
+                        tech["_close"],
+                        tech["_adx_s"],
+                        tech["_pdi_s"],
+                        tech["_mdi_s"],
+                    )
+
+                    # ── 催化剂评分注入 ────────────────────────────
                     code      = ticker.replace(".AX", "")
                     ann       = today_ann.get(code, {})
                     ann_date  = ann.get("date", "") if ann else ""
@@ -1836,6 +2107,7 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
                         tech["catalyst"] = 0.3
                     else:
                         tech["catalyst"] = 0.0
+
                     seen_tickers[ticker] = tech
                     count += 1
             except Exception as e:
@@ -1896,7 +2168,8 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         f"ASX200：{xjo_pct:+.2f}%  |  扫描：{len(all_data)} 只  |  耗时：{elapsed_screen}分钟\n"
         f"层级分布：{tier_label}  |  精选 Top {len(signals)} 只\n\n"
         + "\n".join(
-            f"#{i+1} {s['ticker']} | [{s.get('tier_level','?')}] 评分:{s['composite_score']} "
+            f"#{i+1} {s['ticker']} | [{s.get('tier_level','?')}] "
+            f"评分:{s['composite_score']} 持续性:{s.get('persistence_score',0)} "
             f"RS:{s['rs_vs_xjo']} ADX:{s['adx14']} 量比:{s['vol_ratio']}x"
             for i, s in enumerate(signals)
         )
@@ -1918,7 +2191,8 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
     log.info(f"深度分析 Top {len(signals)} 只（Gemini）...")
     for idx, s in enumerate(signals, 1):
         code = s["ticker"].replace(".AX", "")
-        log.info(f"  [#{idx}] {s['ticker']} 评分:{s['composite_score']}...")
+        log.info(f"  [#{idx}] {s['ticker']} 评分:{s['composite_score']} "
+                 f"持续性:{s.get('persistence_score',0)}...")
 
         ann_hist = fetch_announcements(code, today_ann=today_ann)
         news     = fetch_news(s["ticker"], s.get("company_name", ""))
@@ -1953,7 +2227,7 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         send_telegram(
             f"<b>#{idx} {s_tier_label} {s.get('company_name', s['ticker'])}</b> ({s['ticker']})\n"
             f"📅 {today} | {s.get('sector','未知')} | 市值:${s.get('market_cap_m',0)}M | "
-            f"综合评分:{s['composite_score']}\n\n"
+            f"综合评分:{s['composite_score']} | 持续性:{s.get('persistence_score',0)}\n\n"
             f"💰 昨收：${s['price']} ({s['change_pct']:+.2f}%) | "
             f"1年历史分位:{s.get('price_pct_1y',50)}%{vol_c_badge}\n"
             f"🟢 入场上限：${s['entry_limit']}（超过不追）\n"
@@ -2072,7 +2346,7 @@ def run_report_flow(all_data: dict, market_snap: dict,
 def main() -> None:
     start = time.time()
     log.info("=" * 60)
-    log.info(f"ASX System v15 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
+    log.info(f"ASX System v17 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
     log.info("=" * 60)
 
     # Step 1：大盘快照
@@ -2127,7 +2401,7 @@ def main() -> None:
     log.info(f"ASX System 全部完成，总耗时：{elapsed} 分钟")
     log.info("=" * 60)
     send_telegram(
-        f"🏁 <b>ASX System v15 全部完成</b>\n"
+        f"🏁 <b>ASX System v17 全部完成</b>\n"
         f"📅 {date.today().isoformat()} | ⏱ 总耗时：{elapsed} 分钟\n"
         f"选股：{'跳过（大盘红灯）' if status == 'red' else f'Top{len(screener_signals)}已完成'}\n"
         f"日报Prompt：SEO / Twitter / 小红书 已发送"
