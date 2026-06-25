@@ -1512,8 +1512,181 @@ def format_telegram_message(candidates: list[dict], ai_results: dict, today: str
 
 
 # ============================================================
-# 主扫描流程
+# 板块资金热度分析
 # ============================================================
+
+def run_sector_heatmap(
+    liquid: list[str],
+    daily_data: dict[str, pd.DataFrame],
+    intra_data: dict[str, pd.DataFrame],
+    today: str,
+) -> None:
+    """
+    分析今日板块资金流向，输出前3热门板块及各板块换手额最高的3只代表股。
+
+    数据来源：
+    - sector：yfinance.Ticker.info["sector"]，并发抓取（ThreadPoolExecutor）
+    - 换手额/涨幅/量比：复用已有 intra_data + daily_data，零额外下载
+
+    聚合指标：
+    - 板块总换手额（资金量，最重要的权重）
+    - 板块平均涨幅
+    - 板块量比中位数（是否异常放量）
+    - 板块上涨只数/总只数（广度）
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    log.info("【板块热度】开始分析资金流向...")
+
+    # ── Step 1: 并发抓取 sector ───────────────────────────────
+    sector_cache: dict[str, str] = {}
+
+    def _fetch_sector(ticker: str) -> tuple[str, str]:
+        try:
+            info   = yf.Ticker(ticker).fast_info
+            sector = getattr(info, "sector", None)
+            if not sector:
+                # fast_info没有sector，降级到info
+                sector = yf.Ticker(ticker).info.get("sector", "")
+            return ticker, sector or "Unknown"
+        except Exception:
+            return ticker, "Unknown"
+
+    log.info(f"  抓取{len(liquid)}只股票的板块分类（并发10线程）...")
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(_fetch_sector, t): t for t in liquid}
+        done = 0
+        for future in as_completed(futures):
+            ticker, sector = future.result()
+            sector_cache[ticker] = sector
+            done += 1
+            if done % 100 == 0:
+                log.info(f"  板块抓取进度: {done}/{len(liquid)}")
+
+    known = sum(1 for s in sector_cache.values() if s != "Unknown")
+    log.info(f"  板块抓取完成：{known}/{len(liquid)} 只有效")
+
+    # ── Step 2: 计算每只股票的今日指标 ───────────────────────
+    stock_stats: list[dict] = []
+
+    for t in liquid:
+        intra = intra_data.get(t)
+        daily = daily_data.get(t)
+        if intra is None or intra.empty or daily is None:
+            continue
+        try:
+            curr_price  = float(safe_series(intra, "Close").iloc[-1])
+            today_vol   = float(safe_series(intra, "Volume").sum())
+            dollar_vol  = curr_price * today_vol
+            avg_day_vol = float(safe_series(daily, "Volume").iloc[-20:].mean())
+            vol_ratio   = today_vol / avg_day_vol if avg_day_vol > 0 else 1.0
+
+            # prev_close：同 apply_filters 的日期过滤逻辑
+            closes    = safe_series(daily, "Close")
+            daily_idx = daily.index
+            try:
+                past = closes[daily_idx.strftime("%Y-%m-%d") < today]
+            except AttributeError:
+                past = closes.iloc[:-1]
+            if len(past) < 1:
+                continue
+            prev_close = float(past.iloc[-1])
+            change_pct = (curr_price - prev_close) / prev_close * 100
+
+            sector = sector_cache.get(t, "Unknown")
+            if sector == "Unknown":
+                continue
+
+            stock_stats.append({
+                "ticker"    : t,
+                "sector"    : sector,
+                "dollar_vol": dollar_vol,
+                "change_pct": change_pct,
+                "vol_ratio" : vol_ratio,
+            })
+        except Exception:
+            continue
+
+    if not stock_stats:
+        log.warning("板块热度：无有效数据")
+        return
+
+    # ── Step 3: 按板块聚合 ───────────────────────────────────
+    from collections import defaultdict
+    import statistics
+
+    sector_groups: dict[str, list[dict]] = defaultdict(list)
+    for s in stock_stats:
+        sector_groups[s["sector"]].append(s)
+
+    sector_summary: list[dict] = []
+    for sector, stocks in sector_groups.items():
+        if len(stocks) < 2:          # 太少代表性不足，过滤
+            continue
+        total_dv   = sum(s["dollar_vol"] for s in stocks)
+        avg_chg    = sum(s["change_pct"] for s in stocks) / len(stocks)
+        med_vr     = statistics.median(s["vol_ratio"] for s in stocks)
+        up_count   = sum(1 for s in stocks if s["change_pct"] > 0)
+
+        # 代表股：板块内换手额最高的3只
+        top3 = sorted(stocks, key=lambda x: x["dollar_vol"], reverse=True)[:3]
+
+        sector_summary.append({
+            "sector"   : sector,
+            "total_dv" : total_dv,
+            "avg_chg"  : avg_chg,
+            "med_vr"   : med_vr,
+            "up_count" : up_count,
+            "total"    : len(stocks),
+            "top3"     : top3,
+        })
+
+    # 按总换手额降序，取前3
+    sector_summary.sort(key=lambda x: x["total_dv"], reverse=True)
+    top3_sectors = sector_summary[:3]
+
+    if not top3_sectors:
+        log.warning("板块热度：聚合后无有效板块")
+        return
+
+    # ── Step 4: 格式化发送 ───────────────────────────────────
+    medals = ["🥇", "🥈", "🥉"]
+    lines  = [f"💹 <b>今日板块资金热度 {today}</b>\n"]
+
+    for i, sec in enumerate(top3_sectors):
+        dv_str  = (
+            f"${sec['total_dv']/1_000_000:.1f}M"
+            if sec["total_dv"] >= 1_000_000
+            else f"${sec['total_dv']/1_000:.0f}K"
+        )
+        chg_str = f"{'+' if sec['avg_chg'] >= 0 else ''}{sec['avg_chg']:.1f}%"
+        vr_str  = f"{sec['med_vr']:.1f}x"
+        br_str  = f"{sec['up_count']}/{sec['total']}"
+
+        lines.append(
+            f"{medals[i]} <b>{sec['sector']}</b>\n"
+            f"   换手:{dv_str} | 均涨:{chg_str} | 量比:{vr_str} | 上涨:{br_str}只"
+        )
+
+        # 代表股（换手额最高3只）
+        rep_parts = []
+        for s in sec["top3"]:
+            code   = s["ticker"].replace(".AX", "")
+            chg    = f"{'+' if s['change_pct']>=0 else ''}{s['change_pct']:.1f}%"
+            dv_s   = (
+                f"${s['dollar_vol']/1_000_000:.1f}M"
+                if s["dollar_vol"] >= 1_000_000
+                else f"${s['dollar_vol']/1_000:.0f}K"
+            )
+            rep_parts.append(f"{code}({chg},{dv_s})")
+        lines.append(f"   代表股: {' | '.join(rep_parts)}\n")
+
+    lines.append("数据基于今日流动性股票池，仅供参考。")
+    send_telegram("\n".join(lines))
+    log.info(f"板块热度发送完成，Top3: {[s['sector'] for s in top3_sectors]}")
+
+
+
 
 def run_morning_scan() -> None:
     today = datetime.now().strftime("%Y-%m-%d")
@@ -1627,6 +1800,9 @@ def run_morning_scan() -> None:
         log.info(f"  {flag} {c['ticker']}: +{c['change_pct']}% 量:{c['vol_ratio']}x")
 
     log.info(f"阶段一完成，{len(stage1_pass)} 只通过")
+
+    # ── 板块资金热度（无论有无候选股都运行，每日必报）────────
+    run_sector_heatmap(liquid, daily_data, intra_data, today)
 
     if not stage1_pass:
         send_telegram(
