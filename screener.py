@@ -1403,7 +1403,9 @@ def _build_screener_prompt(signal: dict, timeline: str, tier_label: str) -> str:
         f"52W高:{t['w52_hi']}(距{t['dist_52w_hi_pct']}%) 低:{t['w52_lo']}\n"
         f"近6月最大回撤:{t['max_dd_6m_pct']}%\n"
         f"综合评分:{t.get('composite_score', 'N/A')} "
-        f"趋势持续性:{t.get('persistence_score', 0.0)}"
+        f"趋势持续性:{t.get('persistence_score', 0.0)}\n"
+        f"均线多头排列:{'✅ MA20>MA50>MA200' if t.get('ma_aligned') else '❌ 未满足'} | "
+        f"高低点结构:{'✅ HH/HL已确认（近40日高点抬高+低点抬高）' if t.get('hh_hl') else '— 未确认'}"
     )
 
     return f"""你是一位专注ASX市场的资深机构分析师。今天是{date.today().isoformat()}。
@@ -1462,6 +1464,8 @@ def _build_report_stock_block(ticker: str, tech: dict, fund: dict,
         f"ATR:{tech['atr14_pct']}% 52W高:{tech['w52_hi']}(距{tech['dist_52w_hi_pct']}%)\n"
         f"近6月最大回撤:{tech['max_dd_6m_pct']}% | 综合评分:{tech.get('composite_score','N/A')} "
         f"趋势持续性:{tech.get('persistence_score', 0.0)}\n"
+        f"均线多头排列:{'✅ MA20>MA50>MA200' if tech.get('ma_aligned') else '❌ 未满足'} | "
+        f"高低点结构:{'✅ HH/HL已确认' if tech.get('hh_hl') else '— 未确认'}\n"
         f"大涨大跌节点：{pe_str}"
     )
 
@@ -2091,6 +2095,16 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
                         tech["_pdi_s"],
                         tech["_mdi_s"],
                     )
+
+                    # ── v17新增：结构标记注入（供Gemini/Prompt使用）─
+                    # 能通过_passes_tier说明已通过对应层级的检查
+                    # T1/T2：hh_hl=True表示已通过HH/HL双重价格结构验证
+                    # T3/T4：不强制要求HH/HL，但仍记录实际结果供参考
+                    tech["hh_hl"] = _check_higher_highs_lows(
+                        tech["_high"], tech["_low"]
+                    )
+                    # ma_aligned=True表示已通过均线多头排列验证
+                    tech["ma_aligned"] = _check_ma_alignment(tech, tier["level"])
 
                     # ── 催化剂评分注入 ────────────────────────────
                     code      = ticker.replace(".AX", "")
