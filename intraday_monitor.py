@@ -269,8 +269,14 @@ def check_health(ticker: str, daily_df: pd.DataFrame) -> tuple:
 def _build_bar_record(ts: pd.Timestamp, row: pd.Series, prior_high: float,
                        avg_vol_20d: float) -> dict:
     """把单根15分钟K线转换成标准化记录，便于后续判断和入库"""
-    o, h, l, c, v = (float(row["Open"]), float(row["High"]),
-                      float(row["Low"]), float(row["Close"]), float(row["Volume"]))
+    # 用float(row[col].iloc[0] if hasattr(row[col], 'iloc') else row[col])
+    # 兼容yfinance返回单元素Series和标量两种情况，避免未来pandas版本抛TypeError
+    def _f(val) -> float:
+        if hasattr(val, "iloc"):
+            return float(val.iloc[0])
+        return float(val)
+
+    o, h, l, c, v = _f(row["Open"]), _f(row["High"]), _f(row["Low"]), _f(row["Close"]), _f(row["Volume"])
     # 当日均量按"已经过去的bar数"折算，避免用全天均量去判断早盘的量比（结构性偏差）
     vwap = (h + l + c) / 3.0
     pct_from_high = round((c / prior_high - 1) * 100, 2) if prior_high else 0.0
