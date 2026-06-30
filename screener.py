@@ -133,13 +133,13 @@ PDF_KEY_TERMS = [
 
 # v17：新增 persistence 维度（0.10），其余权重等比下调，总和=1.0
 SCORE_WEIGHTS = {
-    "rs_vs_xjo"     : 0.28,
-    "adx14"         : 0.18,
-    "vol_ratio"     : 0.13,
+    "rs_vs_xjo"     : 0.26,
+    "adx14"         : 0.20,
+    "vol_ratio"     : 0.12,
     "close_pos_pct" : 0.07,
     "price_pct_1y"  : 0.06,
-    "catalyst"      : 0.18,
-    "persistence"   : 0.10,
+    "catalyst"      : 0.13,
+    "persistence"   : 0.16,
 }
 
 TIERS = [
@@ -314,8 +314,8 @@ def calc_composite_score(tech: dict) -> float:
     def norm(val, lo, hi):
         return max(0.0, min(1.0, (val - lo) / (hi - lo))) if hi > lo else 0.0
     scores = {
-        "rs_vs_xjo"     : norm(tech.get("rs_vs_xjo", 1.0), 0.8, 1.5),
-        "adx14"         : norm(tech.get("adx14", 0),        15, 50),
+        "rs_vs_xjo"     : norm(tech.get("rs_vs_xjo", 1.0), 0.95, 1.25),
+        "adx14"         : norm(tech.get("adx14", 0),        15, 40),
         "vol_ratio"     : norm(tech.get("vol_ratio", 1.0),  1.0, 4.0),
         "close_pos_pct" : norm(tech.get("close_pos_pct", 50), 40, 100),
         "price_pct_1y"  : norm(tech.get("price_pct_1y", 50), 50, 100),
@@ -331,8 +331,8 @@ def calc_confidence(tech: dict, tier_level: str) -> float:
     base      = base_map.get(tier_level, 0.60)
     adx       = tech.get("adx14", 20)
     rs        = tech.get("rs_vs_xjo", 1.0)
-    adx_bonus = min(0.05, max(0.0, (adx - 25) / (50 - 25) * 0.05))
-    rs_bonus  = min(0.05, max(0.0, (rs - 1.0) / 0.3 * 0.05))
+    adx_bonus = min(0.05, max(0.0, (adx - 25) / (40 - 25) * 0.05))
+    rs_bonus  = min(0.05, max(0.0, (rs - 1.0) / 0.2 * 0.05))
     vol_bonus = 0.02 if tech.get("vol_consistency") else 0.0
     dist      = abs(tech.get("dist_52w_hi_pct", -20))
     dist_pen  = min(0.05, dist / 20 * 0.05)
