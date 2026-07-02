@@ -1955,7 +1955,7 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 ━━━━━━━━━━━━━━
 
 备注5、结尾后加上标签
-#ASX #复盘
+#ASX #澳洲
 ⚠️仅个人记录，不构成投资建议
 
 - 标签不算在字数限制以内
