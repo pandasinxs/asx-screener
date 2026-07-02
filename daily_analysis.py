@@ -78,7 +78,12 @@ PRIOR_HIGH_WINDOW    = 20       # prior_high_20d 回溯窗口
 VOL_AVG_WINDOW       = 20       # 时段均量回溯窗口
 SESSION_START        = "10:00"  # 交易时段起点（跳过开盘集合竞价）
 SESSION_END          = "16:00"  # 交易时段终点
-MIN_DOLLAR_VOL       = 30_000  # 单根K线最低成交额
+MIN_DOLLAR_VOL          = 300_000  # 盘中监测实时信号用（严格）
+BACKFILL_MIN_DOLLAR_VOL =  50_000  # 历史补齐用（宽松）
+# 两个门槛分开的理由：
+# 盘中监测需要确保流动性足够支撑实际下单，$300K是合理下限
+# 历史补齐只是为了因子分析积累价格/量能数据，不涉及实际交易，
+# $50K避免小盘股历史数据被大量过滤导致因子分析数据基础不足
 
 # 因子分析
 MIN_DAYS_FOR_ANALYSIS   = 5
@@ -124,13 +129,25 @@ def _safe_float(val) -> Optional[float]:
 
 
 def get_existing_days(ticker: str) -> int:
-    """查询该股票在intraday_snapshots里已有的完整交易日数"""
+    """
+    查询该股票在intraday_snapshots里已有的完整交易日数。
+
+    口径和load_daily_summaries保持一致：
+    每天至少有8根K线才算"完整交易日"（约2小时数据）。
+    之前用COUNT(DISTINCT trading_date)不加此条件，
+    会把只有1-2根K线的不完整日也算进去，导致日志里显示的
+    "天数"和实际因子分析可用的天数不一致，引起混淆。
+    """
     try:
         with sqlite3.connect(wdb.WATCHLIST_DB_PATH) as conn:
             row = conn.execute("""
-                SELECT COUNT(DISTINCT trading_date)
-                FROM intraday_snapshots
-                WHERE ticker = ?
+                SELECT COUNT(*) FROM (
+                    SELECT trading_date
+                    FROM intraday_snapshots
+                    WHERE ticker = ?
+                    GROUP BY trading_date
+                    HAVING COUNT(*) >= 8
+                )
             """, (ticker,)).fetchone()
         return row[0] if row else 0
     except Exception:
@@ -271,7 +288,7 @@ def backfill_ticker_to_db(ticker: str,
             continue
         if c <= 0 or v < 0:
             continue
-        if c * v < MIN_DOLLAR_VOL:
+        if c * v < BACKFILL_MIN_DOLLAR_VOL:
             continue
 
         vwap            = (h + l + c) / 3.0
