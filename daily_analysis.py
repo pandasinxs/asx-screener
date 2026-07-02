@@ -78,7 +78,7 @@ PRIOR_HIGH_WINDOW    = 20       # prior_high_20d 回溯窗口
 VOL_AVG_WINDOW       = 20       # 时段均量回溯窗口
 SESSION_START        = "10:00"  # 交易时段起点（跳过开盘集合竞价）
 SESSION_END          = "16:00"  # 交易时段终点
-MIN_DOLLAR_VOL       = 300_000  # 单根K线最低成交额
+MIN_DOLLAR_VOL       = 30_000  # 单根K线最低成交额
 
 # 因子分析
 MIN_DAYS_FOR_ANALYSIS   = 5
