@@ -1911,7 +1911,7 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 - 像“持续观察者视角”，不是一次性解读
 
 --------------------------------
-3. 一句话分析
+3. 用一句话分析
 
 结构判断 +趋势分析
 
