@@ -134,15 +134,58 @@ def safe_series(df: pd.DataFrame, col: str) -> Optional[pd.Series]:
 # ════════════════════════════════════════════════════════════
 
 def download_intraday(ticker: str, retries: int = 3) -> Optional[pd.DataFrame]:
+    """
+    下载当日15分钟K线。
+
+    关键设计（2026-07修复）：
+    实测发现yfinance用period="1d"请求极低流动性股票时，
+    如果当天K线数量过少（比如全天只有2-3根有成交的15分钟bar），
+    yf.download会直接返回空结果并抛出"possibly delisted"这个
+    具有误导性的错误——这不代表真的退市，只是yfinance在
+    period="1d"这个窄窗口下对稀疏数据的处理逻辑过于严格。
+
+    实测验证（SOR.AX真实案例）：
+    period="1d" → 空结果，报错"possibly delisted"
+    period="5d" → 正常返回，能看到当天3根K线（含2根有效成交）
+
+    修复方式：统一用period="5d"请求（避免窄窗口误判），
+    拿到结果后立刻筛选出"悉尼时区今天"这一天的K线再返回。
+    对下游完全透明——monitor_one_ticker()和三个模式判断函数
+    拿到的依然是"只包含今天K线"的DataFrame，语义不变，
+    不需要改动任何下游逻辑。
+
+    时区处理：必须用悉尼时区的"今天"去过滤，不能用系统本地/UTC的
+    今天，否则在悉尼时间0点-10点这段UTC仍是前一天的窗口会误判。
+    """
+    today_syd = now_syd().date()
+
     for attempt in range(1, retries + 1):
         try:
-            df = yf.download(ticker, period="1d", interval="15m",
+            df = yf.download(ticker, period="5d", interval="15m",
                               progress=False, prepost=False)
             if df is None or df.empty:
                 log.warning(f"日内K线为空 [{ticker}] 第{attempt}次")
                 time.sleep(2)
                 continue
-            return df
+
+            # 转换到悉尼时区（yfinance返回的index可能已带时区，也可能是naive）
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC").tz_convert(SYD_TZ)
+            else:
+                df.index = df.index.tz_convert(SYD_TZ)
+
+            # 筛选出今天的K线，保持返回语义和之前period="1d"一致
+            today_mask = df.index.date == today_syd
+            df_today = df[today_mask].copy()
+
+            if df_today.empty:
+                log.warning(f"日内K线中无今日数据 [{ticker}] 第{attempt}次"
+                           f"（5天数据共{len(df)}行，但今日{today_syd}无匹配行）")
+                time.sleep(2)
+                continue
+
+            return df_today
+
         except Exception as e:
             log.error(f"日内K线下载失败 [{ticker}] 第{attempt}次: {e}")
             time.sleep(3)
