@@ -955,6 +955,16 @@ def main() -> None:
             result = evaluate_ticker(item)
             if result:
                 results.append(result)
+                # 只在盘前模式写入today_status，供intraday_monitor.py
+                # 在开盘后的15分钟轮询里读取判断是否运行三种模式。
+                # postmarket模式不写入：写了也没意义（当天已收盘），
+                # 次日premarket会重新计算并覆盖，避免多余的数据库写入。
+                if args.mode == "premarket":
+                    wdb.update_today_status(
+                        result["ticker"],
+                        result["status"],
+                        signal_count=result.get("signal_count", 0),
+                    )
         except Exception as e:
             log.error(f"评估异常 [{item['ticker']}]: {e}")
         time.sleep(1.5)   # 避免yfinance请求过密
