@@ -63,13 +63,25 @@ def init_watchlist_db() -> None:
                     last_signal_date  TEXT,
                     last_signal_price REAL,
                     stop_loss_price   REAL,
+                    -- daily_analysis.py盘前分析写入的当日跨日状态，
+                    -- 供intraday_monitor.py读取，决定是否对该股票
+                    -- 运行三种日内模式判断（只对today_status='ready'的股票判断）
+                    today_status       TEXT,
+                    today_status_date  TEXT,
+                    today_signal_count INTEGER DEFAULT 0,
                     notes             TEXT
                 )
             """)
-            # 兼容旧数据库：若表已存在但缺少source列，补充上去
+            # 兼容旧数据库：若表已存在但缺少source/today_status列，补充上去
             cols = [r[1] for r in conn.execute("PRAGMA table_info(watchlist)").fetchall()]
             if "source" not in cols:
                 conn.execute("ALTER TABLE watchlist ADD COLUMN source TEXT DEFAULT 'eod'")
+            if "today_status" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN today_status TEXT")
+            if "today_status_date" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN today_status_date TEXT")
+            if "today_signal_count" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN today_signal_count INTEGER DEFAULT 0")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS intraday_snapshots (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -272,7 +284,8 @@ def get_active_watchlist() -> list:
                 SELECT ticker, company_name, tier_level, tier_label, composite_score,
                        entry_date, total_days, days_elapsed, reselect_count, source,
                        ref_date, prior_high_20d, prior_low_20d, avg_vol_20d,
-                       last_signal_mode, last_signal_date, last_signal_price, stop_loss_price
+                       last_signal_mode, last_signal_date, last_signal_price, stop_loss_price,
+                       today_status, today_status_date, today_signal_count
                 FROM watchlist
                 WHERE status = 'active' AND days_elapsed < total_days
                 ORDER BY composite_score DESC
@@ -280,7 +293,8 @@ def get_active_watchlist() -> list:
         cols = ["ticker", "company_name", "tier_level", "tier_label", "composite_score",
                 "entry_date", "total_days", "days_elapsed", "reselect_count", "source",
                 "ref_date", "prior_high_20d", "prior_low_20d", "avg_vol_20d",
-                "last_signal_mode", "last_signal_date", "last_signal_price", "stop_loss_price"]
+                "last_signal_mode", "last_signal_date", "last_signal_price", "stop_loss_price",
+                "today_status", "today_status_date", "today_signal_count"]
         return [dict(zip(cols, r)) for r in rows]
     except Exception as e:
         log.error(f"读取监测队列失败: {e}")
@@ -343,6 +357,73 @@ def record_signal(ticker: str, mode: str, price: float, stop_loss: float) -> Non
             conn.commit()
     except Exception as e:
         log.error(f"记录信号失败 [{ticker}]: {e}")
+
+
+def update_today_status(ticker: str, status: str, signal_count: int = 0) -> None:
+    """
+    daily_analysis.py盘前分析完成后调用，写入该股票今日的跨日状态。
+
+    status取值：ready / watch / caution / accumulating
+    （与daily_analysis.py的evaluate_ticker()返回值保持一致，
+    这里不做校验转换，交给调用方保证一致性，避免两处各自维护
+    一套状态枚举导致后续不同步）
+
+    写入today_status_date是为了让intraday_monitor.py能判断
+    "这个状态是不是今天算出来的"——如果daily_analysis.py因为某种
+    原因当天没跑（比如VM重启错过了crontab），intraday_monitor.py
+    读到的会是昨天的状态，必须能识别出这种过期情况，不能默认信任。
+    """
+    today = date.today().isoformat()
+    try:
+        with sqlite3.connect(WATCHLIST_DB_PATH) as conn:
+            conn.execute("""
+                UPDATE watchlist
+                SET today_status = ?, today_status_date = ?, today_signal_count = ?
+                WHERE ticker = ?
+            """, (status, today, signal_count, ticker))
+            conn.commit()
+        log.info(f"今日状态写入 [{ticker}]: {status}（信号数:{signal_count}）")
+    except Exception as e:
+        log.error(f"今日状态写入失败 [{ticker}]: {e}")
+
+
+def get_today_status(ticker: str) -> dict:
+    """
+    intraday_monitor.py每次15分钟轮询时调用，读取该股票今日跨日状态。
+
+    返回dict包含：
+    - status: 状态值，如果today_status_date不是今天，返回'stale'
+             （过期状态，不能作为判断依据）
+    - is_fresh: 布尔值，True表示状态是今天写入的，可信
+    - signal_count: 今日信号数
+
+    stale状态的处理交给调用方决定——保守做法是stale时不运行三个模式
+    判断（避免用旧数据做新决策），但仍然继续写快照积累数据。
+    """
+    today = date.today().isoformat()
+    try:
+        with sqlite3.connect(WATCHLIST_DB_PATH) as conn:
+            row = conn.execute("""
+                SELECT today_status, today_status_date, today_signal_count
+                FROM watchlist WHERE ticker = ?
+            """, (ticker,)).fetchone()
+
+        if row is None or row[0] is None:
+            return {"status": "unknown", "is_fresh": False, "signal_count": 0}
+
+        status, status_date, signal_count = row
+        is_fresh = (status_date == today)
+
+        return {
+            "status": status if is_fresh else "stale",
+            "is_fresh": is_fresh,
+            "signal_count": signal_count or 0,
+            "raw_status": status,       # 即使过期也保留原始值，供日志参考
+            "status_date": status_date,
+        }
+    except Exception as e:
+        log.error(f"读取今日状态失败 [{ticker}]: {e}")
+        return {"status": "unknown", "is_fresh": False, "signal_count": 0}
 
 
 def save_snapshot(ticker: str, snapshot_time: str, trading_date: str,
