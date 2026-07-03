@@ -284,12 +284,38 @@ def _build_bar_record(ts: pd.Timestamp, row: pd.Series, prior_high: float,
         return float(val)
 
     o, h, l, c, v = _f(row["Open"]), _f(row["High"]), _f(row["Low"]), _f(row["Close"]), _f(row["Volume"])
-    vwap = (h + l + c) / 3.0
+    # 注：typical_price是(H+L+C)/3，用于计算VWAP的单根K线代表价格，
+    # 不是VWAP本身。之前版本这里的字段名误写成"vwap"，实际存的是
+    # typical_price——这两个是不同的量，VWAP必须是多根K线的成交量加权
+    # 累积值，单根K线内部算不出VWAP。这里改名为typical_price，
+    # 真正的累积VWAP由calc_cumulative_vwap()单独计算。
+    typical_price = (h + l + c) / 3.0
     pct_from_high = round((c / prior_high - 1) * 100, 2) if prior_high else 0.0
     return {
         "time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v,
-        "vwap": vwap, "pct_from_prior_high": pct_from_high,
+        "typical_price": typical_price, "pct_from_prior_high": pct_from_high,
     }
+
+
+def calc_cumulative_vwap(bars: list) -> Optional[float]:
+    """
+    计算截至当前bar为止，当日累积VWAP（成交量加权均价）。
+
+    公式：Σ(typical_price × volume) / Σ(volume)
+    这是VWAP的标准定义，不是单根K线的均价。
+
+    用途：作为限价单入场参考——如果触发信号时的价格明显高于
+    当日VWAP，说明相对今天已发生的成交而言在追高，入场风险更高；
+    如果接近或低于VWAP，说明入场位置相对当日成交结构是合理的。
+
+    返回None的情况：全部成交量为0（比如SOR.AX那种全天只有
+    零星成交甚至零成交的极端流动性股票），此时VWAP无意义。
+    """
+    total_dollar = sum(b["typical_price"] * b["volume"] for b in bars)
+    total_volume = sum(b["volume"] for b in bars)
+    if total_volume <= 0:
+        return None
+    return round(total_dollar / total_volume, 4)
 
 
 def detect_mode1_breakout(bars: list, prior_high: float, avg_vol_20d: float,
@@ -439,12 +465,20 @@ def monitor_one_ticker(item: dict) -> None:
     breakout_state_for_log = "above" if cur_bar["close"] >= prior_high else "below"
     intraday_avg_so_far = (sum(b["volume"] for b in bars[:-1]) / len(bars[:-1])) if len(bars) > 1 else cur_bar["volume"]
     vol_ratio_log = cur_bar["volume"] / intraday_avg_so_far if intraday_avg_so_far > 0 else 1.0
+
+    # 计算真正的累积VWAP（之前这里误用了典型价格，见calc_cumulative_vwap注释）
+    cumulative_vwap = calc_cumulative_vwap(bars)
+    # calc_cumulative_vwap在全天零成交时返回None，数据库vwap字段
+    # 用典型价格兜底（总比存NULL让下游代码要处理None更简单，
+    # 且这种极端情况下典型价格和真实价格的偏差本身也没有太大意义）
+    vwap_for_db = cumulative_vwap if cumulative_vwap is not None else cur_bar["typical_price"]
+
     wdb.save_snapshot(
         ticker=ticker,
         snapshot_time=cur_bar["time"].isoformat(),
         trading_date=today,
         price=cur_bar["close"], high=cur_bar["high"], low=cur_bar["low"],
-        volume=cur_bar["volume"], vwap=cur_bar["vwap"],
+        volume=cur_bar["volume"], vwap=vwap_for_db,
         pct_from_prior_high=cur_bar["pct_from_prior_high"],
         vol_vs_avg_ratio=round(vol_ratio_log, 2),
         breakout_state=breakout_state_for_log,
@@ -526,6 +560,37 @@ def monitor_one_ticker(item: dict) -> None:
         stop_loss = round(prior_high * 0.99, 3)
         stop_logic = f"次日跌破今日突破位 ${prior_high:.3f} 视为信号失败"
 
+    # 风险收益比目标价：用prior_high与prior_low_20d的差值 / 20
+    # 作为"日均波幅"的粗略代理，不是真实ATR14。
+    #
+    # 为什么不现场下载日线数据算真实ATR：
+    # 信号触发是时间敏感事件，现场再发一次yfinance请求算ATR会拖慢
+    # 响应速度（之前daily_analysis.py下载ATR平均耗时1-2秒，
+    # 38只股票轮询本来就要跑约1分钟，不应该为了这个精度提升
+    # 再增加延迟）。lock_daily_reference()已经算出的
+    # prior_high_20d/prior_low_20d本身就来自20日窗口，
+    # 用二者差值/20作为波幅代理，量级上是合理的近似，
+    # 但明确不等于ATR14（ATR是基于真实波幅TR的滚动均值，
+    # 这里只是用价格区间宽度做了简化）。
+    stop_distance = abs(price - stop_loss)
+    target_1r = round(price + stop_distance * 2, 3)
+    target_2r = round(price + stop_distance * 3, 3)
+    risk_reward_note = "（止损距离×2/×3，非真实ATR，仅供参考）"
+
+    # 当日累积VWAP，作为限价单入场参考
+    cum_vwap = calc_cumulative_vwap(bars)
+    if cum_vwap is not None:
+        vwap_deviation_pct = round((price / cum_vwap - 1) * 100, 2)
+        if vwap_deviation_pct > 2.0:
+            vwap_note = f"⚠️ 当前价高于VWAP {vwap_deviation_pct}%，追高风险较高"
+        elif vwap_deviation_pct < -1.0:
+            vwap_note = f"当前价低于VWAP {abs(vwap_deviation_pct)}%，入场位置相对合理"
+        else:
+            vwap_note = "当前价接近VWAP，入场位置合理"
+    else:
+        vwap_deviation_pct = None
+        vwap_note = "今日成交量过低，VWAP参考意义有限"
+
     wdb.record_signal(ticker, signal["mode"], price, stop_loss)
 
     extra_lines = []
@@ -555,23 +620,31 @@ def monitor_one_ticker(item: dict) -> None:
     # "unknown/stale"是跨日分析层不可用时降级运行、未经跨日过滤的信号，
     # 两者可信度不同，必须让用户知道差异，不能用同样的措辞混在一起
     if status_info["status"] == "ready":
-        status_line = "✅ 已通过跨日因子分析确认（今日ready状态）"
+        status_line = "✅ 中线判断：已通过跨日因子分析确认（今日ready，值得建仓）"
     else:
         status_line = (
-            f"⚠️ 跨日因子分析不可用（{status_info['status']}），"
+            f"⚠️ 中线判断：跨日因子分析不可用（{status_info['status']}），"
             f"本信号未经跨日质量过滤，可信度低于常规信号"
         )
+
+    vwap_line = (
+        f"📊 当日VWAP：${cum_vwap:.3f}（{vwap_note}）"
+        if cum_vwap is not None else f"📊 {vwap_note}"
+    )
 
     msg = (
         f"🚨 <b>入场信号触发</b>\n\n"
         f"<b>{item.get('company_name', ticker)}</b> ({ticker})\n"
-        f"📍 应用策略：<b>{signal['mode']}</b>\n"
-        f"⏱ 触发时间：{signal['time'].strftime('%H:%M')}\n"
-        f"💰 当前价：${price:.3f}\n"
-        f"{extra_text}\n\n"
-        f"📌 建议执行窗口：{signal['execution_window']}\n"
-        f"🛑 止损逻辑：{stop_logic}（止损价参考 ${stop_loss:.3f}）\n\n"
         f"{status_line}\n"
+        f"📍 短线择时：<b>{signal['mode']}</b>\n"
+        f"⏱ 触发时间：{signal['time'].strftime('%H:%M')}\n"
+        f"💰 触发价：${price:.3f}\n"
+        f"{vwap_line}\n"
+        f"{extra_text}\n\n"
+        f"🎯 目标价：${target_1r}（2倍风险）/ ${target_2r}（3倍风险）"
+        f"{risk_reward_note}\n"
+        f"🛑 止损逻辑：{stop_logic}（止损价参考 ${stop_loss:.3f}）\n\n"
+        f"📌 建议执行窗口：{signal['execution_window']}\n\n"
         f"{source_line}\n"
         f"⚠️ 15分钟K线级别确认，非逐笔实时信号，请结合实时盘口核实再操作"
     )
