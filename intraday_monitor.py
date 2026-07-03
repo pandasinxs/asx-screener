@@ -58,33 +58,27 @@ SYD_TZ = ZoneInfo("Australia/Sydney")
 
 TIMEOUT = 15
 
-# ── 交易时段定义（悉尼时间）────────────────────────────────
-# ASX连续交易：10:00-16:00（开盘前有集合竞价至10:00，收盘集合竞价16:10-16:12）
-# 我们跳过开盘后头15分钟（噪音）和收盘前的集合竞价窗口
 MARKET_OPEN          = "10:00"
-SESSION_START_SAFE   = "10:15"   # 跳过开盘竞价后的头15分钟噪音
+SESSION_START_SAFE   = "10:15"
 MARKET_CLOSE         = "16:00"
-LATE_SESSION_START   = "15:30"   # 模式3"尾盘确认"窗口起点
-LATE_SESSION_END     = "15:45"   # 必须早于集合竞价（16:00后不算连续盘）
+LATE_SESSION_START   = "15:30"
+LATE_SESSION_END     = "15:45"
 
-# ── 流动性门槛（与screener.py一致逻辑）─────────────────────
-MIN_DOLLAR_VOLUME_INTRADAY = 300_000   # 单次15分钟K线最低成交额，过滤低基数噪音
+MIN_DOLLAR_VOLUME_INTRADAY = 300_000
 
-# ── 模式判断参数 ────────────────────────────────────────────
-BREAKOUT_LOOKBACK_DAYS   = 20    # "前高/前低"取过去20个交易日（不含今天）
-VOL_SPIKE_RATIO_M1       = 1.8   # 模式1：该15分钟K线量 vs 当日均量 的放量倍数门槛
-VOL_SPIKE_RATIO_HIST     = 1.5   # 模式1辅助：vs 历史同时段均量 的放量倍数门槛
-BREAKOUT_FAILURE_PCT     = -0.3  # 假突破判定：突破后次根K线收盘跌破突破位超过此百分比则判失败
-PULLBACK_MAX_DEPTH_PCT   = 4.0   # 模式2：回踩深度不超过突破位下方4%（太深视为趋势反转而非回踩）
-PULLBACK_VOL_SHRINK_RATIO = 0.7  # 模式2：回踩段成交量须 <= 突破段成交量的70%（缩量确认）
-LATE_SESSION_NEAR_HIGH_PCT = 1.5  # 模式3：尾盘价格须在当日高点1.5%以内
-LATE_SESSION_MIN_VOL_RATIO = 0.8  # 模式3：尾盘成交量不能过度萎缩（仍需>=日均量的80%水准之类佐证）
+BREAKOUT_LOOKBACK_DAYS   = 20
+VOL_SPIKE_RATIO_M1       = 1.8
+VOL_SPIKE_RATIO_HIST     = 1.5
+BREAKOUT_FAILURE_PCT     = -0.3
+PULLBACK_MAX_DEPTH_PCT   = 4.0
+PULLBACK_VOL_SHRINK_RATIO = 0.7
+LATE_SESSION_NEAR_HIGH_PCT = 1.5
+LATE_SESSION_MIN_VOL_RATIO = 0.8
 
-# ── 健康度门槛（决定是否提前清出监测队列）───────────────────
-HEALTH_MIN_RS_VS_XJO = 0.97   # 相对强度跌破此值视为转弱
-HEALTH_BELOW_MA50_GRACE_DAYS = 2  # 连续N天跌破MA50才清出（避免单日噪音误杀）
+HEALTH_MIN_RS_VS_XJO = 0.97
+HEALTH_BELOW_MA50_GRACE_DAYS = 2
 
-_health_fail_streak: dict = {}   # 进程内缓存：{ticker: 连续不健康天数}，每日运行重置由DB状态间接体现
+_health_fail_streak: dict = {}
 
 
 # ════════════════════════════════════════════════════════════
@@ -96,16 +90,8 @@ def now_syd() -> datetime:
 
 
 def is_trading_day_and_time() -> bool:
-    """
-    判断当前是否在ASX有效监测窗口内：
-    - 周一到周五
-    - 10:15 ~ 16:00（悉尼时间）
-    不处理公共假期日历（建议后续接入 exchange_calendars 库做精确判断；
-    当前版本若在假期触发，会因K线数据未更新当天而自然跳过，不会产生误报，
-    但会浪费一次API调用 —— 这是已知的、可接受的简化）
-    """
     n = now_syd()
-    if n.weekday() >= 5:  # 周六=5, 周日=6
+    if n.weekday() >= 5:
         return False
     t = n.strftime("%H:%M")
     return SESSION_START_SAFE <= t <= MARKET_CLOSE
@@ -134,7 +120,6 @@ def send_telegram(text: str) -> None:
 
 
 def safe_series(df: pd.DataFrame, col: str) -> Optional[pd.Series]:
-    """统一处理yfinance squeeze()可能返回numpy scalar的问题"""
     try:
         s = df[col].squeeze()
         if isinstance(s, pd.Series):
@@ -149,10 +134,6 @@ def safe_series(df: pd.DataFrame, col: str) -> Optional[pd.Series]:
 # ════════════════════════════════════════════════════════════
 
 def download_intraday(ticker: str, retries: int = 3) -> Optional[pd.DataFrame]:
-    """
-    下载当日15分钟K线。yfinance对15m间隔最多回看60天，这里只取today即可。
-    含超时重试，失败分类写日志。
-    """
     for attempt in range(1, retries + 1):
         try:
             df = yf.download(ticker, period="1d", interval="15m",
@@ -169,7 +150,6 @@ def download_intraday(ticker: str, retries: int = 3) -> Optional[pd.DataFrame]:
 
 
 def download_daily_reference(ticker: str, retries: int = 3) -> Optional[pd.DataFrame]:
-    """下载过去N日日K线，用于计算prior_high_20d / avg_vol_20d 基准（不含今天）"""
     for attempt in range(1, retries + 1):
         try:
             df = yf.download(ticker, period="2mo", interval="1d", progress=False)
@@ -185,19 +165,15 @@ def download_daily_reference(ticker: str, retries: int = 3) -> Optional[pd.DataF
 
 
 # ════════════════════════════════════════════════════════════
-# 4. 每日基准位锁定（开盘后调用一次）
+# 4. 每日基准位锁定
 # ════════════════════════════════════════════════════════════
 
 def lock_daily_reference(item: dict) -> Optional[dict]:
-    """
-    若该股票今天还没锁定基准位（ref_date != today），重新计算并写入DB。
-    基准位锁定后全天不变，避免"价格在变，标准也在变"的未来函数问题。
-    """
     ticker = item["ticker"]
     today  = date.today().isoformat()
 
     if item.get("ref_date") == today and item.get("prior_high_20d"):
-        return item   # 今日已锁定，直接复用
+        return item
 
     daily_df = download_daily_reference(ticker)
     if daily_df is None:
@@ -210,7 +186,6 @@ def lock_daily_reference(item: dict) -> Optional[dict]:
         low    = safe_series(daily_df, "Low")
         volume = safe_series(daily_df, "Volume")
 
-        # 不含今天：若最后一行日期等于今天则剔除（部分情况yfinance会把当天未收盘的K线也带出）
         if str(daily_df.index[-1].date()) == today:
             high, low, volume, close = high.iloc[:-1], low.iloc[:-1], volume.iloc[:-1], close.iloc[:-1]
 
@@ -235,18 +210,10 @@ def lock_daily_reference(item: dict) -> Optional[dict]:
 # ════════════════════════════════════════════════════════════
 
 def check_health(ticker: str, daily_df: pd.DataFrame) -> tuple:
-    """
-    判断该股票是否仍值得继续监测。
-    返回 (is_healthy: bool, reason: str)
-
-    规则（均基于已收盘日线，避免日内噪音误判）：
-    - 价格连续HEALTH_BELOW_MA50_GRACE_DAYS天跌破MA50 → 不健康
-    - 最新RS_vs_XJO < HEALTH_MIN_RS_VS_XJO → 不健康（相对大盘转弱）
-    """
     try:
         close = safe_series(daily_df, "Close")
         if close is None or len(close) < 50:
-            return True, ""  # 数据不足时不误杀，保守放行
+            return True, ""
 
         ma50 = close.rolling(50).mean()
         below_streak = 0
@@ -259,7 +226,7 @@ def check_health(ticker: str, daily_df: pd.DataFrame) -> tuple:
         return True, ""
     except Exception as e:
         log.warning(f"健康度检查异常 [{ticker}]: {e}")
-        return True, ""  # 异常时保守放行，不误杀
+        return True, ""
 
 
 # ════════════════════════════════════════════════════════════
@@ -268,16 +235,12 @@ def check_health(ticker: str, daily_df: pd.DataFrame) -> tuple:
 
 def _build_bar_record(ts: pd.Timestamp, row: pd.Series, prior_high: float,
                        avg_vol_20d: float) -> dict:
-    """把单根15分钟K线转换成标准化记录，便于后续判断和入库"""
-    # 用float(row[col].iloc[0] if hasattr(row[col], 'iloc') else row[col])
-    # 兼容yfinance返回单元素Series和标量两种情况，避免未来pandas版本抛TypeError
     def _f(val) -> float:
         if hasattr(val, "iloc"):
             return float(val.iloc[0])
         return float(val)
 
     o, h, l, c, v = _f(row["Open"]), _f(row["High"]), _f(row["Low"]), _f(row["Close"]), _f(row["Volume"])
-    # 当日均量按"已经过去的bar数"折算，避免用全天均量去判断早盘的量比（结构性偏差）
     vwap = (h + l + c) / 3.0
     pct_from_high = round((c / prior_high - 1) * 100, 2) if prior_high else 0.0
     return {
@@ -288,34 +251,20 @@ def _build_bar_record(ts: pd.Timestamp, row: pd.Series, prior_high: float,
 
 def detect_mode1_breakout(bars: list, prior_high: float, avg_vol_20d: float,
                            min_dollar_vol: float) -> Optional[dict]:
-    """
-    模式1：突破瞬间买（15分钟K线代理版）
-
-    触发条件（全部满足）：
-    1. 当前bar收盘价首次突破prior_high_20d（即上一根bar收盘价还在prior_high之下）
-    2. 当前bar成交量 >= 该股票当日截至目前bar均量 * VOL_SPIKE_RATIO_M1
-       （用"当日已发生的bar均量"而非全天均量，避免早盘量本来就大造成的偏差）
-    3. 流动性达标：该bar成交额 >= min_dollar_vol
-    4. 未出现"假突破"：若已有下一根bar，其收盘价不能较突破位下跌超过BREAKOUT_FAILURE_PCT
-
-    注：第4点在"突破当根"判断时尚无法验证（下一根还没出现），
-        因此本函数只负责标记"breaking"状态；真正确认要等下一次15分钟轮询，
-        由 detect_breakout_confirmation() 完成"confirmed"或"failed"的判定。
-    """
     if len(bars) < 2 or not prior_high:
         return None
 
     cur, prev = bars[-1], bars[-2]
     if prev["close"] >= prior_high:
-        return None  # 不是"首次"突破，可能已经突破过，留给confirm逻辑处理
+        return None
     if cur["close"] < prior_high:
-        return None  # 还没突破
+        return None
 
-    same_day_bars = bars[:-1]  # 不含当前bar的历史bar，用于计算当日已发生均量
+    same_day_bars = bars[:-1]
     if same_day_bars:
         intraday_avg_vol = sum(b["volume"] for b in same_day_bars) / len(same_day_bars)
     else:
-        intraday_avg_vol = avg_vol_20d / 26  # 26 = 6.5小时/15分钟，粗略折算单bar基准
+        intraday_avg_vol = avg_vol_20d / 26
 
     dollar_vol = cur["close"] * cur["volume"]
     if dollar_vol < min_dollar_vol:
@@ -334,13 +283,6 @@ def detect_mode1_breakout(bars: list, prior_high: float, avg_vol_20d: float,
 
 
 def detect_breakout_confirmation(bars: list, prior_high: float) -> Optional[str]:
-    """
-    检查最近一次"breaking"状态的突破，是否在随后的bar中被确认或证伪。
-    返回 'confirmed' / 'failed' / None（仍在观察中）
-
-    真突破：突破后续bar维持在突破位上方或继续上行
-    假突破：突破后续bar收盘跌回突破位下方超过BREAKOUT_FAILURE_PCT
-    """
     if len(bars) < 2:
         return None
     cur = bars[-1]
@@ -353,28 +295,16 @@ def detect_breakout_confirmation(bars: list, prior_high: float) -> Optional[str]
 
 
 def detect_mode2_pullback(bars: list, prior_high: float) -> Optional[dict]:
-    """
-    模式2：回踩确认买
-
-    触发条件：
-    1. 今日早些时候已经出现突破confirmed（即历史bar中有收盘价>=prior_high的记录）
-    2. 随后价格回踩到突破位附近（不超过PULLBACK_MAX_DEPTH_PCT，避免把"反转"误判成"回踩"）
-    3. 回踩段成交量明显小于突破段（PULLBACK_VOL_SHRINK_RATIO），代表抛压衰竭
-    4. 当前bar相对上一根bar重新拉升（close > prev close，且close回到突破位之上或非常接近）
-
-    这是"在重新向上那一刻买"的代理实现：用收盘价环比回升 + 站回/逼近突破位 作为信号。
-    """
     if len(bars) < 4 or not prior_high:
         return None
 
-    # 找到今日第一次确认突破的bar索引
     breakout_idx = None
     for i, b in enumerate(bars):
         if b["close"] >= prior_high:
             breakout_idx = i
             break
     if breakout_idx is None or breakout_idx >= len(bars) - 2:
-        return None  # 还没突破，或突破刚发生没有后续回踩数据
+        return None
 
     post_breakout = bars[breakout_idx:]
     breakout_vol_avg = sum(b["volume"] for b in post_breakout[:2]) / min(2, len(post_breakout))
@@ -383,14 +313,13 @@ def detect_mode2_pullback(bars: list, prior_high: float) -> Optional[dict]:
     pullback_depth_pct = (prior_high - prev["low"]) / prior_high * 100
 
     if prev["close"] >= prior_high:
-        return None  # 还没真正回踩过，价格一直在上方，不是模式2场景
+        return None
     if pullback_depth_pct > PULLBACK_MAX_DEPTH_PCT:
-        return None  # 回踩太深，更像反转而非健康回踩，模式2不适用
+        return None
 
     if cur["volume"] > breakout_vol_avg * PULLBACK_VOL_SHRINK_RATIO * 1.5:
-        return None  # 回踩段不是缩量，可能是主力出货而非洗盘
+        return None
 
-    # 重新向上确认：当前bar收盘价比上一根高，且已经收回到接近/重新站上突破位
     if cur["close"] <= prev["close"]:
         return None
     if cur["close"] < prior_high * (1 - PULLBACK_MAX_DEPTH_PCT / 100):
@@ -406,16 +335,6 @@ def detect_mode2_pullback(bars: list, prior_high: float) -> Optional[dict]:
 
 def detect_mode3_late_session(bars: list, day_high: float,
                                avg_vol_20d: float) -> Optional[dict]:
-    """
-    模式3：尾盘确认买（仅在15:30-15:45窗口判断一次，避免重复触发）
-
-    触发条件：
-    1. 当前处于尾盘窗口（由外部is_late_session_window()保证调用时机）
-    2. 当前价格距离当日高点不超过LATE_SESSION_NEAR_HIGH_PCT
-    3. 最近2根bar没有持续放量下跌（即没有"明显抛压"的代理判断：
-       最近bar若是阴线，其量不能显著高于均量，否则视为有抛压）
-    4. 成交量仍维持基本水准（不是萎缩到几乎无人交易，那种情况下"强势"没有意义）
-    """
     if len(bars) < 2 or not day_high:
         return None
 
@@ -427,10 +346,10 @@ def detect_mode3_late_session(bars: list, day_high: float,
     bar_avg_vol = avg_vol_20d / 26 if avg_vol_20d else 0
     is_red_bar = cur["close"] < cur["open"]
     if is_red_bar and bar_avg_vol > 0 and cur["volume"] > bar_avg_vol * 1.5:
-        return None  # 阴线放量 = 明显抛压，不满足"无明显抛压"
+        return None
 
     if bar_avg_vol > 0 and cur["volume"] < bar_avg_vol * LATE_SESSION_MIN_VOL_RATIO:
-        return None  # 量能枯竭，强势缺乏验证，谨慎不触发
+        return None
 
     return {
         "mode": "模式3-尾盘确认买", "state": "confirmed",
@@ -474,7 +393,6 @@ def monitor_one_ticker(item: dict) -> None:
     cur_bar  = bars[-1]
     day_high = max(b["high"] for b in bars)
 
-    # 写入快照（历史比对基础，永远写入，不论是否有信号）
     breakout_state_for_log = "above" if cur_bar["close"] >= prior_high else "below"
     intraday_avg_so_far = (sum(b["volume"] for b in bars[:-1]) / len(bars[:-1])) if len(bars) > 1 else cur_bar["volume"]
     vol_ratio_log = cur_bar["volume"] / intraday_avg_so_far if intraday_avg_so_far > 0 else 1.0
@@ -489,31 +407,60 @@ def monitor_one_ticker(item: dict) -> None:
         breakout_state=breakout_state_for_log,
     )
 
-    # 流动性门槛：本bar成交额不达标，不做信号判断（但快照已记录，用于历史统计）
     dollar_vol = cur_bar["close"] * cur_bar["volume"]
     if dollar_vol < MIN_DOLLAR_VOLUME_INTRADAY:
         log.debug(f"[{ticker}] 本bar成交额{dollar_vol:,.0f}不达标，跳过信号判断")
         return
 
-    # 避免同一信号同一天重复推送
+    # ── 跨日状态前置过滤 ─────────────────────────────────────
+    # 只对daily_analysis.py盘前判定为"ready"（跨日因子达标）的股票
+    # 运行三种日内模式判断，避免对整理不充分/量能未达标的股票
+    # 产生大量低质量信号。
+    #
+    # 设计为"软性过滤"而非硬性阻断：
+    # 如果today_status是unknown（daily_analysis.py从未跑过这只股票，
+    # 比如刚通过/watch手动加入还没到下次盘前分析）或stale
+    # （daily_analysis.py当天因故障未运行，比如VM重启错过crontab），
+    # 不会直接跳过信号判断，而是记录警告日志后继续按原逻辑运行。
+    # 这是为了避免"分析层单点故障导致监测层完全失效"——
+    # 跨日过滤是质量优化，不应该成为系统可用性的单点风险。
+    #
+    # 若要改成硬性阻断（unknown/stale时也跳过），
+    # 将 STRICT_STATUS_GATE 改为 True。
+    STRICT_STATUS_GATE = False
+
+    status_info = wdb.get_today_status(ticker)
+    if status_info["status"] == "ready":
+        pass  # 正常进入信号判断
+    elif status_info["status"] in ("watch", "caution", "accumulating"):
+        log.debug(f"[{ticker}] 跨日状态={status_info['status']}（非ready），"
+                 f"跳过信号判断，继续积累数据")
+        return
+    else:
+        # unknown / stale
+        msg = (f"[{ticker}] 跨日状态不可用（{status_info['status']}，"
+              f"原始值:{status_info.get('raw_status')}）")
+        if STRICT_STATUS_GATE:
+            log.warning(f"{msg}，严格模式下跳过信号判断")
+            return
+        else:
+            log.warning(f"{msg}，降级为不做跨日过滤，仍运行信号判断")
+
     already_signaled_today = (item.get("last_signal_date") == today)
 
     signal = None
 
-    # 模式1：突破瞬间
     m1 = detect_mode1_breakout(bars, prior_high, avg_vol_20d, MIN_DOLLAR_VOLUME_INTRADAY)
     if m1 and not already_signaled_today:
         signal = m1
         signal["execution_window"] = "当前/今日内尽快（突破刚发生，确认窗口很短）"
 
-    # 模式2：回踩确认（即使模式1今天已触发过，模式2是不同阶段的信号，仍可触发一次）
     if signal is None:
         m2 = detect_mode2_pullback(bars, prior_high)
         if m2 and item.get("last_signal_mode") != "模式2-回踩确认买":
             signal = m2
             signal["execution_window"] = "当前/今日内（回踩企稳确认）"
 
-    # 模式3：尾盘确认，仅在指定窗口判断，且当天只触发一次
     if signal is None and is_late_session_window():
         if item.get("last_signal_mode") != "模式3-尾盘确认买" or item.get("last_signal_date") != today:
             m3 = detect_mode3_late_session(bars, day_high, avg_vol_20d)
@@ -522,18 +469,17 @@ def monitor_one_ticker(item: dict) -> None:
                 signal["execution_window"] = "次日开盘附近（尾盘锁仓确认，今日已收盘）"
 
     if signal is None:
-        return  # 没动作，不推送，安静退出
+        return
 
-    # ── 有信号：计算止损位并推送 ─────────────────────────────
     price = signal["price"]
     if signal["mode"] == "模式1-突破瞬间买":
-        stop_loss = round(prior_high * 0.995, 3)  # 跌回突破位即视为止损
+        stop_loss = round(prior_high * 0.995, 3)
         stop_logic = f"跌破突破位 ${prior_high:.3f} 立即离场"
     elif signal["mode"] == "模式2-回踩确认买":
         recent_low = min(b["low"] for b in bars[-6:])
         stop_loss = round(recent_low * 0.995, 3)
         stop_logic = f"跌破回踩低点 ${recent_low:.3f} 立即离场"
-    else:  # 模式3
+    else:
         stop_loss = round(prior_high * 0.99, 3)
         stop_logic = f"次日跌破今日突破位 ${prior_high:.3f} 视为信号失败"
 
@@ -548,8 +494,6 @@ def monitor_one_ticker(item: dict) -> None:
         extra_lines.append(f"距今日高点：{signal['dist_from_high_pct']}%")
     extra_text = "\n".join(extra_lines)
 
-    # 来源文案：EOD自动筛选 vs 用户手动添加，两套表述，避免None值露出或文案矛盾
-    # （手动添加的股票没有tier_level/composite_score，原样塞进f-string会显示"None"）
     if item.get("source") == "manual":
         source_line = (
             f"🔎 来源：手动添加监测 "
@@ -563,6 +507,18 @@ def monitor_one_ticker(item: dict) -> None:
             f"已监测{item.get('days_elapsed', 0)}/{item.get('total_days', 0)}天)"
         )
 
+    # 跨日状态说明：让用户能区分信号可信度——
+    # "ready"是经过daily_analysis.py盘前跨日因子确认的高质量信号，
+    # "unknown/stale"是跨日分析层不可用时降级运行、未经跨日过滤的信号，
+    # 两者可信度不同，必须让用户知道差异，不能用同样的措辞混在一起
+    if status_info["status"] == "ready":
+        status_line = "✅ 已通过跨日因子分析确认（今日ready状态）"
+    else:
+        status_line = (
+            f"⚠️ 跨日因子分析不可用（{status_info['status']}），"
+            f"本信号未经跨日质量过滤，可信度低于常规信号"
+        )
+
     msg = (
         f"🚨 <b>入场信号触发</b>\n\n"
         f"<b>{item.get('company_name', ticker)}</b> ({ticker})\n"
@@ -572,24 +528,20 @@ def monitor_one_ticker(item: dict) -> None:
         f"{extra_text}\n\n"
         f"📌 建议执行窗口：{signal['execution_window']}\n"
         f"🛑 止损逻辑：{stop_logic}（止损价参考 ${stop_loss:.3f}）\n\n"
+        f"{status_line}\n"
         f"{source_line}\n"
         f"⚠️ 15分钟K线级别确认，非逐笔实时信号，请结合实时盘口核实再操作"
     )
     send_telegram(msg)
-    log.info(f"信号推送 [{ticker}] {signal['mode']} @ ${price:.3f}")
+    log.info(f"信号推送 [{ticker}] {signal['mode']} @ ${price:.3f} "
+             f"（跨日状态:{status_info['status']}）")
 
 
 # ════════════════════════════════════════════════════════════
-# 8. 收盘后日终处理：健康度检查 + 天数递增 + 队列清理
+# 8. 收盘后日终处理
 # ════════════════════════════════════════════════════════════
 
 def run_end_of_day_maintenance() -> None:
-    """
-    收盘后（建议crontab在16:05单独触发一次，或在最后一次15分钟轮询中附带执行）：
-    - 监测天数+1
-    - 健康度检查，不达标则提前清出
-    - 天数耗尽则正常清出
-    """
     log.info("=== 收盘后队列维护开始 ===")
     watchlist = wdb.get_active_watchlist()
     for item in watchlist:
@@ -643,10 +595,8 @@ def main() -> None:
             monitor_one_ticker(item)
         except Exception as e:
             log.error(f"监测异常 [{item['ticker']}]: {e}")
-        time.sleep(1.0)  # 避免对yfinance过于密集请求
+        time.sleep(1.0)
 
-    # 收盘前最后一次轮询时（15:45-16:00窗口）顺带做日终维护，
-    # 避免额外占用一个crontab条目。
     t = n.strftime("%H:%M")
     if "15:45" <= t <= "16:00":
         run_end_of_day_maintenance()
