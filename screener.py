@@ -2093,73 +2093,79 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 # 7. 选股筛选
 # ════════════════════════════════════════════════════════════
 
+# ============================================================
+# _passes_tier() 最终替换版
+#
+# 改动：原有7个高相关硬性条件(volume_multiple/near_52w_hi/
+# ma_alignment/relative_strength/hh_hl_structure/ma50_trend/
+# vwap_position)合并为trend_strength_score加权评分。
+#
+# 保留硬性AND的条件（"能不能交易"问题，不是"趋势强弱"问题）：
+# liquidity / consolidation / volume_quality / di_direction /
+# adx_strength / rsi_range / close_position
+#
+# 阈值来源：用真实ASX全市场1628只股票数据反推校准
+# （2026-07-04诊断，trend_strength_score v2版本）
+# ============================================================
+
+TREND_SCORE_THRESHOLD = {
+    "T1": 0.45,   # trend_strength_score层面通过率约7.6%（123/1628）
+    "T2": 0.40,   # 约12.8%（209/1628）
+    "T3": 0.35,   # 约31.0%（504/1628）
+    "T4": 0.30,   # 约45.5%（740/1628）
+}
+# 注：以上是trend_strength_score单独层面的通过率，
+# 叠加liquidity/consolidation/volume_quality/di_direction/
+# adx_strength/rsi_range/close_position这7个硬性条件后，
+# 最终真实通过率会显著更低，需要跑一次完整run_screener_flow()
+# 验证实际效果，而不是只看这一层的数字。
+
 def _passes_tier(tech: dict, tier: dict) -> bool:
     lc        = tech["price"]
     vol_ratio = tech["vol_ratio"]
     close_pos = tech["close_pos_pct"] / 100.0
-    w52_hi    = tech["w52_hi"]
     volume_s  = tech["_volume"]
     high_s    = tech["_high"]
     low_s     = tech["_low"]
 
-    # ── 基础条件：MA50趋势 ───────────────────────────────────────
-    if lc < tech["ma50"] or not tech["ma50_up"]:
-        return False
-
-    # ── 基础条件：最低流动性 ─────────────────────────────────────
+    # ── 硬性条件1：最低流动性（"能不能交易"问题，不参与评分）──────
     if float(volume_s.iloc[-20:].mean()) * lc < 300_000:
         return False
 
-    # ── 整理幅度 ────────────────────────────────────────────────
+    # ── 硬性条件2：整理幅度（防止追涨过高风险位）──────────────────
     r15 = pd.concat([high_s, low_s], axis=1).iloc[-15:]
     pr  = (float(r15.iloc[:, 0].max()) - float(r15.iloc[:, 1].min())) / lc
     if pr > tier["consol"]:
         return False
 
-    # ── v16：量能质量检查（替代原硬性缩量要求）──────────────────
+    # ── 硬性条件3：v16量能质量检查（排除爆量脉冲/无方向震荡）──────
     if tier["vol_decline"]:
         if not _check_volume_quality(volume_s):
             return False
 
-    # ── v17新增：均线多头排列验证（全层级）──────────────────────
-    if not _check_ma_alignment(tech, tier["level"]):
-        return False
-
-    # ── v17新增：价格结构验证（T1/T2硬性条件）───────────────────
-    if tier["level"] in ("T1", "T2"):
-        if not _check_higher_highs_lows(high_s, low_s):
-            return False
-
-    # ── 52周高点距离 ─────────────────────────────────────────────
-    if tier["near_52w_hi"] and lc < w52_hi * 0.90:
-        return False
-
-    # ── ADX趋势强度 ──────────────────────────────────────────────
-    if tech["adx14"] < tier["adx_min"]:
-        return False
-
-    # ── DI方向 ───────────────────────────────────────────────────
+    # ── 硬性条件4：DI方向（趋势方向性的基础判断，不模糊化）────────
     if tier["di_cross"] and tech["plus_di"] <= tech["minus_di"]:
         return False
 
-    # ── VWAP位置与方向 ───────────────────────────────────────────
-    if tier["vwap_above"] and (lc < tech["vwap20"] or not tech["vwap_up"]):
+    # ── 硬性条件5：ADX强度门槛（是否存在明确趋势）─────────────────
+    if tech["adx14"] < tier["adx_min"]:
         return False
 
-    # ── 相对强弱 ─────────────────────────────────────────────────
-    if tech["rs_vs_xjo"] < tier["rs_min"]:
-        return False
-
-    # ── 成交量倍数 ───────────────────────────────────────────────
-    if vol_ratio < tier["vol_mult"]:
-        return False
-
-    # ── RSI区间 ──────────────────────────────────────────────────
+    # ── 硬性条件6：RSI区间（防止追高/抄底两个极端）────────────────
     if not (tier["rsi_lo"] <= tech["rsi14"] <= tier["rsi_hi"]):
         return False
 
-    # ── 收盘位置 ─────────────────────────────────────────────────
+    # ── 硬性条件7：收盘位置（当天买盘强度，短周期信号）────────────
     if close_pos < tier["close_pos"]:
+        return False
+
+    # ── 趋势强度综合评分（替代原7个高相关硬性AND条件）─────────────
+    trend_result = calc_trend_strength_score(tech, tier)
+    tech["trend_strength_score"] = trend_result["trend_strength_score"]
+    tech["trend_sub_scores"]     = trend_result["sub_scores"]
+
+    threshold = TREND_SCORE_THRESHOLD.get(tier["level"], 0.35)
+    if trend_result["trend_strength_score"] < threshold:
         return False
 
     return True
