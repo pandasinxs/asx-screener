@@ -16,7 +16,12 @@ def main():
     print(f"K线下载完成：{len(all_data)}只有效")
     print()
     
+    print("=== 条件失败率诊断 ===")
     sc.run_tier_diagnostic(all_data, market_snap, tier_levels=["T1", "T2"])
+    
+    print()
+    print("=== 趋势强度评分阈值扫描 ===")
+    sc.run_threshold_scan(all_data, market_snap, tier_levels=["T1", "T2", "T3", "T4"])
 
 if __name__ == "__main__":
     main()
