@@ -2293,6 +2293,85 @@ def select_top3(all_data: dict, market_snap: dict,
 
     return signals, raw_signals, tier_label, tier_level
 
+VALIDATION_LOG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tier_validation.log"
+)
+
+def log_tier_validation(raw_signals: list, signals: list,
+                        tier_label: str, market_snap: dict) -> None:
+    """
+    记录本次运行的T1-T4筛选质量诊断信息到独立日志文件。
+    """
+    today = date.today().isoformat()
+
+    tier_counts = {}
+    for s in raw_signals:
+        lv = s.get("tier_level", "T?")
+        tier_counts[lv] = tier_counts.get(lv, 0) + 1
+
+    lines = [
+        f"{'='*70}",
+        f"验证日期: {today}",
+        f"ASX200: {market_snap.get('xjo_change_pct', 0):+.2f}% "
+        f"状态: {market_snap.get('market_status', 'normal')}",
+        f"{'-'*70}",
+        f"【Top10候选池层级分布】（进入候选池的股票，按tier统计）",
+    ]
+    for lv in ["T1", "T2", "T3", "T4"]:
+        count = tier_counts.get(lv, 0)
+        lines.append(f"  {lv}: {count}只")
+
+    lines.append(f"{'-'*70}")
+    lines.append(f"【Top{len(signals)}最终入选】层级分布: {tier_label or '（无）'}")
+
+    if signals:
+        for i, s in enumerate(signals, 1):
+            trend_score = s.get("trend_strength_score", "N/A")
+            comp_score  = s.get("composite_score", "N/A")
+            persist     = s.get("persistence_score", "N/A")
+            lines.append(
+                f"  #{i} {s['ticker']} [{s.get('tier_level','?')}] "
+                f"composite={comp_score} trend_strength={trend_score} "
+                f"persistence={persist}"
+            )
+    else:
+        lines.append("  （今日无Top3入选，T1-T4筛选全部为空或市值过滤后不足）")
+
+    lines.append(f"{'-'*70}")
+    lines.append(f"【滚动7日T1/T2候选数均值】（避免单日样本误判趋势）")
+    try:
+        import sqlite3
+        cutoff = (date.today() - timedelta(days=7)).isoformat()
+        with sqlite3.connect(ANN_DB_PATH) as conn:
+            rows = conn.execute("""
+                SELECT signal_date, tier_level, COUNT(*) as cnt
+                FROM signals_history
+                WHERE signal_date >= ? AND tier_level IN ('T1', 'T2')
+                GROUP BY signal_date, tier_level
+            """, (cutoff,)).fetchall()
+
+        t1_counts = [r[2] for r in rows if r[1] == "T1"]
+        t2_counts = [r[2] for r in rows if r[1] == "T2"]
+        t1_avg = sum(t1_counts) / len(t1_counts) if t1_counts else 0.0
+        t2_avg = sum(t2_counts) / len(t2_counts) if t2_counts else 0.0
+        t1_days_with_data = len(t1_counts)
+        t2_days_with_data = len(t2_counts)
+
+        lines.append(f"  T1: 过去7天内有{t1_days_with_data}天产生候选，均值{t1_avg:.2f}只/天")
+        lines.append(f"  T2: 过去7天内有{t2_days_with_data}天产生候选，均值{t2_avg:.2f}只/天")
+    except Exception as e:
+        lines.append(f"  滚动统计查询失败: {e}")
+
+    lines.append(f"{'='*70}")
+    lines.append("")
+
+    try:
+        with open(VALIDATION_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        log.info(f"验证日志已写入: {VALIDATION_LOG_PATH}")
+    except Exception as e:
+        log.error(f"验证日志写入失败: {e}")
+
 def _passes_tier_diagnostic(tech: dict, tier: dict) -> dict:
     """
     诊断版本的_passes_tier，不做提前return，
