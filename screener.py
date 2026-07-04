@@ -2543,14 +2543,23 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
 
     today_ann = fetch_today_announcements()
 
-#获取T1-T4的top3 signals
+    # 获取T1-T4的Top3 signals（select_top3内部已写signals_history和watchlist，
+    # 这里不再重复写watchlist——之前重复调用upsert_watchlist会导致
+    # 同一批Top3股票的监测天数被错误地翻倍累加）
     signals, raw_signals, tier_label, tier_level = select_top3(all_data, market_snap)
+
+    # 修复：elapsed_screen在这里补上定义（原来筛选循环结束时算的这个值，
+    # 拆分到select_top3()后这里丢失了，导致下面引用时NameError崩溃）
+    elapsed_screen = round((time.time() - start) / 60, 1)
+
+    # 每日验证记录（新阈值观察期，不影响正式流程，纯本地文件写入）
+    log_tier_validation(raw_signals, signals, tier_label, market_snap)
 
     if not signals:
         send_telegram(
             f"📊 <b>{market_label}ASX扫描完成 {today}</b>\n\n"
             f"扫描：{len(all_data)} 只（T1-T4均无信号）\n"
-            f"市场动能不足，建议观望。耗时：{round((time.time() - start) / 60, 1)}分钟{market_note}"
+            f"市场动能不足，建议观望。耗时：{elapsed_screen}分钟{market_note}"
         )
         return []
 
@@ -2568,16 +2577,9 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         + market_note
     )
 
-    # 写入watchlist监测队列
-    wdb.init_watchlist_db()
-    for s in signals:
-        wdb.upsert_watchlist(
-            ticker=s["ticker"],
-            company_name=s.get("company_name", s["ticker"]),
-            tier_level=s.get("tier_level", tier_level),
-            tier_label=s.get("tier_label", tier_label),
-            composite_score=s["composite_score"],
-        )
+    # 注：写入watchlist的逻辑已经在select_top3()内部完成，
+    # 这里不再重复调用wdb.upsert_watchlist()，
+    # 避免同一批股票的监测天数被重复累加两次
 
     # Top3逐只Gemini深度分析
     log.info(f"深度分析 Top {len(signals)} 只（Gemini）...")
