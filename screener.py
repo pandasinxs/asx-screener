@@ -565,19 +565,15 @@ def _check_ma_alignment(tech: dict, tier_level: str) -> bool:
     return True
 
 # ============================================================
-# 趋势强度综合评分 —— 替代7个强相关的硬性AND条件
+# 趋势强度综合评分 v2 —— 修复"四个tier分布几乎一样"的缺陷
 #
-# 背景：诊断发现volume_multiple/near_52w_hi/ma_alignment/
-# relative_strength/hh_hl_structure/ma50_trend/vwap_position
-# 这7个条件本质上都在衡量同一件事："趋势是否强劲"，
-# 用AND连接会因为相关性导致通过率坍缩到0%（T1/T2实测0.00%）。
+# v1问题（已用真实数据验证）：只有volume_multiple一项的归一化区间
+# 随tier变化，其余6项区间写死，导致T1-T4的trend_strength_score
+# 均值/中位数/标准差几乎完全一致（相差<0.02），四个层级实质上
+# 变成了同一个筛选器，违背"T1最严格、T4最宽松"的分层设计初衷。
 #
-# 设计原则：
-# 1. 每个条件从布尔值改为0-1的连续分数（越接近1越强）
-# 2. 加权求和得到trend_strength_score
-# 3. 阈值可调，用diagnostic工具反推校准，不凭空定数字
-# 4. liquidity/consolidation两个"能不能交易"类条件依然保持硬性AND，
-#    不纳入这次的评分合并（这两个不是"趋势强弱"问题，是准入门槛问题）
+# 修复：让全部7项的归一化区间都参照原v17硬性门槛参数，
+# 按tier动态生成，而不是只有一项动态、其余写死。
 # ============================================================
 
 def _norm(val: float, lo: float, hi: float) -> float:
@@ -589,72 +585,73 @@ def _norm(val: float, lo: float, hi: float) -> float:
 
 def calc_trend_strength_score(tech: dict, tier: dict) -> dict:
     """
-    计算7个强相关条件的加权综合分数，返回0-1的trend_strength_score，
-    以及每个子项的原始分数（供调试和后续参数校准使用）。
+    计算7个强相关条件的加权综合分数，返回0-1的trend_strength_score。
 
-    权重分配依据：
-    - volume_multiple权重最高(0.20)：诊断显示这是最强的单一瓶颈(T1失败94%)，
-      放量确实是趋势确认最直接的证据，但不应该是唯一决定因素
-    - near_52w_hi(0.15)：距高点太远确实削弱"强势"的说服力，但不应硬性卡死
-    - ma_alignment(0.15) + ma50_trend(0.15)：均线结构合计0.30权重，
-      这是趋势方向最基础的确认，权重适度提高
-    - hh_hl_structure(0.15)：价格结构确认，权重与均线相当
-    - relative_strength(0.10)：跑赢大盘的程度，重要但不是决定性的
-    - vwap_position(0.10)：日内位置确认，权重最低（噪音相对较大）
-    总权重 = 1.0
+    v2改动：全部7项归一化区间均参照原v17硬性门槛动态生成，
+    确保T1（严格tier）在每一项上的评分标准都比T4（宽松tier）更严苛，
+    而不是只有volume_multiple一项体现tier差异。
+
+    区间生成规则：以原v17硬性门槛为"评0.5分"的锚点，
+    向上/向下各扩展一定幅度作为0分/1分的边界，
+    这样阈值校准出来的分数在语义上更接近"是否达到原硬性标准附近"。
     """
     lc     = tech["price"]
     w52_hi = tech["w52_hi"]
 
     scores = {}
 
-    # 1. volume_multiple：当日量比，归一化区间参考诊断阈值附近拉宽
-    #    tier["vol_mult"]是原硬性门槛(T1=2.0/T2=1.5)，
-    #    用[0.5, tier门槛×1.5]作为归一化区间，让评分在门槛附近有区分度
-    vol_mult_target = tier["vol_mult"]
+    # 1. volume_multiple：锚点=tier["vol_mult"]，下限0.5倍锚点，上限1.5倍锚点
+    vol_anchor = tier["vol_mult"]
     scores["volume_multiple"] = _norm(
-        tech.get("vol_ratio", 1.0), 0.5, vol_mult_target * 1.5
+        tech.get("vol_ratio", 1.0), vol_anchor * 0.5, vol_anchor * 1.5
     )
 
-    # 2. near_52w_hi：距52周高点的比例，原硬性门槛是90%
-    #    用[70%, 100%]归一化，70%以下给0分，100%（创新高）给满分
+    # 2. near_52w_hi：锚点=tier["near_52w_hi"]对应的门槛
+    #    v17里near_52w_hi是布尔值(T1/T2=True要求>=90%，T3/T4=False无要求)，
+    #    转换成动态锚点：True→0.90，False→0.75（仍给一定权重，但标准更松）
     dist_ratio = lc / w52_hi if w52_hi > 0 else 0.7
-    scores["near_52w_hi"] = _norm(dist_ratio, 0.70, 1.0)
+    near_hi_anchor = 0.90 if tier["near_52w_hi"] else 0.75
+    scores["near_52w_hi"] = _norm(dist_ratio, near_hi_anchor - 0.15, near_hi_anchor + 0.10)
 
-    # 3. ma_alignment：均线多头排列程度，用MA20相对MA50的溢价比例衡量
-    #    而不是简单的True/False，溢价越大说明排列越健康
+    # 3. ma_alignment：MA20相对MA50溢价。T1/T2额外要求MA50>MA200（更严格），
+    #    用tier level间接调整锚点：T1/T2锚点更高
     ma20 = tech.get("ma20", 0)
     ma50 = tech.get("ma50", 1)
     ma_premium = (ma20 / ma50 - 1) if ma50 > 0 else 0
-    scores["ma_alignment"] = _norm(ma_premium, -0.02, 0.05)
+    ma_anchor  = 0.02 if tier["level"] in ("T1", "T2") else 0.0
+    scores["ma_alignment"] = _norm(ma_premium, ma_anchor - 0.03, ma_anchor + 0.05)
 
-    # 4. relative_strength：RS vs XJO，原硬性门槛在0.98-1.05之间
-    #    用[0.90, 1.15]归一化，给出更宽的区分空间
-    scores["relative_strength"] = _norm(tech.get("rs_vs_xjo", 1.0), 0.90, 1.15)
+    # 4. relative_strength：锚点=tier["rs_min"]（原v17硬性门槛，T1=1.05...T4=0.98）
+    rs_anchor = tier["rs_min"]
+    scores["relative_strength"] = _norm(tech.get("rs_vs_xjo", 1.0), rs_anchor - 0.10, rs_anchor + 0.15)
 
-    # 5. hh_hl_structure：价格结构，用"近20日高点相对前20日高点的抬升幅度"
-    #    量化，而不是简单的True/False
+    # 5. hh_hl_structure：T1/T2原本是硬性要求（必须同时HH+HL），
+    #    T3/T4不要求。锚点体现这个差异
     high_s = tech["_high"]
     low_s  = tech["_low"]
+    hh_anchor = 0.02 if tier["level"] in ("T1", "T2") else -0.02
     if len(high_s) >= 40:
         recent_hi = float(high_s.iloc[-20:].max())
         prior_hi  = float(high_s.iloc[-40:-20].max())
         hh_ratio  = (recent_hi / prior_hi - 1) if prior_hi > 0 else 0
-        scores["hh_hl_structure"] = _norm(hh_ratio, -0.05, 0.10)
+        scores["hh_hl_structure"] = _norm(hh_ratio, hh_anchor - 0.05, hh_anchor + 0.10)
     else:
         scores["hh_hl_structure"] = 0.0
 
-    # 6. ma50_trend：MA50斜率方向性，用近10日MA50变化率衡量
+    # 6. ma50_trend：MA50斜率，用tier的adx_min间接反映"要求趋势有多强"
+    #    ADX门槛越高的tier，对趋势斜率的要求也应该越高
     close_s = tech["_close"]
+    slope_anchor = (tier["adx_min"] - 15) / 100  # T1(28)→0.13%，T4(15)→0%
     if len(close_s) >= 61:
         ma50_now  = float(close_s.rolling(50).mean().iloc[-1])
         ma50_prev = float(close_s.rolling(50).mean().iloc[-11])
         ma50_chg  = (ma50_now / ma50_prev - 1) if ma50_prev > 0 else 0
-        scores["ma50_trend"] = _norm(ma50_chg, -0.02, 0.05)
+        scores["ma50_trend"] = _norm(ma50_chg, slope_anchor - 0.02, slope_anchor + 0.05)
     else:
         scores["ma50_trend"] = 0.0
 
-    # 7. vwap_position：价格相对VWAP20的位置
+    # 7. vwap_position：锚点固定（vwap_above在v17里全层级都要求True，
+    #    没有tier间差异，保持原样即可）
     vwap20 = tech.get("vwap20", lc)
     vwap_premium = (lc / vwap20 - 1) if vwap20 > 0 else 0
     scores["vwap_position"] = _norm(vwap_premium, -0.03, 0.05)
@@ -675,7 +672,6 @@ def calc_trend_strength_score(tech: dict, tier: dict) -> dict:
         "trend_strength_score": round(trend_strength_score, 4),
         "sub_scores": {k: round(v, 3) for k, v in scores.items()},
     }
-
 
 # ════════════════════════════════════════════════════════════
 # JSON字段提取 & signals.json生成 & GitHub推送
