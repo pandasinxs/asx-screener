@@ -2056,6 +2056,109 @@ def _passes_tier(tech: dict, tier: dict) -> bool:
 
     return True
 
+def _passes_tier_diagnostic(tech: dict, tier: dict) -> dict:
+    """
+    诊断版本的_passes_tier，不做提前return，
+    而是记录每一个条件的通过/失败情况，返回完整字典。
+    
+    用途：临时诊断工具，找出T1/T2为什么几乎不触发。
+    正式筛选逻辑仍用_passes_tier()，不受影响。
+    """
+    lc        = tech["price"]
+    vol_ratio = tech["vol_ratio"]
+    close_pos = tech["close_pos_pct"] / 100.0
+    w52_hi    = tech["w52_hi"]
+    volume_s  = tech["_volume"]
+    high_s    = tech["_high"]
+    low_s     = tech["_low"]
+
+    checks = {}
+
+    checks["ma50_trend"] = (lc >= tech["ma50"] and tech["ma50_up"])
+
+    checks["liquidity"] = (float(volume_s.iloc[-20:].mean()) * lc >= 300_000)
+
+    r15 = pd.concat([high_s, low_s], axis=1).iloc[-15:]
+    pr  = (float(r15.iloc[:, 0].max()) - float(r15.iloc[:, 1].min())) / lc
+    checks["consolidation"] = (pr <= tier["consol"])
+
+    if tier["vol_decline"]:
+        checks["volume_quality"] = _check_volume_quality(volume_s)
+    else:
+        checks["volume_quality"] = True  # T4不检查，视为通过
+
+    checks["ma_alignment"] = _check_ma_alignment(tech, tier["level"])
+
+    if tier["level"] in ("T1", "T2"):
+        checks["hh_hl_structure"] = _check_higher_highs_lows(high_s, low_s)
+    else:
+        checks["hh_hl_structure"] = True  # T3/T4不要求
+
+    checks["near_52w_hi"] = (not tier["near_52w_hi"]) or (lc >= w52_hi * 0.90)
+
+    checks["adx_strength"] = (tech["adx14"] >= tier["adx_min"])
+
+    checks["di_direction"] = (not tier["di_cross"]) or (tech["plus_di"] > tech["minus_di"])
+
+    checks["vwap_position"] = (not tier["vwap_above"]) or (lc >= tech["vwap20"] and tech["vwap_up"])
+
+    checks["relative_strength"] = (tech["rs_vs_xjo"] >= tier["rs_min"])
+
+    checks["volume_multiple"] = (vol_ratio >= tier["vol_mult"])
+
+    checks["rsi_range"] = (tier["rsi_lo"] <= tech["rsi14"] <= tier["rsi_hi"])
+
+    checks["close_position"] = (close_pos >= tier["close_pos"])
+
+    checks["_all_passed"] = all(v for k, v in checks.items() if k != "_all_passed")
+
+    return checks
+
+def run_tier_diagnostic(all_data: dict, market_snap: dict, 
+                         tier_levels: list = ["T1", "T2"]) -> None:
+    """
+    诊断工具：对全市场股票跑指定tier的诊断版筛选，
+    统计每个条件的失败率，找出系统性瓶颈。
+    
+    独立运行，不影响正常的run_screener_flow()流程。
+    """
+    xjo_s = market_snap.get("xjo_series")
+    tier_map = {t["level"]: t for t in TIERS}
+    
+    for tier_level in tier_levels:
+        tier = tier_map[tier_level]
+        log.info(f"=== 诊断 {tier_level} ({tier['label']}) ===")
+        
+        fail_counts = {}
+        total_checked = 0
+        total_passed = 0
+        
+        for ticker, df in all_data.items():
+            if len(df) < 60:
+                continue
+            try:
+                tech = build_tech_summary(df, xjo_s)
+                result = _passes_tier_diagnostic(tech, tier)
+                total_checked += 1
+                
+                if result["_all_passed"]:
+                    total_passed += 1
+                
+                for check_name, passed in result.items():
+                    if check_name == "_all_passed":
+                        continue
+                    if not passed:
+                        fail_counts[check_name] = fail_counts.get(check_name, 0) + 1
+            except Exception as e:
+                log.debug(f"诊断异常 [{ticker}]: {e}")
+        
+        log.info(f"{tier_level}: 检查{total_checked}只，通过{total_passed}只 "
+                 f"({total_passed/total_checked*100:.2f}%)")
+        log.info(f"{tier_level} 各条件失败次数（按失败率降序）：")
+        for check_name, count in sorted(fail_counts.items(), 
+                                         key=lambda x: x[1], reverse=True):
+            pct = count / total_checked * 100
+            log.info(f"    {check_name}: 失败{count}只 ({pct:.1f}%)")
 
 def run_screener_flow(all_data: dict, market_snap: dict) -> list:
     today   = date.today().strftime("%Y-%m-%d")
