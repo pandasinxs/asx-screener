@@ -1,5 +1,3 @@
-cd ~/asx
-cat > run_diagnostic.py << 'EOF'
 import screener as sc
 
 def main():
@@ -22,4 +20,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
