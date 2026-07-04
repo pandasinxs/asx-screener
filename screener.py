@@ -2164,6 +2164,129 @@ def _passes_tier(tech: dict, tier: dict) -> bool:
 
     return True
 
+def select_top3(all_data: dict, market_snap: dict,
+                write_to_db: bool = True) -> tuple:
+    """
+    执行T1-T4筛选+composite_score排序+市值过滤，返回Top3。
+
+    参数：
+        write_to_db: 是否写入signals_history和watchlist（本地SQLite，
+                     不花钱）。测试时如果想连数据库也不碰，传False；
+                     默认True，因为写库本身就是你要验证的重要环节。
+
+    返回：
+        (signals, raw_signals, tier_label, tier_level)
+        signals     — 最终Top3（或更少）的完整列表
+        raw_signals — 排序后的Top10候选（写signals_history用这个）
+        tier_label  — 层级汇总字符串（如"T3×2 / T4×1"）
+        tier_level  — 最高层级候选对应的tier_level（供日志用）
+
+    这个函数不调用Gemini、不发Telegram、不推送GitHub，
+    可以放心反复跑，用来验证新_passes_tier()的实际筛选效果。
+    """
+    xjo_s     = market_snap.get("xjo_series")
+    today_ann = fetch_today_announcements()
+
+    log.info("分级筛选（T1-T4全部扫描，合并排序）...")
+    seen_tickers = {}
+
+    for tier in TIERS:
+        log.info(f"  {tier['level']} ({tier['label']})...")
+        count = 0
+        for ticker, df in all_data.items():
+            if ticker in seen_tickers:
+                continue
+            try:
+                if len(df) < 60:
+                    continue
+                tech = build_tech_summary(df, xjo_s)
+                if _passes_tier(tech, tier):
+                    tech["ticker"]     = ticker
+                    tech["tier_level"] = tier["level"]
+                    tech["tier_label"] = tier["label"]
+
+                    tech["persistence_score"] = _check_trend_persistence(
+                        tech["_close"], tech["_adx_s"],
+                        tech["_pdi_s"], tech["_mdi_s"],
+                    )
+
+                    tech["hh_hl"]      = _check_higher_highs_lows(tech["_high"], tech["_low"])
+                    tech["ma_aligned"] = _check_ma_alignment(tech, tier["level"])
+
+                    code      = ticker.replace(".AX", "")
+                    ann       = today_ann.get(code, {})
+                    ann_date  = ann.get("date", "") if ann else ""
+                    today_str = date.today().isoformat()
+                    week_ago  = (date.today() - timedelta(days=7)).isoformat()
+                    month_ago = (date.today() - timedelta(days=30)).isoformat()
+                    if ann.get("sensitive") and ann_date == today_str:
+                        tech["catalyst"] = 1.0
+                    elif ann.get("sensitive") and ann_date >= week_ago:
+                        tech["catalyst"] = 0.7
+                    elif ann_date >= month_ago:
+                        tech["catalyst"] = 0.3
+                    else:
+                        tech["catalyst"] = 0.0
+
+                    seen_tickers[ticker] = tech
+                    count += 1
+            except Exception as e:
+                log.debug(f"筛选异常 [{ticker}]: {e}")
+        log.info(f"    → 本层新增 {count} 个（累计 {len(seen_tickers)} 个）")
+
+    raw_signals = list(seen_tickers.values())
+
+    if not raw_signals:
+        log.info("T1-T4均无信号")
+        return [], [], "", "T?"
+
+    for s in raw_signals:
+        s["composite_score"] = calc_composite_score(s)
+    raw_signals.sort(key=lambda x: x["composite_score"], reverse=True)
+    raw_signals = raw_signals[:10]
+
+    signals = []
+    for s in raw_signals:
+        fund = fetch_fundamentals(s["ticker"])
+        if fund.get("market_cap_m", 0) * 1e6 < 50_000_000:
+            log.debug(f"市值过滤 [{s['ticker']}]")
+            continue
+        s.update(fund)
+        s["entry_limit"] = round(s["price"] * 1.02, 3)
+        s["stop_loss"]   = round(s["price"] * 0.90, 3)
+        s["take_profit"] = round(s["price"] * 1.20, 3)
+        signals.append(s)
+        if len(signals) == TOP_N:
+            break
+
+    tier_summary = {}
+    for s in signals:
+        lv = s.get("tier_level", "T?")
+        tier_summary[lv] = tier_summary.get(lv, 0) + 1
+    tier_label = " / ".join(f"{lv}×{n}" for lv, n in sorted(tier_summary.items()))
+    tier_level = signals[0].get("tier_level", "T?") if signals else "T?"
+
+    if write_to_db:
+        selected_tickers = {s["ticker"] for s in signals}
+        for s in raw_signals:
+            save_signal_to_history(
+                s, market_snap,
+                is_selected=(s["ticker"] in selected_tickers)
+            )
+        log.info(f"signals_history写入：{len(raw_signals)} 条候选（Top3已标记）")
+
+        wdb.init_watchlist_db()
+        for s in signals:
+            wdb.upsert_watchlist(
+                ticker=s["ticker"],
+                company_name=s.get("company_name", s["ticker"]),
+                tier_level=s.get("tier_level", tier_level),
+                tier_label=s.get("tier_label", tier_label),
+                composite_score=s["composite_score"],
+            )
+
+    return signals, raw_signals, tier_label, tier_level
+
 def _passes_tier_diagnostic(tech: dict, tier: dict) -> dict:
     """
     诊断版本的_passes_tier，不做提前return，
@@ -2335,112 +2458,16 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
 
     today_ann = fetch_today_announcements()
 
-    # T1→T4全部扫描，每只股票只记录通过的最高层级
-    log.info("分级筛选（T1-T4全部扫描，合并排序）...")
-    seen_tickers = {}
+#获取T1-T4的top3 signals
+    signals, raw_signals, tier_label, tier_level = select_top3(all_data, market_snap)
 
-    for tier in TIERS:
-        log.info(f"  {tier['level']} ({tier['label']})...")
-        count = 0
-        for ticker, df in all_data.items():
-            if ticker in seen_tickers:
-                continue
-            try:
-                if len(df) < 60:
-                    continue
-                tech = build_tech_summary(df, xjo_s)
-                if _passes_tier(tech, tier):
-                    tech["ticker"]     = ticker
-                    tech["tier_level"] = tier["level"]
-                    tech["tier_label"] = tier["label"]
-
-                    # ── v17新增：趋势持续性分值注入 ──────────────
-                    tech["persistence_score"] = _check_trend_persistence(
-                        tech["_close"],
-                        tech["_adx_s"],
-                        tech["_pdi_s"],
-                        tech["_mdi_s"],
-                    )
-
-                    # ── v17新增：结构标记注入（供Gemini/Prompt使用）─
-                    # 能通过_passes_tier说明已通过对应层级的检查
-                    # T1/T2：hh_hl=True表示已通过HH/HL双重价格结构验证
-                    # T3/T4：不强制要求HH/HL，但仍记录实际结果供参考
-                    tech["hh_hl"] = _check_higher_highs_lows(
-                        tech["_high"], tech["_low"]
-                    )
-                    # ma_aligned=True表示已通过均线多头排列验证
-                    tech["ma_aligned"] = _check_ma_alignment(tech, tier["level"])
-
-                    # ── 催化剂评分注入 ────────────────────────────
-                    code      = ticker.replace(".AX", "")
-                    ann       = today_ann.get(code, {})
-                    ann_date  = ann.get("date", "") if ann else ""
-                    today_str = date.today().isoformat()
-                    week_ago  = (date.today() - timedelta(days=7)).isoformat()
-                    month_ago = (date.today() - timedelta(days=30)).isoformat()
-                    if ann.get("sensitive") and ann_date == today_str:
-                        tech["catalyst"] = 1.0
-                    elif ann.get("sensitive") and ann_date >= week_ago:
-                        tech["catalyst"] = 0.7
-                    elif ann_date >= month_ago:
-                        tech["catalyst"] = 0.3
-                    else:
-                        tech["catalyst"] = 0.0
-
-                    seen_tickers[ticker] = tech
-                    count += 1
-            except Exception as e:
-                log.debug(f"筛选异常 [{ticker}]: {e}")
-        log.info(f"    → 本层新增 {count} 个（累计 {len(seen_tickers)} 个）")
-
-    raw_signals    = list(seen_tickers.values())
-    elapsed_screen = round((time.time() - start) / 60, 1)
-
-    if not raw_signals:
+    if not signals:
         send_telegram(
             f"📊 <b>{market_label}ASX扫描完成 {today}</b>\n\n"
             f"扫描：{len(all_data)} 只（T1-T4均无信号）\n"
-            f"市场动能不足，建议观望。耗时：{elapsed_screen}分钟{market_note}"
+            f"市场动能不足，建议观望。耗时：{round((time.time() - start) / 60, 1)}分钟{market_note}"
         )
         return []
-
-    # 加权评分 + Top3
-    for s in raw_signals:
-        s["composite_score"] = calc_composite_score(s)
-    raw_signals.sort(key=lambda x: x["composite_score"], reverse=True)
-    raw_signals = raw_signals[:10]
-
-    signals = []
-    for s in raw_signals:
-        fund = fetch_fundamentals(s["ticker"])
-        if fund.get("market_cap_m", 0) * 1e6 < 50_000_000:
-            log.debug(f"市值过滤 [{s['ticker']}]")
-            continue
-        s.update(fund)
-        s["entry_limit"] = round(s["price"] * 1.02, 3)
-        s["stop_loss"]   = round(s["price"] * 0.90, 3)
-        s["take_profit"] = round(s["price"] * 1.20, 3)
-        signals.append(s)
-        if len(signals) == TOP_N:
-            break
-
-    # 层级汇总
-    tier_summary = {}
-    for s in signals:
-        lv = s.get("tier_level", "T?")
-        tier_summary[lv] = tier_summary.get(lv, 0) + 1
-    tier_label = " / ".join(f"{lv}×{n}" for lv, n in sorted(tier_summary.items()))
-    tier_level = signals[0].get("tier_level", "T?") if signals else "T?"
-
-    # ── 回测：记录全部候选（含未入选）────────────────────────────
-    selected_tickers = {s["ticker"] for s in signals}
-    for s in raw_signals:
-        save_signal_to_history(
-            s, market_snap,
-            is_selected=(s["ticker"] in selected_tickers)
-        )
-    log.info(f"signals_history写入：{len(raw_signals)} 条候选（Top3已标记）")
 
     # 汇总消息
     send_telegram(
