@@ -917,8 +917,6 @@ def fetch_fundamentals(ticker: str, retries: int = 3) -> dict:
             info = yf.Ticker(ticker).info
             market_cap = info.get("marketCap", 0)
 
-            # market_cap为0或None时，不能确定是真实市值为0还是请求本身
-            # 拿到了不完整数据，视为失败触发重试，而不是直接返回0
             if not market_cap:
                 if attempt < retries:
                     log.warning(f"fetch_fundamentals [{ticker}] 第{attempt}次: "
@@ -926,7 +924,15 @@ def fetch_fundamentals(ticker: str, retries: int = 3) -> dict:
                     time.sleep(1.5 * attempt)
                     continue
                 else:
+                    # 修复：达到重试上限仍无有效市值时，直接break跳出循环，
+                    # 走向函数末尾的统一兜底return。原代码这里没有break，
+                    # 会继续执行下面的return语句，用值为0/None的market_cap
+                    # 计算round(market_cap / 1_000_000, 1)——如果market_cap是
+                    # None（yfinance偶发返回None而非0），会触发TypeError，
+                    # 虽然被外层except捕获不会导致程序崩溃，但会产生
+                    # 误导性的重复日志，且逻辑本身不清晰。
                     log.error(f"fetch_fundamentals [{ticker}] 达到{retries}次仍无有效市值")
+                    break
 
             return {
                 "company_name": info.get("longName", ticker),
@@ -943,6 +949,7 @@ def fetch_fundamentals(ticker: str, retries: int = 3) -> dict:
 
     return {"company_name": ticker, "sector": "未知",
             "industry": "未知", "market_cap_m": 0.0}
+
 
 def _ann_significance(headline: str, sensitive: bool,
                       doc_type: str, pdf_text: str, pub_date: str) -> int:
