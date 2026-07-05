@@ -2176,24 +2176,6 @@ def _passes_tier(tech: dict, tier: dict) -> bool:
 
 def select_top3(all_data: dict, market_snap: dict,
                 write_to_db: bool = True) -> tuple:
-    """
-    执行T1-T4筛选+composite_score排序+市值过滤，返回Top3。
-
-    参数：
-        write_to_db: 是否写入signals_history和watchlist（本地SQLite，
-                     不花钱）。测试时如果想连数据库也不碰，传False；
-                     默认True，因为写库本身就是你要验证的重要环节。
-
-    返回：
-        (signals, raw_signals, tier_label, tier_level)
-        signals     — 最终Top3（或更少）的完整列表
-        raw_signals — 排序后的Top10候选（写signals_history用这个）
-        tier_label  — 层级汇总字符串（如"T3×2 / T4×1"）
-        tier_level  — 最高层级候选对应的tier_level（供日志用）
-
-    这个函数不调用Gemini、不发Telegram、不推送GitHub，
-    可以放心反复跑，用来验证新_passes_tier()的实际筛选效果。
-    """
     xjo_s     = market_snap.get("xjo_series")
     today_ann = fetch_today_announcements()
 
@@ -2255,7 +2237,10 @@ def select_top3(all_data: dict, market_snap: dict,
     raw_signals.sort(key=lambda x: x["composite_score"], reverse=True)
     raw_signals = raw_signals[:10]
 
-    signals = []
+    # 市值过滤：Top10候选池全部要求通过（不只是Top3），
+    # 因为Top4-Top10现在也要进入watchlist做盘中监测，
+    # 同样需要满足最低市值门槛，避免监测流动性太差的股票
+    filtered_pool = []
     for s in raw_signals:
         fund = fetch_fundamentals(s["ticker"])
         if fund.get("market_cap_m", 0) * 1e6 < 50_000_000:
@@ -2265,9 +2250,11 @@ def select_top3(all_data: dict, market_snap: dict,
         s["entry_limit"] = round(s["price"] * 1.02, 3)
         s["stop_loss"]   = round(s["price"] * 0.90, 3)
         s["take_profit"] = round(s["price"] * 1.20, 3)
-        signals.append(s)
-        if len(signals) == TOP_N:
-            break
+        filtered_pool.append(s)
+
+    # Top3：仍然是市值过滤后的候选池里排名最前的3只，
+    # 用于JSON推送/Gemini分析/详细Telegram，逻辑不变
+    signals = filtered_pool[:TOP_N]
 
     tier_summary = {}
     for s in signals:
@@ -2285,8 +2272,11 @@ def select_top3(all_data: dict, market_snap: dict,
             )
         log.info(f"signals_history写入：{len(raw_signals)} 条候选（Top3已标记）")
 
+        # 改动：watchlist写入范围从signals（Top3）扩大到
+        # filtered_pool（市值过滤后的Top10全部），
+        # Top1-Top10同等对待，不做优先级区分
         wdb.init_watchlist_db()
-        for s in signals:
+        for s in filtered_pool:
             wdb.upsert_watchlist(
                 ticker=s["ticker"],
                 company_name=s.get("company_name", s["ticker"]),
@@ -2294,6 +2284,7 @@ def select_top3(all_data: dict, market_snap: dict,
                 tier_label=s.get("tier_label", tier_label),
                 composite_score=s["composite_score"],
             )
+        log.info(f"watchlist写入：{len(filtered_pool)} 只（Top10全部，不只Top3）")
 
     return signals, raw_signals, tier_label, tier_level
 
