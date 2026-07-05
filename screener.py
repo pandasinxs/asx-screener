@@ -314,6 +314,8 @@ def build_tech_summary(df: pd.DataFrame,
         "_mdi_s"  : mdi_s,
     }
 
+TIER_BONUS = {"T1": 0.15, "T2": 0.10, "T3": 0.05, "T4": 0.0}
+
 def calc_composite_score(tech: dict) -> float:
     def norm(val, lo, hi):
         return max(0.0, min(1.0, (val - lo) / (hi - lo))) if hi > lo else 0.0
@@ -324,7 +326,9 @@ def calc_composite_score(tech: dict) -> float:
         "catalyst"      : tech.get("catalyst", 0.0),
         "price_pct_1y"  : norm(tech.get("price_pct_1y", 50), 50, 100),
     }
-    return round(sum(SCORE_WEIGHTS[k] * v for k, v in scores.items()), 4)
+    base = sum(SCORE_WEIGHTS[k] * v for k, v in scores.items())
+    bonus = TIER_BONUS.get(tech.get("tier_level", ""), 0.0)
+    return round(base + bonus, 4)
 
 def calc_confidence(tech: dict, tier_level: str) -> float:
     base_map  = {"T1": 0.85, "T2": 0.75, "T3": 0.65, "T4": 0.55}
