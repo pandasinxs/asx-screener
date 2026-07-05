@@ -131,15 +131,20 @@ PDF_KEY_TERMS = [
     "milestone", "update", "completion", "approval", "forecast",
 ]
 
-# v17：新增 persistence 维度（0.10），其余权重等比下调，总和=1.0
+# ============================================================
+# v18: SCORE_WEIGHTS 改为复用trend_strength_score，不再与其
+# 重复计算rs_vs_xjo/adx14/vol_ratio。原因：两套体系衡量同一件
+# 事但归一化区间不同，导致排序和筛选结果矛盾（真实数据验证：
+# T2候选trend_strength更低但composite_score排序更高）。
+# close_pos_pct已是_passes_tier()硬性条件，通过筛选后此项
+# 已保证达标，排序时边际信息量低，故去除。
+# ============================================================
+
 SCORE_WEIGHTS = {
-    "rs_vs_xjo"     : 0.26,
-    "adx14"         : 0.20,
-    "vol_ratio"     : 0.12,
-    "close_pos_pct" : 0.07,
-    "price_pct_1y"  : 0.06,
-    "catalyst"      : 0.13,
-    "persistence"   : 0.16,
+    "trend_strength": 0.50,
+    "persistence"    : 0.20,
+    "catalyst"       : 0.15,
+    "price_pct_1y"   : 0.15,
 }
 
 TIERS = [
@@ -309,22 +314,17 @@ def build_tech_summary(df: pd.DataFrame,
         "_mdi_s"  : mdi_s,
     }
 
-
 def calc_composite_score(tech: dict) -> float:
     def norm(val, lo, hi):
         return max(0.0, min(1.0, (val - lo) / (hi - lo))) if hi > lo else 0.0
+
     scores = {
-        "rs_vs_xjo"     : norm(tech.get("rs_vs_xjo", 1.0), 0.95, 1.25),
-        "adx14"         : norm(tech.get("adx14", 0),        15, 40),
-        "vol_ratio"     : norm(tech.get("vol_ratio", 1.0),  1.0, 4.0),
-        "close_pos_pct" : norm(tech.get("close_pos_pct", 50), 40, 100),
-        "price_pct_1y"  : norm(tech.get("price_pct_1y", 50), 50, 100),
-        "catalyst"      : tech.get("catalyst", 0.0),
-        # v17新增：趋势持续性分值，已在筛选循环中注入
+        "trend_strength": tech.get("trend_strength_score", 0.0),
         "persistence"   : tech.get("persistence_score", 0.0),
+        "catalyst"      : tech.get("catalyst", 0.0),
+        "price_pct_1y"  : norm(tech.get("price_pct_1y", 50), 50, 100),
     }
     return round(sum(SCORE_WEIGHTS[k] * v for k, v in scores.items()), 4)
-
 
 def calc_confidence(tech: dict, tier_level: str) -> float:
     base_map  = {"T1": 0.85, "T2": 0.75, "T3": 0.65, "T4": 0.55}
