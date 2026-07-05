@@ -1529,6 +1529,8 @@ def _build_screener_prompt(signal: dict, timeline: str, tier_label: str) -> str:
         for e in pe[:6]
     ) if pe else "  近6个月无±5%单日大幅波动"
 
+    tier_bonus_val = TIER_BONUS.get(t.get("tier_level", ""), 0.0)
+
     tech_block = (
         f"价格:{t['price']}({t['change_pct']:+.2f}%) | "
         f"1年历史分位:{pct_1y_str} | {vol_c_str}\n"
@@ -1538,10 +1540,11 @@ def _build_screener_prompt(signal: dict, timeline: str, tier_label: str) -> str:
         f"RS(vsXJO):{t['rs_vs_xjo']} ATR:{t['atr14_pct']}% "
         f"52W高:{t['w52_hi']}(距{t['dist_52w_hi_pct']}%) 低:{t['w52_lo']}\n"
         f"近6月最大回撤:{t['max_dd_6m_pct']}%\n"
-        f"综合评分:{t.get('composite_score', 'N/A')} "
-        f"趋势持续性:{t.get('persistence_score', 0.0)}\n"
-        f"均线多头排列:{'✅ MA20>MA50>MA200' if t.get('ma_aligned') else '❌ 未满足'} | "
-        f"高低点结构:{'✅ HH/HL已确认（近40日高点抬高+低点抬高）' if t.get('hh_hl') else '— 未确认'}"
+        f"趋势强度评分:{t.get('trend_strength_score', 'N/A')}"
+        f"（筛选/排序核心依据，0-1分，{tier_label}门槛为{TREND_SCORE_THRESHOLD.get(t.get('tier_level',''), 'N/A')}）\n"
+        f"趋势持续性:{t.get('persistence_score', 0.0)}（趋势维持时长，非当前强度）\n"
+        f"综合评分:{t.get('composite_score', 'N/A')}"
+        f"（已含{tier_label}层级加成+{tier_bonus_val}，不同层级间的绝对值不可直接横向比较）"
     )
 
     return f"""你是一位专注ASX市场的资深机构分析师。今天是{date.today().isoformat()}。
@@ -1562,7 +1565,7 @@ def _build_screener_prompt(signal: dict, timeline: str, tier_label: str) -> str:
 ===== 分析任务 =====
 请严格按以下4部分输出，每部分2-3句，语言精炼专业：
 
-【技术形态】结合1年历史分位和量能连续性，评估当前突破质量和支撑压力位。
+【技术形态】结合趋势强度评分和量能连续性，评估当前突破质量和支撑压力位。
 
 【事件驱动分析】对照价格波动节点和时间线，找出最重要的1-2个催化剂事件，
 判断市场是否已充分定价。
@@ -1573,10 +1576,11 @@ def _build_screener_prompt(signal: dict, timeline: str, tier_label: str) -> str:
 【综合结论】给出买入/观望/回避建议，说明止损位（基于ATR或关键支撑），
 以及最值得关注的一个上行/下行风险。
 
-规则：不确定内容标注"需进一步核查"，禁止编造数据。
+规则：不确定内容标注"需进一步核查"，禁止编造数据。趋势强度评分是本次分析的
+核心技术依据，请优先参考该指标而非其他辅助字段。
 
 ===== 固定输出字段（必须在分析末尾严格按格式输出，不得省略）=====
-【JSON_TAG_EN】（英文信号标签，2-4个词，如：Bullish Momentum / Range Break Setup / Overbought Pressure）
+【JSON_TAG_EN】（英文信号标签，2-4 words，如：Bullish Momentum / Range Break Setup / Overbought Pressure）
 【JSON_TAG_ZH】（中文信号标签，2-4个字，如：强势突破 / 区间试探 / 超买压力）
 【JSON_ONE_LINER_ZH】（一句中文核心解释，≤25字，描述当前技术或事件驱动的关键状态）
 【JSON_ONE_LINER_EN】（One English sentence, ≤20 words, same meaning as ZH above）"""
@@ -1593,15 +1597,28 @@ def _build_report_stock_block(ticker: str, tech: dict, fund: dict,
         for e in pe[:5]
     ) if pe else "近6个月无大幅波动"
 
+    trend_score = tech.get("trend_strength_score")
+    trend_score_str = (f"{trend_score}" if trend_score is not None
+                       else "N/A（非screener筛选信号，见下方降级模式说明）")
+
+    composite = tech.get("composite_score")
+    tier_level = tech.get("tier_level", "")
+    if composite is None:
+        composite_str = "N/A"
+        bonus_note = "（降级模式：大盘红灯或涨幅榜数据，未经tier筛选，无有效综合评分）"
+    else:
+        composite_str = f"{composite}"
+        tier_bonus_val = TIER_BONUS.get(tier_level, 0.0)
+        bonus_note = f"（已含层级加成+{tier_bonus_val}）"
+
     tech_line = (
         f"价格:{tech['price']}({tech['change_pct']:+.2f}%) {pct_1y_str} {vol_c_str}\n"
         f"MA50:{tech['ma50']} {ma200_str} RSI:{tech['rsi14']} ADX:{tech['adx14']} "
         f"量比:{tech['vol_ratio']}x RS:{tech['rs_vs_xjo']} "
         f"ATR:{tech['atr14_pct']}% 52W高:{tech['w52_hi']}(距{tech['dist_52w_hi_pct']}%)\n"
-        f"近6月最大回撤:{tech['max_dd_6m_pct']}% | 综合评分:{tech.get('composite_score','N/A')} "
-        f"趋势持续性:{tech.get('persistence_score', 0.0)}\n"
-        f"均线多头排列:{'✅ MA20>MA50>MA200' if tech.get('ma_aligned') else '❌ 未满足'} | "
-        f"高低点结构:{'✅ HH/HL已确认' if tech.get('hh_hl') else '— 未确认'}\n"
+        f"近6月最大回撤:{tech['max_dd_6m_pct']}%\n"
+        f"趋势强度评分:{trend_score_str} | 趋势持续性:{tech.get('persistence_score', 0.0)}\n"
+        f"综合评分:{composite_str}{bonus_note}\n"
         f"大涨大跌节点：{pe_str}"
     )
 
@@ -2717,8 +2734,13 @@ def run_report_flow(all_data: dict, market_snap: dict,
         log.info(f"  [#{rank}] {ticker} 构建日报数据包...")
         existing = next((s for s in (screener_signals or []) if s["ticker"] == ticker), None)
         tech     = existing if existing else build_tech_summary(df, xjo_s)
-        if "composite_score" not in tech:
+
+        if existing and "composite_score" not in tech:
             tech["composite_score"] = calc_composite_score(tech)
+        elif not existing:
+            tech["composite_score"] = None
+            log.info(f"  [{ticker}] 降级模式（大盘红灯/涨幅Movers），"
+                     f"不计算composite_score，避免展示无意义分数")
 
         fund      = existing if (existing and existing.get("company_name")) else fetch_fundamentals(ticker)
         ann_hist  = fetch_announcements(code, today_ann=today_ann)
