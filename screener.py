@@ -911,21 +911,38 @@ def get_top_movers(all_data: dict, top_n: int = TOP_N) -> list:
     log.info(f"Top {top_n} Movers: {[(t, f'{c:.1f}%') for t, c in top]}")
     return [t for t, _ in top]
 
+def fetch_fundamentals(ticker: str, retries: int = 3) -> dict:
+    for attempt in range(1, retries + 1):
+        try:
+            info = yf.Ticker(ticker).info
+            market_cap = info.get("marketCap", 0)
 
-def fetch_fundamentals(ticker: str) -> dict:
-    try:
-        info = yf.Ticker(ticker).info
-        return {
-            "company_name": info.get("longName", ticker),
-            "sector":       info.get("sector", "未知"),
-            "industry":     info.get("industry", "未知"),
-            "market_cap_m": round(info.get("marketCap", 0) / 1_000_000, 1),
-        }
-    except Exception as e:
-        log.warning(f"fetch_fundamentals失败 [{ticker}]: {e}")
-        return {"company_name": ticker, "sector": "未知",
-                "industry": "未知", "market_cap_m": 0.0}
+            # market_cap为0或None时，不能确定是真实市值为0还是请求本身
+            # 拿到了不完整数据，视为失败触发重试，而不是直接返回0
+            if not market_cap:
+                if attempt < retries:
+                    log.warning(f"fetch_fundamentals [{ticker}] 第{attempt}次: "
+                               f"marketCap为空，重试")
+                    time.sleep(1.5 * attempt)
+                    continue
+                else:
+                    log.error(f"fetch_fundamentals [{ticker}] 达到{retries}次仍无有效市值")
 
+            return {
+                "company_name": info.get("longName", ticker),
+                "sector":       info.get("sector", "未知"),
+                "industry":     info.get("industry", "未知"),
+                "market_cap_m": round(market_cap / 1_000_000, 1),
+            }
+        except Exception as e:
+            if attempt < retries:
+                log.warning(f"fetch_fundamentals失败 [{ticker}] 第{attempt}次: {e}，重试")
+                time.sleep(1.5 * attempt)
+            else:
+                log.error(f"fetch_fundamentals最终失败 [{ticker}]: {e}")
+
+    return {"company_name": ticker, "sector": "未知",
+            "industry": "未知", "market_cap_m": 0.0}
 
 def _ann_significance(headline: str, sensitive: bool,
                       doc_type: str, pdf_text: str, pub_date: str) -> int:
