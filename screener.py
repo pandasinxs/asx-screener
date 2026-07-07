@@ -1,13 +1,23 @@
 # ============================================================
-# ASX SYSTEM — screener.py  v17
+# ASX SYSTEM — screener.py  v18
 #
 # 流程一：EOD选股
 #   全市场K线 → T1-T4筛选 → Top3加权评分 → 新闻/公告时间线
-#   → Gemini深度分析 → Telegram → signals.json → GitHub推送
+#   → Gemini分析（纯Telegram阅读，不再产出JSON/SEO）
 #
-# 流程二：每日日报Prompt（不调用Gemini）
+# 流程二：SEO文章 + 信号JSON 合并生成（v18新增，取代原来从不触发的
+#   run_report_flow "seo" prompt）
+#   Top3 → 单次Gemini批量调用，产出：
+#     - 每只股票的英文SEO文章 + 中文SEO文章（Markdown，含frontmatter）
+#     - 每只股票的URL slug
+#     - 每只股票的信号标签字段（JSON_TAG/ONE_LINER，中英文）
+#   → 逐只校验（长度/frontmatter/标题数/FAQ） → 校验失败的股票跳过+
+#   Telegram告警，绝不用半成品覆盖线上内容 → 校验通过的文章写入
+#   src/content/blog/en|zh/ → signals.json重新生成 → 一次性git commit推送
+#
+# 流程三：每日日报Prompt（Twitter / 小红书，人工使用，不调用Gemini）
 #   Top3 Movers → 技术面+精选新闻+公告+PDF关键段落
-#   → 构建三平台Prompt → Telegram附件（SEO/Twitter/小红书）
+#   → 构建Prompt → Telegram附件
 #
 # v15新增（相对v14）：
 #   - signals_history表：记录全部T1-T4候选股（含落选），用于回测
@@ -34,6 +44,46 @@
 #     供 _check_trend_persistence() 使用，不对外展示
 #   - SCORE_WEIGHTS 新增 persistence 维度（权重0.10）
 #     其余权重等比下调，总和仍为1.0
+#
+# v18新增（相对v17，历史记录，部分内容已被v18.2取代）：
+#   - 首次尝试将Gemini分析与SEO文章合并为单次批量调用，
+#     该架构已在v18.2被用户否决，详见v18.2条目
+#
+# v18.1新增（相对v18，历史记录，部分内容已被v18.2取代）：
+#   - 曾短暂加入seo_article_log表做跨日防重复叙事，已在v18.2彻底删除
+#   - _write_seo_article_files() 新增 dir_en/dir_zh 可选参数，
+#     支持写入测试目录而不触碰线上BLOG_CONTENT_DIR（v18.2保留）
+#   - 新增 TEST_OUTPUT_DIR_EN/ZH + SEO_DRY_RUN 环境变量开关（v18.2保留）
+#
+# v18.2新增（相对v18.1，用户当轮反馈——当前实际架构）：
+#   - 【架构核心改动】分析(Telegram)+信号JSON(GitHub) 与 SEO文章(GitHub)
+#     彻底解耦为两条完全独立的流水线：
+#     ① run_screener_flow()：逐只调用Gemini做深度分析→Telegram，
+#        解析JSON标签字段→生成signals.json→立即push GitHub。
+#        这是v17原有行为，此次基本原样恢复，确保信号更新最快最稳定，
+#        不等待任何SEO文章调用
+#     ② run_seo_article_flow()：Top1/Top2/Top3各自独立调用一次Gemini
+#        （3次调用，每次1只股票，产出1篇英文+1篇中文SEO文章），
+#        每只股票独立校验、独立commit推送，互不连累
+#   - 不再有批量调用（v18.1的_build_seo_and_signal_prompt/
+#     _parse_seo_signal_response/_validate_seo_fields/
+#     run_seo_signal_flow 已重写为单只股票版本：
+#     _build_seo_article_prompt/_parse_seo_article_response/
+#     _validate_seo_article_fields/run_seo_article_flow）
+#   - GEMINI_CFG_SEO_BATCH 重命名为 GEMINI_CFG_SEO_ARTICLE
+#     （含义从"批量"变为"单篇"，参数值不变：max_output_tokens=65535，
+#     thinking_budget=1024）
+#   - push_to_github() 签名改为 (files: list, commit_message: str)，
+#     不再隐式默认signals.json文件，调用方必须显式传入文件列表和
+#     commit信息——避免"推signals.json"和"推SEO文章"两个独立场景
+#     共享一个隐藏默认值造成耦合
+#   - _parse_gemini_json_fields() 恢复（v18曾删除，v18.2按用户要求
+#     恢复原v17逻辑），_build_screener_prompt() 末尾"固定输出字段"
+#     段落同步恢复
+#   - 任意一只股票的SEO文章生成失败（Gemini无响应/校验不过/写入异常），
+#     除Telegram文字告警外，附带该股票专属的.txt Prompt供人工兜底，
+#     不影响另外两只股票的正常发布
+#   - seo_article_log表及配套跨日防重复叙事机制维持删除状态（v18.1已删）
 # ============================================================
 
 import os, io, re, sys, time, logging, json, subprocess
@@ -67,12 +117,27 @@ CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID", "")
 GEMINI_KEY     = os.environ.get("GEMINI_API_KEY", "")
 gemini_client  = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
+# v18.1新增：SEO试运行开关。设置环境变量 SEO_DRY_RUN=1 后跑main()，
+# run_seo_article_flow会走试跑模式（写测试目录+发Telegram审阅，
+# 不碰GitHub；signals.json不受此开关影响，仍由run_screener_flow正常推送）。
+# 调参阶段用这个开关，不用改代码。
+SEO_DRY_RUN = os.environ.get("SEO_DRY_RUN", "0") == "1"
+
 # ════════════════════════════════════════════════════════════
 # 1. 常量 & 配置
 # ════════════════════════════════════════════════════════════
 
 GEMINI_MODEL    = "gemini-2.5-flash"
 GEMINI_CFG_DEEP = {"thinking_config": {"thinking_budget": 512}}
+
+# v18.2改动：不再批量调用，改为逐只股票单独调用（每次1篇英文+1篇中文），
+# 单次输出量比v18的批量版（3只×双语）小得多，但依然保留生成的max_output_tokens
+# 上限（Gemini 2.5 Flash官方文档记录的实际上限），进一步降低截断风险。
+GEMINI_CFG_SEO_ARTICLE = {
+    "thinking_config": {"thinking_budget": 1024},
+    "max_output_tokens": 65535,
+}
+
 RETRY_MAX       = 20
 RETRY_WAIT      = 30
 TIMEOUT         = 15
@@ -80,6 +145,19 @@ TOP_N           = 3
 
 ASXBOX_REPO  = os.path.expanduser("~/asxbox")
 SIGNALS_DIR  = os.path.join(ASXBOX_REPO, "src", "data", "signals")
+
+# v18新增：SEO文章目录（Astro content collection结构，已与用户确认）
+BLOG_CONTENT_DIR_EN = os.path.join(ASXBOX_REPO, "src", "content", "blog", "en")
+BLOG_CONTENT_DIR_ZH = os.path.join(ASXBOX_REPO, "src", "content", "blog", "zh")
+
+# v18.1新增：测试模式专用目录，与线上BLOG_CONTENT_DIR完全隔离，
+# 试运行时文章写在这里，绝不触碰ASXBOX_REPO的git工作区，
+# 避免测试内容被意外扫进下一次真实commit
+TEST_OUTPUT_DIR_EN = os.path.expanduser("~/asx_seo_test_output/en")
+TEST_OUTPUT_DIR_ZH = os.path.expanduser("~/asx_seo_test_output/zh")
+
+SEO_ARTICLE_MIN_CHARS = 600   # 正文最低字数（不含frontmatter），低于此视为生成失败
+# v18.1：SEO_RECENT_LOOKBACK_DAYS 及 seo_article_log 防重复叙事机制已按用户要求删除
 
 ASX_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
@@ -678,9 +756,11 @@ def calc_trend_strength_score(tech: dict, tier: dict) -> dict:
     }
 
 # ════════════════════════════════════════════════════════════
-# JSON字段提取 & signals.json生成 & GitHub推送
+# signals.json生成 & GitHub推送
 # ════════════════════════════════════════════════════════════
 
+# v18.2恢复：分析Gemini调用重新自己解析JSON标签字段（v17原有逻辑），
+# 与SEO文章生成彻底解耦——signals.json的更新不再等待任何SEO调用。
 def _parse_gemini_json_fields(text: str) -> dict:
     patterns = {
         "tag_en":       r"【JSON_TAG_EN】(.+)",
@@ -729,21 +809,29 @@ def generate_signals_json(signals: list) -> bool:
         return False
 
 
-def push_to_github() -> bool:
-    today_str = date.today().isoformat()
+def push_to_github(files: list, commit_message: str) -> bool:
+    """
+    v18.2改动：不再隐式默认signals.json文件，改为调用方显式传入
+    要提交的文件相对路径列表和commit信息。原因：现在有两种完全独立的
+    调用场景——① run_screener_flow推signals.json（最高优先级，第一时间
+    更新）② run_seo_article_flow逐只推单只股票的md文件——两者不应该
+    共享一个隐藏的"默认总是带上signals.json"假设，否则两个场景互相
+    耦合，任何一边改动都可能悄悄影响另一边。
+    """
+    if not files:
+        log.info("push_to_github: 文件列表为空，跳过")
+        return True
     try:
         r = subprocess.run(
             ["git", "-C", ASXBOX_REPO, "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True, text=True, timeout=10
         )
         branch = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "main"
-        log.info(f"push_to_github: 使用branch={branch}")
+        log.info(f"push_to_github: branch={branch}，文件={files}")
         cmds = [
             ["git", "-C", ASXBOX_REPO, "pull", "--no-rebase", "origin", branch],
-            ["git", "-C", ASXBOX_REPO, "add",
-             "src/data/signals/en.json", "src/data/signals/zh.json"],
-            ["git", "-C", ASXBOX_REPO, "commit",
-             "-m", f"chore: update signals {today_str}"],
+            ["git", "-C", ASXBOX_REPO, "add"] + files,
+            ["git", "-C", ASXBOX_REPO, "commit", "-m", commit_message],
             ["git", "-C", ASXBOX_REPO, "push", "origin", branch],
         ]
         for cmd in cmds:
@@ -756,7 +844,7 @@ def push_to_github() -> bool:
                           f"stdout:{result.stdout}\nstderr:{result.stderr}")
                 return False
             log.info(f"git: {' '.join(cmd[2:])} → OK")
-        log.info(f"push_to_github: 推送成功 [{today_str}] branch={branch}")
+        log.info(f"push_to_github: 推送成功 branch={branch}")
         return True
     except subprocess.TimeoutExpired:
         log.error("push_to_github: git超时")
@@ -975,7 +1063,7 @@ _today_ann_cache: dict = {}
 
 
 def _init_ann_db() -> None:
-    """初始化SQLite（announcements + signals_history两张表）"""
+    """初始化SQLite（announcements + signals_history 两张表）"""
     import sqlite3
     try:
         with sqlite3.connect(ANN_DB_PATH) as conn:
@@ -1037,6 +1125,7 @@ def _init_ann_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_sh_outcome "
                 "ON signals_history(outcome)"
             )
+            # v18.1：seo_article_log表已按用户要求删除（不再做跨日防重复叙事）
             conn.commit()
         log.info(f"公告数据库就绪：{ANN_DB_PATH}")
     except Exception as e:
@@ -1440,22 +1529,91 @@ def build_timeline_text(code: str, announcements: list, news: list,
             lines.append(f"{e['date']}  {e['text']}")
     return "\n".join(lines[:20]) if lines else "暂无近期公告/新闻"
 
+
+# ════════════════════════════════════════════════════════════
+# v18新增：SEO文章辅助函数（安全文件名清洗）
+# v18.1：_get_recent_seo_angles / _save_seo_article_log 已按用户要求删除
+# ════════════════════════════════════════════════════════════
+
+def _extract_frontmatter_title(md_content: str) -> str:
+    """从生成的Markdown里提取title字段，仅用于日志记录，失败不影响主流程。"""
+    m = re.search(r'title:\s*"([^"]*)"', md_content)
+    return m.group(1) if m else ""
+
+
+def _sanitize_slug(raw: str) -> str:
+    """
+    文件名安全清洗：绝不直接信任Gemini输出的字符串去拼文件路径，
+    只保留小写字母/数字，其余一律转连字符，防止路径穿越或非法文件名。
+    """
+    s = raw.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s[:60]
+
+
 # ════════════════════════════════════════════════════════════
 # 4. Gemini
 # ════════════════════════════════════════════════════════════
 
-def ask_gemini(prompt: str, label: str = "") -> str:
+def ask_gemini(prompt: str, label: str = "", config: Optional[dict] = None,
+               return_meta: bool = False):
+    """
+    调用Gemini生成内容。
+
+    v18新增两个可选参数（向后兼容，不传时行为与v17完全一致）：
+      config      ：覆盖默认的GEMINI_CFG_DEEP，SEO文章调用使用独立的
+                    GEMINI_CFG_SEO_ARTICLE（更大的max_output_tokens）
+      return_meta ：True时返回(text, finish_reason, thoughts_tokens,
+                    output_tokens)四元组，用于诊断MAX_TOKENS截断——
+                    Gemini 2.5系列的thinking token与正文token共享
+                    同一个max_output_tokens预算池，且thinking_budget
+                    不保证被严格遵守，一旦真的触发截断，这里能给出
+                    精确的token消耗数字，而不是靠正则猜测。
+                    False（默认）时只返回文本字符串，与旧调用方完全兼容。
+    """
+    empty_result = ("", "", 0, 0) if return_meta else ""
     if not gemini_client:
         log.warning("Gemini未配置")
-        return ""
+        return empty_result
+
+    cfg = config if config is not None else GEMINI_CFG_DEEP
     for attempt in range(1, RETRY_MAX + 1):
         try:
             resp = gemini_client.models.generate_content(
-                model=GEMINI_MODEL, contents=prompt, config=GEMINI_CFG_DEEP
+                model=GEMINI_MODEL, contents=prompt, config=cfg
             )
             if attempt > 1:
                 log.info(f"Gemini成功 [{label}] 第{attempt}次")
-            return resp.text.strip()
+
+            try:
+                text = resp.text.strip() if resp.text else ""
+            except Exception as text_e:
+                log.warning(f"ask_gemini: resp.text提取失败 [{label}]: {text_e}")
+                text = ""
+
+            if not return_meta:
+                return text
+
+            finish_reason, thoughts_tokens, output_tokens = "", 0, 0
+            try:
+                if resp.candidates:
+                    finish_reason = str(getattr(resp.candidates[0], "finish_reason", "") or "")
+                usage = getattr(resp, "usage_metadata", None)
+                if usage:
+                    thoughts_tokens = getattr(usage, "thoughts_token_count", 0) or 0
+                    output_tokens   = getattr(usage, "candidates_token_count", 0) or 0
+            except Exception as meta_e:
+                log.debug(f"ask_gemini: 提取finish_reason/usage_metadata失败 [{label}]: {meta_e}")
+
+            if finish_reason and "MAX_TOKENS" in finish_reason.upper():
+                log.warning(
+                    f"ask_gemini [{label}]: finish_reason=MAX_TOKENS "
+                    f"(thinking={thoughts_tokens} output={output_tokens} "
+                    f"limit={cfg.get('max_output_tokens', 'N/A')})"
+                )
+            return text, finish_reason, thoughts_tokens, output_tokens
+
         except Exception as e:
             err = str(e)
             if any(k in err for k in ("429", "503", "RESOURCE_EXHAUSTED", "overloaded", "quota")):
@@ -1464,11 +1622,11 @@ def ask_gemini(prompt: str, label: str = "") -> str:
                     time.sleep(RETRY_WAIT)
                 else:
                     log.error(f"Gemini [{label}] 达到10分钟上限，放弃")
-                    return ""
+                    return empty_result
             else:
                 log.error(f"Gemini不可重试错误 [{label}]: {err}")
-                return ""
-    return ""
+                return empty_result
+    return empty_result
 
 # ════════════════════════════════════════════════════════════
 # 5. Telegram
@@ -1636,6 +1794,305 @@ def _build_report_stock_block(ticker: str, tech: dict, fund: dict,
     return block
 
 
+# ════════════════════════════════════════════════════════════
+# v18新增：SEO文章 + 信号JSON 合并批量Prompt构建 / 解析 / 校验 / 写入
+# ════════════════════════════════════════════════════════════
+
+def _build_seo_article_prompt(market_snap: dict, stock_package: dict) -> str:
+    """
+    v18.2改动：单只股票独立调用（不再批量3只一次性调用）。
+    信号标签字段（JSON_TAG/ONE_LINER）已不再由这里产出——那部分已经
+    恢复到_build_screener_prompt()里，由screener分析调用负责。
+    这里只负责一件事：一篇英文SEO文章 + 一篇中文SEO文章 + 一个slug。
+    结构要求（frontmatter/8章节/FAQ/风格铁律/硬性约束/自检环节）
+    完整保留，不因为改成单只调用而删减。
+    """
+    sector_str = "、".join(
+        f"{s}({p:+.1f}%)" for s, p in market_snap.get("sector_leaders", [])
+    ) or "数据暂缺"
+    status_map = {
+        "red": "大幅下跌⚠️", "yellow": "轻微走弱",
+        "bullish": "强势上涨", "normal": "窄幅震荡",
+    }
+    market_block = (
+        f"Date: {market_snap.get('date', date.today().isoformat())}\n"
+        f"ASX200: {market_snap.get('xjo_close',0)} "
+        f"({market_snap.get('xjo_change_pct',0):+.2f}%, "
+        f"{status_map.get(market_snap.get('market_status','normal'),'normal')})\n"
+        f"Sector leaders today: {sector_str}"
+    )
+
+    ticker = stock_package["ticker"]
+    data_block = stock_package["data_block"]
+
+    return f"""You are a professional ASX equity research analyst and SEO content engine.
+
+Your task is to generate a high-quality END-OF-DAY (EOD) stock analysis article for the ONE
+stock provided below.
+
+This content is designed for:
+- SEO indexing (Google search traffic)
+- Retail trader education
+- Post-market strategy interpretation
+- Content automation pipeline feeding a live website
+
+-------------------------------------------------
+MARKET CONTEXT
+-------------------------------------------------
+{market_block}
+
+-------------------------------------------------
+STOCK PACKAGE: {ticker}
+-------------------------------------------------
+{data_block}
+
+-------------------------------------------------
+CRITICAL CONTEXT
+-------------------------------------------------
+This is END-OF-DAY (EOD) data.
+
+You MUST:
+- Use full-session price action (NOT intraday signals)
+- Focus on closing behavior, not triggers
+- Avoid VWAP, entry signals, or intraday mechanics
+- Avoid any "real-time execution framing"
+- Disregard word count limits. Deliver high-density, comprehensive content without any fluff.
+
+-------------------------------------------------
+OUTPUT REQUIREMENT (STRICT)
+-------------------------------------------------
+For this stock you MUST generate:
+1. One English SEO article in Markdown
+2. One Chinese SEO article in Markdown (independent narrative, NOT a literal translation of #1)
+3. An English URL slug (3–6 words, lowercase, hyphenated, no stock ticker in it, reflecting
+   the dominant theme of this article)
+
+-------------------------------------------------
+ARTICLE STRUCTURE (SEO + TRADING HYBRID) — required for both EN and ZH versions
+-------------------------------------------------
+
+## 1. YAML Front Matter (mandatory)
+Include:
+- title (SEO optimized, natural language)
+- description (1–2 sentences, search oriented)
+- pubDate (YYYY-MM-DD)
+
+Ensure all string values are wrapped in double quotes, e.g.:
+title: "[Insert Title Here]"
+description: "[Insert Description Here]"
+pubDate: "{date.today().isoformat()}"
+
+## 2. Market Context Section
+- ASX200 performance
+- sector leadership
+- macro tone (risk-on / risk-off / rotation)
+
+## 3. Stock Overview
+- company name
+- sector
+- market cap (if provided)
+- positioning summary (1 paragraph)
+
+## 4. Technical Analysis (EOD-based)
+Must include:
+- MA50 / MA200 trend structure
+- RSI interpretation (not just the value)
+- ADX trend strength interpretation
+- volume confirmation or lack of it
+- proximity to 52-week high/low
+
+IMPORTANT:
+- This is NOT a trading signal section
+- Do NOT include entry/exit triggers
+- Do NOT use VWAP or intraday logic
+
+## 5. Catalyst & Narrative Flow (MOST IMPORTANT)
+You must build a STORY, not a list.
+Structure: Catalyst → Market reaction → Confirmation → Interpretation
+Rules:
+- Prioritize narrative continuity
+- If no direct catalyst exists, explain macro/sector/flow-driven narrative
+- Always explain "why now"
+
+## 6. EOD Outlook
+- continuation vs exhaustion vs consolidation
+- next session bias (soft directional expectation)
+- key resistance/support zones (NOT trigger-based)
+
+## 7. Conclusion
+- one paragraph synthesis
+- classify stock behavior (e.g. trend continuation / range-bound / breakout attempt)
+
+## 8. FAQ Section (SEO-critical, flexible generation)
+Include at least 4 questions. Questions are NOT fixed, but must collectively cover:
+1. Driver Explanation Intent — Why did the stock move today?
+2. Sustainability Intent — Is the move likely to continue or fade?
+3. Market Structure Intent — What key levels or price zones matter?
+4. Forward Scenario Intent — What is the most likely next market behavior?
+
+Rules:
+- Questions must be natural and not repetitive across articles
+- Must adapt to stock-specific narrative (no template reuse)
+- Must reflect actual catalyst/structure of the stock
+- Must optimize for long-tail search variation
+
+-------------------------------------------------
+STYLE RULES
+-------------------------------------------------
+- No repetitive sentence structures across sections
+- No rigid templates or robotic phrasing
+- Prioritize interpretation over data dumping
+- Maintain analyst tone, not news reporter tone
+- Maintain narrative coherence across the full article
+- The Chinese version must read as independently written, not translated
+
+-------------------------------------------------
+HARD CONSTRAINTS
+-------------------------------------------------
+- NO intraday mechanics (VWAP, entry trigger, breakout triggers)
+- NO real-time trading instructions
+- NO deterministic predictions
+- NO repeated phrasing across languages
+- NO hallucinated data
+- If data is missing, explicitly state: "Cannot verify due to missing dataset" (EN) /
+  "数据待核实" (ZH)
+
+-------------------------------------------------
+OUTPUT FORMAT (STRICT — nothing outside these markers, no preamble, no closing remarks)
+-------------------------------------------------
+
+【SEO_SLUG】english-slug-here【/SEO_SLUG】
+【SEO_EN】
+```markdown
+(full English article including frontmatter)
+```
+【/SEO_EN】
+【SEO_ZH】
+```markdown
+(full Chinese article including frontmatter)
+```
+【/SEO_ZH】
+
+(Do not add any text before 【SEO_SLUG】 or after the closing 【/SEO_ZH】.)
+
+-------------------------------------------------
+BACKTEST BEFORE FINAL OUTPUT (MANDATORY EXECUTION)
+-------------------------------------------------
+1. First, generate an internal draft for self-backtesting.
+2. Verify it meets all requirements above: SEO best practices, strong independent perspective,
+   no regulatory/legal violations, no hallucinated data.
+3. Verify you have exactly one EN article + one ZH article + one slug.
+4. Verify every marker above is spelled exactly as specified.
+5. Skip any explanation of this process — output ONLY the final version, using the exact
+   marker format above."""
+
+
+def _parse_seo_article_response(raw_text: str, ticker: str,
+                                 gemini_meta: Optional[dict] = None) -> dict:
+    """
+    v18.2改动：单只股票解析，不再需要按ticker拆block（每次调用本来就只有
+    一只股票）。只提取slug/英文文章/中文文章，JSON标签字段不再由这里产出。
+
+    gemini_meta（可选）：{"finish_reason", "thoughts_tokens", "output_tokens"}
+    用于在marker缺失时给出精确失败原因，而不是"疑似截断"这种猜测性描述。
+    """
+    gemini_meta     = gemini_meta or {}
+    finish_reason   = gemini_meta.get("finish_reason", "")
+    thoughts_tokens = gemini_meta.get("thoughts_tokens", 0)
+    output_tokens   = gemini_meta.get("output_tokens", 0)
+
+    def _extract(tag: str) -> str:
+        mm = re.search(rf"【{tag}】(.*?)【/{tag}】", raw_text, re.DOTALL)
+        return mm.group(1).strip() if mm else ""
+
+    slug       = _extract("SEO_SLUG")
+    seo_en_raw = _extract("SEO_EN")
+    seo_zh_raw = _extract("SEO_ZH")
+
+    seo_en_raw = re.sub(r"^```(?:markdown)?\s*\n?", "", seo_en_raw)
+    seo_en_raw = re.sub(r"\n?```\s*$", "", seo_en_raw).strip()
+    seo_zh_raw = re.sub(r"^```(?:markdown)?\s*\n?", "", seo_zh_raw)
+    seo_zh_raw = re.sub(r"\n?```\s*$", "", seo_zh_raw).strip()
+
+    valid = bool(slug and seo_en_raw and seo_zh_raw)
+    fail_reason = ""
+    if not valid:
+        missing = [n for n, v in
+                   [("SEO_SLUG", slug), ("SEO_EN", seo_en_raw), ("SEO_ZH", seo_zh_raw)]
+                   if not v]
+        if finish_reason and "MAX_TOKENS" in finish_reason.upper():
+            fail_reason = (f"确认被MAX_TOKENS截断（thinking消耗{thoughts_tokens} token，"
+                            f"正文消耗{output_tokens} token），缺失字段:{missing}")
+        else:
+            fail_reason = f"必需marker缺失:{missing}"
+        log.warning(f"_parse_seo_article_response: [{ticker}] {fail_reason}")
+
+    return {
+        "slug": slug, "seo_en_raw": seo_en_raw, "seo_zh_raw": seo_zh_raw,
+        "_valid": valid, "_fail_reason": fail_reason,
+    }
+
+
+def _validate_seo_article_fields(fields: dict) -> tuple:
+    """
+    任何一项不通过 → 这只股票的文章本次跳过，绝不用半成品覆盖GitHub。
+    v18.2改动：去掉JSON_TAG/ONE_LINER相关校验（这些字段已不在这次调用产出）。
+    """
+    if not fields.get("_valid", False):
+        return False, fields.get("_fail_reason", "解析失败")
+
+    for key, label in [("seo_en_raw", "英文文章"), ("seo_zh_raw", "中文文章")]:
+        content = fields.get(key, "")
+        if len(content) < SEO_ARTICLE_MIN_CHARS:
+            return False, f"{label}长度不足({len(content)}字符)"
+        if not content.strip().startswith("---"):
+            return False, f"{label}frontmatter格式错误（未以---开头）"
+        if "title:" not in content or "pubdate:" not in content.lower():
+            return False, f"{label}缺少frontmatter必需字段(title/pubDate)"
+        if content.count("## ") < 5:
+            return False, f"{label}二级标题数量不足(<5)，结构可能不完整"
+        if "faq" not in content.lower():
+            return False, f"{label}缺少FAQ部分"
+
+    slug_clean = _sanitize_slug(fields.get("slug", ""))
+    if not slug_clean:
+        return False, f"slug清洗后为空(原始值:{fields.get('slug','')!r})"
+    fields["slug_clean"] = slug_clean
+
+    return True, ""
+
+
+def _write_seo_article_files(ticker: str, slug: str, content_en: str, content_zh: str,
+                              dir_en: Optional[str] = None, dir_zh: Optional[str] = None) -> tuple:
+    """
+    文件名格式（已与用户确认，固定不变）：
+        {YYYY-MM-DD}-{完整ticker含.AX}-{slug}.md
+        例：2026-07-07-BHP.AX-iron-ore-rally-continuation.md
+    中英文文件用完全相同的文件名，只是分别存放在不同目录。
+    文件名不依赖Gemini输出的整体格式——Gemini只负责生成slug这一个
+    3-6个单词的短语（通过SEO_SLUG marker提取），日期和ticker都是
+    外部代码拼装的，slug本身还会经过_sanitize_slug()二次清洗
+    （只保留小写字母数字和连字符），所以最终文件名的正确性不依赖
+    Gemini有没有守规矩。
+
+    v18.1新增dir_en/dir_zh参数：不传时使用线上真实目录
+    （BLOG_CONTENT_DIR_EN/ZH）；试运行(dry_run)时由调用方传入
+    TEST_OUTPUT_DIR_EN/ZH，两套目录完全隔离。
+    """
+    dir_en = dir_en or BLOG_CONTENT_DIR_EN
+    dir_zh = dir_zh or BLOG_CONTENT_DIR_ZH
+    filename = f"{date.today().isoformat()}-{ticker}-{slug}.md"
+    os.makedirs(dir_en, exist_ok=True)
+    os.makedirs(dir_zh, exist_ok=True)
+    path_en = os.path.join(dir_en, filename)
+    path_zh = os.path.join(dir_zh, filename)
+    with open(path_en, "w", encoding="utf-8") as f:
+        f.write(content_en)
+    with open(path_zh, "w", encoding="utf-8") as f:
+        f.write(content_zh)
+    return path_en, path_zh
+
+
 def serialize_to_prompt(market_snap: dict, stocks_block: str, platform: str) -> str:
     sector_str = "、".join(
         f"{s}({p:+.1f}%)" for s, p in market_snap.get("sector_leaders", [])
@@ -1653,186 +2110,6 @@ def serialize_to_prompt(market_snap: dict, stocks_block: str, platform: str) -> 
     )
 
     instructions = {
-        "seo": """You are a professional ASX equity research analyst and SEO content engine.
-
-Your task is to generate a high-quality END-OF-DAY (EOD) stock analysis article based on structured market data.
-
-This content is designed for:
-- SEO indexing (Google search traffic)
-- Retail trader education
-- Post-market strategy interpretation
-- Content automation pipeline
-
-Input data contain data of up to 3 stocks. Generate SEO articles for each stock.
-
--------------------------------------------------
-CRITICAL CONTEXT
--------------------------------------------------
-This is END-OF-DAY (EOD) data.
-
-You MUST:
-- Use full-session price action (NOT intraday signals)
-- Focus on closing behavior, not triggers
-- Avoid VWAP, entry signals, or intraday mechanics
-- Avoid any "real-time execution framing"
-- Disregard word count limits. Deliver high-density, comprehensive content without any fluff.
-
--------------------------------------------------
-OUTPUT REQUIREMENT (STRICT)
--------------------------------------------------
-You MUST generate:
-
-1. English SEO articles for each stock provided in Markdown format
-2. Chinese SEO article for each stock provided in Markdown format
-
-Each article must be output in a separate code block.
-
--------------------------------------------------
-FILE NAMING RULE
--------------------------------------------------
-Before each article‘s output, provide filenames:
-
-Format:
-YYYY-MM-DD-TICKER-KEYTHEME.md
-
-Example:
-2026-06-17-AIA.AX-approaching-resistance.md
-
-Key theme must reflect dominant narrative:
-(e.g. breakout, earnings momentum, resistance test, trend continuation)
-
--------------------------------------------------
-ARTICLE STRUCTURE (SEO + TRADING HYBRID)
--------------------------------------------------
-
-Each article MUST include:
-
-## 1. YAML Front Matter (mandatory)
-
-Include:
-- title (SEO optimized, natural language)
-- description (1–2 sentences, search oriented)
-- pubDate (YYYY-MM-DD)
-
-note: ensuring the content is wrapped in double quotes
-(for example)
-1, title: "[Insert Title Here]"
-2, description: "[Insert Description Here]"
-
--------------------------------------------------
-
-## 2. Market Context Section
-- ASX200 performance
-- sector leadership
-- macro tone (risk-on / risk-off / rotation)
-
--------------------------------------------------
-
-## 3. Stock Overview
-- company name
-- sector
-- market cap (if provided)
-- positioning summary (1 paragraph)
-
--------------------------------------------------
-
-## 4. Technical Analysis (EOD-based)
-Must include:
-- MA50 / MA200 trend structure
-- RSI interpretation (not just value)
-- ADX trend strength interpretation
-- volume confirmation or lack of it
-- proximity to 52-week high/low
-
-IMPORTANT:
-- This is NOT a trading signal section
-- Do NOT include entry/exit triggers
-- Do NOT use VWAP or intraday logic
-
--------------------------------------------------
-
-## 5. Catalyst & Narrative Flow (MOST IMPORTANT)
-You must build a STORY, not a list.
-
-Structure:
-- Catalyst → Market reaction → Confirmation → Interpretation
-
-Rules:
-- Prioritize narrative continuity
-- If no direct catalyst exists, explain macro/sector/flow-driven narrative
-- Always explain "why now"
-
--------------------------------------------------
-
-## 6. EOD Outlook
-- continuation vs exhaustion vs consolidation
-- next session bias (soft directional expectation)
-- key resistance/support zones (NOT trigger-based)
-
--------------------------------------------------
-
-## 7. Conclusion
-- one paragraph synthesis
-- classify stock behavior (e.g. trend continuation / range-bound / breakout attempt)
-
--------------------------------------------------
-
-## 8. FAQ Section (SEO-critical, flexible generation)
-
-You must include a FAQ section with at least 4 questions.
-
-However, questions are NOT fixed.
-
-Instead, they must collectively cover these intent categories:
-
-1. Driver Explanation Intent
-   - Why did the stock move today?
-
-2. Sustainability Intent
-   - Is the move likely to continue or fade?
-
-3. Market Structure Intent
-   - What key levels or price zones matter?
-
-4. Forward Scenario Intent
-   - What is the most likely next market behavior?
-
-Rules:
-- Questions must be natural and not repetitive across articles
-- Must adapt to stock-specific narrative (no template reuse)
-- Must reflect actual catalyst/structure of the stock
-- Must optimize for long-tail search variation
-
--------------------------------------------------
-
-## STYLE RULES
-- No repetitive sentence structures across sections
-- No rigid templates or robotic phrasing
-- Prioritize interpretation over data dumping
-- Maintain analyst tone, not news reporter tone
-- Maintain narrative coherence across full article
-
--------------------------------------------------
-HARD CONSTRAINTS
--------------------------------------------------
-- NO intraday mechanics (VWAP, entry trigger, breakout triggers)
-- NO real-time trading instructions
-- NO deterministic predictions
-- NO repeated phrasing across languages
-- NO hallucinated data
-
-If data is missing, explicitly state:
-"Cannot verify due to missing dataset"
-
--------------------------------------------------
-Backtest Before Final Output (Mandatory Execution)
-
-1, First, generate an initial draft of the copy for self-backtesting. 
-2, Verify that it meets all prompt requirements, complies with SEO best practices, delivers a strong personal perspective, and contains no regulatory or legal violations. 
-3, Double check the format of the content and make sure 1 English article and 1 Chinese article for each stock. 
-4, Skip any explanations of your process—output only the final version of the copy.
-""",
-
         "twitter": """You are an event-driven ASX equity trader generating high-signal X (Twitter) content.
 
 INPUT:
@@ -1949,8 +2226,8 @@ Do NOT label these explicitly.
 
 ❌ HARD ANTI-FILLER RULES
 
-- No generic phrases (“interesting”, “market watching”, etc.)
-- No “suggests / indicates / therefore / because”
+- No generic phrases ("interesting", "market watching", etc.)
+- No "suggests / indicates / therefore / because"
 - No essay-style explanations
 - No repeated sentence structures
 - No macro market commentary
@@ -1962,7 +2239,7 @@ Do NOT label these explicitly.
 Across each tweet:
 
 - Max 1–2 uncertainty expressions total
-- At least 1 emotional reaction (e.g. “feels crowded”, “not clean”, “too smooth”)
+- At least 1 emotional reaction (e.g. "feels crowded", "not clean", "too smooth")
 - At least 1 incomplete thought
 - At least 1 subtle contradiction
 - Conviction must vary across tweets
@@ -1997,7 +2274,7 @@ Avoid:
 - No titles
 - No extra text
 - No explanations
-- if ticker is mentioned in a tweet, ticker format must be for instance“$BHP.AX”
+- if ticker is mentioned in a tweet, ticker format must be for instance"$BHP.AX"
 
 --------------------------------------------------
 
@@ -2019,8 +2296,8 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 
 ━━━━━━━━━━━━━━
 核心定义
-“盲盒” = 股票（用于隐喻表达，规避平台审查）
-全文统一使用“盲盒”，不使用“股票/标的”。
+"盲盒" = 股票（用于隐喻表达，规避平台审查）
+全文统一使用"盲盒"，不使用"股票/标的"。
 盲盒使用的股票代码，不能包含后缀.AX
 
 ━━━━━━━━━━━━━━
@@ -2038,7 +2315,7 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 ━━━━━━━━━━━━━━
 一、标题
 
-类似“让我们打开今天的盲盒”的一句话
+类似"让我们打开今天的盲盒"的一句话
 （仅作参考，类似表达即可，但必须包含盲盒）
 
 ━━━━━━━━━━━━━━
@@ -2059,9 +2336,9 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 
 要求：
 
-- 参考表达“我上月看它发生哪一件事，结果是怎么样，然后今天发生了什么事，有什么变化”
+- 参考表达"我上月看它发生哪一件事，结果是怎么样，然后今天发生了什么事，有什么变化"
 
-- 像“持续观察者视角”，不是一次性解读
+- 像"持续观察者视角"，不是一次性解读
 
 --------------------------------
 3. 用一句话分析
@@ -2116,7 +2393,7 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 """,
     }
 
-    instruction = instructions.get(platform, instructions["seo"])
+    instruction = instructions.get(platform, instructions["twitter"])
 
     return f"""📋 <b>ASX日报Prompt — {platform.upper()} — {market_snap.get('date','')}</b>
 
@@ -2294,7 +2571,7 @@ def select_top3(all_data: dict, market_snap: dict,
         filtered_pool.append(s)
 
     # Top3：仍然是市值过滤后的候选池里排名最前的3只，
-    # 用于JSON推送/Gemini分析/详细Telegram，逻辑不变
+    # 用于JSON推送/SEO文章/Gemini分析/详细Telegram，逻辑不变
     signals = filtered_pool[:TOP_N]
 
     tier_summary = {}
@@ -2568,6 +2845,12 @@ def run_threshold_scan(all_data: dict, market_snap: dict,
         log.info("")
 
 def run_screener_flow(all_data: dict, market_snap: dict) -> list:
+    """
+    v18.2：T1-T4筛选 + Gemini逐只深度分析 → Telegram + 解析JSON标签字段
+    → 生成signals.json → push GitHub。这是v17原有行为的恢复，与SEO文章
+    生成（run_seo_article_flow）彻底解耦——signals.json的更新不等待
+    任何SEO调用，保证信号发布是最快最稳定的一环。
+    """
     today   = date.today().strftime("%Y-%m-%d")
     start   = time.time()
     status  = market_snap.get("market_status", "normal")
@@ -2579,16 +2862,10 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
 
     today_ann = fetch_today_announcements()
 
-    # 获取T1-T4的Top3 signals（select_top3内部已写signals_history和watchlist，
-    # 这里不再重复写watchlist——之前重复调用upsert_watchlist会导致
-    # 同一批Top3股票的监测天数被错误地翻倍累加）
     signals, raw_signals, tier_label, tier_level = select_top3(all_data, market_snap)
 
-    # 修复：elapsed_screen在这里补上定义（原来筛选循环结束时算的这个值，
-    # 拆分到select_top3()后这里丢失了，导致下面引用时NameError崩溃）
     elapsed_screen = round((time.time() - start) / 60, 1)
 
-    # 每日验证记录（新阈值观察期，不影响正式流程，纯本地文件写入）
     log_tier_validation(raw_signals, signals, tier_label, market_snap)
 
     if not signals:
@@ -2599,7 +2876,6 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         )
         return []
 
-    # 汇总消息
     send_telegram(
         f"📊 <b>{market_label}ASX扫描完成 {today}</b>\n\n"
         f"ASX200：{xjo_pct:+.2f}%  |  扫描：{len(all_data)} 只  |  耗时：{elapsed_screen}分钟\n"
@@ -2613,11 +2889,8 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         + market_note
     )
 
-    # 注：写入watchlist的逻辑已经在select_top3()内部完成，
-    # 这里不再重复调用wdb.upsert_watchlist()，
-    # 避免同一批股票的监测天数被重复累加两次
-
-    # Top3逐只Gemini深度分析
+    # Top3逐只Gemini深度分析（Telegram阅读 + 解析JSON标签字段，
+    # 用于下面生成signals.json；SEO文章由run_seo_article_flow单独负责）
     log.info(f"深度分析 Top {len(signals)} 只（Gemini）...")
     for idx, s in enumerate(signals, 1):
         code = s["ticker"].replace(".AX", "")
@@ -2633,6 +2906,8 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         if not analysis:
             analysis = "⚠️ Gemini分析暂时不可用"
 
+        # v18.2恢复：JSON标签字段解析+confidence计算，回到v17原有逻辑，
+        # 与SEO文章生成彻底解耦，signals.json不再等待任何SEO调用
         json_fields             = _parse_gemini_json_fields(analysis)
         s["_json_tag_en"]       = json_fields.get("tag_en", "")
         s["_json_tag_zh"]       = json_fields.get("tag_zh", "")
@@ -2672,17 +2947,21 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         )
         time.sleep(1.0)
 
-    # signals.json → GitHub
+    # v18.2恢复：signals.json生成 + GitHub推送，独立于SEO文章，
+    # 最高优先级，第一时间更新，不等任何SEO调用结果
     valid_signals = [s for s in signals if s.get("_json_valid")]
     log.info(f"生成signals.json：{len(valid_signals)}/{len(signals)} 只有效JSON字段...")
     written = generate_signals_json(valid_signals)
     if written:
-        pushed = push_to_github()
+        pushed = push_to_github(
+            ["src/data/signals/en.json", "src/data/signals/zh.json"],
+            commit_message=f"chore: update signals {today}",
+        )
         if pushed:
             send_telegram(
-                f"🌐 <b>网站已更新</b> {today}\n"
+                f"🌐 <b>网站信号已更新</b> {today}\n"
                 f"signals.json已推送GitHub，Cloudflare正在重建。\n"
-                f"信号数量：{len(valid_signals)} 只"
+                f"信号数量：{len(valid_signals)} 只（SEO文章随后单独生成）"
             )
         else:
             send_telegram(
@@ -2698,6 +2977,134 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         f"✅ <b>选股完成</b> {today} | {tier_label} | Top{len(signals)} | {elapsed}分钟"
     )
     return signals
+
+
+def run_seo_article_flow(signals: list, market_snap: dict, dry_run: bool = False) -> None:
+    """
+    v18.2重写：不再是单次批量调用，改为Top1/Top2/Top3各自独立调用Gemini
+    （3次调用，每次1只股票，产出1篇英文+1篇中文SEO文章）。
+
+    与信号JSON彻底解耦：signals.json的生成和推送已经在run_screener_flow()
+    里完成，本函数只负责文章，不再产出/依赖任何JSON标签字段。
+
+    每只股票独立处理、独立commit：
+      - 某只股票的Gemini调用/校验失败 → 该股票单独跳过+Telegram告警，
+        并把该股票专属的prompt原文作为.txt附件发送，供人工手动补救；
+        不影响其他两只股票的正常发布
+      - 某只股票成功 → 立即写文件+push，不等其他股票
+
+    dry_run=True时：写入本地测试目录（TEST_OUTPUT_DIR_EN/ZH），文章原文
+    直接发Telegram供审阅，不推送GitHub。
+    """
+    if not signals:
+        log.info("run_seo_article_flow: 无signals，跳过（大盘红灯或T1-T4均无候选）")
+        return
+
+    today      = date.today().isoformat()
+    today_ann  = fetch_today_announcements()
+    mode_label = "🧪 测试模式" if dry_run else "正式模式"
+    log.info(f"=== SEO文章逐只生成流程启动（{mode_label}） ===")
+
+    success_count = 0
+
+    for rank, s in enumerate(signals, 1):
+        ticker = s["ticker"]
+        code   = ticker.replace(".AX", "")
+        log.info(f"  [Top{rank}] {ticker} SEO文章生成中...")
+
+        try:
+            ann_hist   = fetch_announcements(code, today_ann=today_ann)
+            news       = fetch_news(ticker, s.get("company_name", ""))
+            timeline   = build_timeline_text(code, ann_hist, news, today_ann)
+            pdf_texts  = [a["pdf_text"] for a in ann_hist if a.get("pdf_text")]
+            data_block = _build_report_stock_block(ticker, s, s, timeline, pdf_texts, rank)
+        except Exception as e:
+            log.error(f"run_seo_article_flow: 数据包构建失败 [{ticker}]: {e}")
+            send_telegram(f"⚠️ [Top{rank} {ticker}] SEO文章数据包构建失败: {e}")
+            continue
+
+        prompt = _build_seo_article_prompt(market_snap, {"ticker": ticker, "data_block": data_block})
+        raw, finish_reason, thoughts_tokens, output_tokens = ask_gemini(
+            prompt, label=f"SEO_ARTICLE_{ticker}", config=GEMINI_CFG_SEO_ARTICLE, return_meta=True
+        )
+        log.info(
+            f"  [{ticker}] SEO调用完成: finish_reason={finish_reason or 'N/A'} "
+            f"thinking_tokens={thoughts_tokens} output_tokens={output_tokens}"
+        )
+
+        if not raw:
+            log.error(f"[{ticker}] Gemini无返回 finish_reason={finish_reason}，转人工兜底")
+            send_telegram(
+                f"⚠️ [Top{rank} {ticker}] SEO文章生成失败：Gemini无响应\n"
+                f"finish_reason={finish_reason or '未知'}\n"
+                f"已附上Prompt，可手动粘贴给AI生成后手动上传。"
+            )
+            send_document(
+                f"seo_prompt_fallback_{ticker}_{today}.txt", prompt,
+                caption=f"📋 [{ticker}] SEO Prompt人工兜底（Gemini无响应）— {today}"
+            )
+            continue
+
+        gemini_meta = {
+            "finish_reason": finish_reason,
+            "thoughts_tokens": thoughts_tokens,
+            "output_tokens": output_tokens,
+        }
+        fields     = _parse_seo_article_response(raw, ticker, gemini_meta=gemini_meta)
+        ok, reason = _validate_seo_article_fields(fields)
+
+        if not ok:
+            log.warning(f"[{ticker}] 校验失败-{reason}，转人工兜底")
+            send_telegram(
+                f"⚠️ [Top{rank} {ticker}] SEO文章校验失败: {reason}\n"
+                f"已附上Prompt，可手动粘贴给AI生成后手动上传。"
+            )
+            send_document(
+                f"seo_prompt_fallback_{ticker}_{today}.txt", prompt,
+                caption=f"📋 [{ticker}] SEO Prompt人工兜底（{reason}）— {today}"
+            )
+            continue
+
+        try:
+            if dry_run:
+                path_en, path_zh = _write_seo_article_files(
+                    ticker, fields["slug_clean"], fields["seo_en_raw"], fields["seo_zh_raw"],
+                    dir_en=TEST_OUTPUT_DIR_EN, dir_zh=TEST_OUTPUT_DIR_ZH,
+                )
+                fname = os.path.basename(path_en)
+                send_document(fname, fields["seo_en_raw"], caption=f"🧪 {ticker} 英文文章试跑结果")
+                send_document(fname, fields["seo_zh_raw"], caption=f"🧪 {ticker} 中文文章试跑结果")
+                send_telegram(f"🧪 [Top{rank} {ticker}] 试跑完成，未推送GitHub，写入测试目录：{path_en}")
+                success_count += 1
+            else:
+                path_en, path_zh = _write_seo_article_files(
+                    ticker, fields["slug_clean"], fields["seo_en_raw"], fields["seo_zh_raw"]
+                )
+                rel_en = os.path.relpath(path_en, ASXBOX_REPO)
+                rel_zh = os.path.relpath(path_zh, ASXBOX_REPO)
+                pushed = push_to_github(
+                    [rel_en, rel_zh],
+                    commit_message=f"content: {ticker} SEO article {today}",
+                )
+                if pushed:
+                    send_telegram(f"✅ [Top{rank} {ticker}] SEO文章已生成并推送GitHub")
+                    success_count += 1
+                else:
+                    send_telegram(
+                        f"⚠️ [Top{rank} {ticker}] SEO文章已生成但GitHub推送失败，"
+                        f"请查看screener.log手动处理"
+                    )
+        except Exception as e:
+            log.error(f"[{ticker}] 写文件/推送异常: {e}")
+            send_telegram(f"⚠️ [Top{rank} {ticker}] SEO文章写入/推送异常: {e}，已附上Prompt人工兜底")
+            send_document(
+                f"seo_prompt_fallback_{ticker}_{today}.txt", prompt,
+                caption=f"📋 [{ticker}] SEO Prompt人工兜底（写入异常）— {today}"
+            )
+
+        time.sleep(1.0)
+
+    log.info(f"run_seo_article_flow完成（{mode_label}）：{success_count}/{len(signals)} 只成功")
 
 # ════════════════════════════════════════════════════════════
 # 8. 日报Prompt流程
@@ -2761,10 +3168,12 @@ def run_report_flow(all_data: dict, market_snap: dict,
     send_telegram(
         f"📂 <b>ASX日报Prompt就绪 {today}</b>\n\n"
         f"股票：{tickers_str}\n"
-        f"以下3个文件已发送，复制文件内容给AI生成文章👇"
+        f"以下2个文件已发送，复制文件内容给AI生成文章👇"
     )
 
-    for platform in ["seo", "twitter", "xiaohongshu"]:
+    # v18改动：平台列表移除"seo"——SEO文章已由run_seo_article_flow
+    # 直接调用Gemini生成并自动推送GitHub，不再需要手动Prompt流程
+    for platform in ["twitter", "xiaohongshu"]:
         log.info(f"发送 [{platform}] Prompt文件...")
         prompt_text = serialize_to_prompt(market_snap, stocks_block, platform)
         filename    = f"prompt_{platform}_{today}.txt"
@@ -2781,7 +3190,7 @@ def run_report_flow(all_data: dict, market_snap: dict,
 def main() -> None:
     start = time.time()
     log.info("=" * 60)
-    log.info(f"ASX System v17 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
+    log.info(f"ASX System v18 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
     log.info("=" * 60)
 
     # Step 1：大盘快照
@@ -2818,7 +3227,7 @@ def main() -> None:
     log.info("【Step 2.5】更新历史信号回测结果...")
     update_signal_outcomes(all_data)
 
-    # Step 3：选股流程
+    # Step 3：选股流程（仅生成Telegram分析，不再产出JSON/SEO）
     screener_signals = []
     if status != "red":
         log.info("【Step 3】选股筛选流程...")
@@ -2826,7 +3235,16 @@ def main() -> None:
     else:
         log.info("【Step 3】大盘红灯，跳过选股")
 
-    # Step 4：日报Prompt
+    # Step 3.5：SEO文章逐只生成并推送GitHub（v18.2：与Step3的signals.json
+    # 彻底解耦，signals.json在Step3已经推送完毕，这里只负责文章）
+    if screener_signals:
+        mode_note = "（🧪 SEO_DRY_RUN=1，试跑模式，不碰GitHub）" if SEO_DRY_RUN else ""
+        log.info(f"【Step 3.5】SEO文章逐只生成流程...{mode_note}")
+        run_seo_article_flow(screener_signals, market_snap, dry_run=SEO_DRY_RUN)
+    else:
+        log.info("【Step 3.5】无screener信号，跳过SEO文章生成，网站保持昨日数据")
+
+    # Step 4：日报Prompt（Twitter/小红书，人工使用）
     log.info("【Step 4】日报Prompt生成流程...")
     run_report_flow(all_data, market_snap,
                     screener_signals=screener_signals if screener_signals else None)
@@ -2836,10 +3254,11 @@ def main() -> None:
     log.info(f"ASX System 全部完成，总耗时：{elapsed} 分钟")
     log.info("=" * 60)
     send_telegram(
-        f"🏁 <b>ASX System v17 全部完成</b>\n"
+        f"🏁 <b>ASX System v18 全部完成</b>\n"
         f"📅 {date.today().isoformat()} | ⏱ 总耗时：{elapsed} 分钟\n"
         f"选股：{'跳过（大盘红灯）' if status == 'red' else f'Top{len(screener_signals)}已完成'}\n"
-        f"日报Prompt：SEO / Twitter / 小红书 已发送"
+        f"SEO文章/信号JSON：{'已生成，见上方推送结果' if screener_signals else '跳过'}\n"
+        f"日报Prompt：Twitter / 小红书 已发送"
     )
 
 
