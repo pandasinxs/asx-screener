@@ -2053,8 +2053,6 @@ def _validate_seo_article_fields(fields: dict) -> tuple:
             return False, f"{label}缺少frontmatter必需字段(title/pubDate)"
         if content.count("## ") < 5:
             return False, f"{label}二级标题数量不足(<5)，结构可能不完整"
-        if "faq" not in content.lower():
-            return False, f"{label}缺少FAQ部分"
 
     slug_clean = _sanitize_slug(fields.get("slug", ""))
     if not slug_clean:
@@ -2062,7 +2060,6 @@ def _validate_seo_article_fields(fields: dict) -> tuple:
     fields["slug_clean"] = slug_clean
 
     return True, ""
-
 
 def _write_seo_article_files(ticker: str, slug: str, content_en: str, content_zh: str,
                               dir_en: Optional[str] = None, dir_zh: Optional[str] = None) -> tuple:
