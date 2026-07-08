@@ -1978,8 +1978,9 @@ OUTPUT FORMAT (STRICT — nothing outside these markers, no preamble, no closing
 -------------------------------------------------
 BACKTEST BEFORE FINAL OUTPUT (MANDATORY EXECUTION)
 -------------------------------------------------
-1. First, generate an internal draft for self-backtesting.
-2. Verify the draft meets all requirements above, complies with SEO best practices, delivers a strong personal perspective,
+1. First, generate an internal draft (one EN article + one ZH article) for self-backtesting.
+2. Verify the draft (one EN article + one ZH article) meets all requirements above,
+   complies with SEO best practices, delivers a strong personal perspective,
    no regulatory/legal violations, no hallucinated data.
    If not, draft another one and repeat this step.
 3. Verify the format meets the criteria of md files and output exactly one EN article + one ZH article + one slug.
