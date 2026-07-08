@@ -1979,9 +1979,10 @@ OUTPUT FORMAT (STRICT — nothing outside these markers, no preamble, no closing
 BACKTEST BEFORE FINAL OUTPUT (MANDATORY EXECUTION)
 -------------------------------------------------
 1. First, generate an internal draft for self-backtesting.
-2. Verify it meets all requirements above: SEO best practices, strong independent perspective,
+2. Verify the draft meets all requirements above, complies with SEO best practices, delivers a strong personal perspective,
    no regulatory/legal violations, no hallucinated data.
-3. Verify you have exactly one EN article + one ZH article + one slug.
+   If not, draft another one and repeat this step.
+3. Verify the format meets the criteria of md files and output exactly one EN article + one ZH article + one slug.
 4. Verify every marker above is spelled exactly as specified.
 5. Skip any explanation of this process — output ONLY the final version, using the exact
    marker format above."""
@@ -2110,7 +2111,7 @@ def serialize_to_prompt(market_snap: dict, stocks_block: str, platform: str) -> 
     )
 
     instructions = {
-        "twitter": """You are an event-driven ASX equity trader generating high-signal X (Twitter) content.
+       "twitter": """You are an event-driven ASX equity trader generating high-signal X (Twitter) content.
 
 INPUT:
 - ASX index data
@@ -2189,12 +2190,6 @@ Each tweet must be ≤280 characters; no multi-paragraph or multi-point construc
 
 🔧 CRITICAL COMPRESSION RULE (MANDATORY)
 
-Because structure is fixed at 4 tweets:
-
-- Driver + Expectation Shift MUST be merged (Tweet 2)
-- Flow + Positioning MUST remain separate (Tweet 3)
-- Risk + Conclusion MUST be merged (Tweet 4)
-
 Under NO circumstance can tweet count exceed 4.
 
 If content overflows:
@@ -2226,8 +2221,8 @@ Do NOT label these explicitly.
 
 ❌ HARD ANTI-FILLER RULES
 
-- No generic phrases ("interesting", "market watching", etc.)
-- No "suggests / indicates / therefore / because"
+- No generic phrases (“interesting”, “market watching”, etc.)
+- No “suggests / indicates / therefore / because”
 - No essay-style explanations
 - No repeated sentence structures
 - No macro market commentary
@@ -2239,7 +2234,7 @@ Do NOT label these explicitly.
 Across each tweet:
 
 - Max 1–2 uncertainty expressions total
-- At least 1 emotional reaction (e.g. "feels crowded", "not clean", "too smooth")
+- At least 1 emotional reaction (e.g. “feels crowded”, “not clean”, “too smooth”)
 - At least 1 incomplete thought
 - At least 1 subtle contradiction
 - Conviction must vary across tweets
@@ -2274,20 +2269,16 @@ Avoid:
 - No titles
 - No extra text
 - No explanations
-- if ticker is mentioned in a tweet, ticker format must be for instance"$BHP.AX"
-
---------------------------------------------------
-
-📌 FINAL CONSTRAINT
-
-Transform inputs into trading behavior interpretation, not summary.
-Focus on what the market is pricing, not what happened.
+- if ticker is mentioned in a tweet, ticker format must be for instance“$BHP.AX”
 
 --------------------------------------------------
 
 Backtest Before Final Output (Mandatory)
 
-First, generate an initial draft of the copy for self-backtesting to ensure it meets all prompt requirements. Verify that it delivers a strong personal perspective. Finally, double-check that the output formatting is entirely correct. Do not explain your process—output only the final version of the copy.
+a. generate an initial draft of the copy for self-backtesting to ensure it meets all prompt requirements. If not, redraft another one and repeat this step.
+b. Verify if the draft delivers a strong personal perspective. 
+c. double-check that the output formatting is entirely correct. 
+D. Do not explain your process—output only the final version of the copy.
 """,
 
         "xiaohongshu": """ASX小红书交易盲盒复盘（叙事流IP版）
@@ -2296,8 +2287,8 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 
 ━━━━━━━━━━━━━━
 核心定义
-"盲盒" = 股票（用于隐喻表达，规避平台审查）
-全文统一使用"盲盒"，不使用"股票/标的"。
+“盲盒” = 股票（用于隐喻表达，规避平台审查）
+全文统一使用“盲盒”，不使用“股票/标的”。
 盲盒使用的股票代码，不能包含后缀.AX
 
 ━━━━━━━━━━━━━━
@@ -2315,7 +2306,7 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 ━━━━━━━━━━━━━━
 一、标题
 
-类似"让我们打开今天的盲盒"的一句话
+类似“让我们打开今天的盲盒”的一句话
 （仅作参考，类似表达即可，但必须包含盲盒）
 
 ━━━━━━━━━━━━━━
@@ -2330,22 +2321,22 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 --------------------------------
 2. 历史背景 + 关注连续性
 可以体现：
-- 之前发生过什么类似情况
+- 之前发生过什么比较大的催化剂
 - 市场之前怎么反应
-- 你为什么一直在看它
+- 你为什么一直在观察它
 
 要求：
 
-- 参考表达"我上月看它发生哪一件事，结果是怎么样，然后今天发生了什么事，有什么变化"
+- 参考表达“我上月看它发生哪一件事，因为什么，结果是怎么样，然后今天发生了什么事，有什么变化”
 
-- 像"持续观察者视角"，不是一次性解读
+- 像“持续观察者视角”，不是一次性解读
 
 --------------------------------
-3. 用一句话分析
+3. 用一句话分析：
 
 结构判断 +趋势分析
 
-允许乐观表达，类似：
+允许乐观又真实的表达，类似：
 -短期/中期/长期趋势向好
 
 不允许悲观表达，类似：
@@ -2373,18 +2364,18 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 ━━━━━━━━━━━━━━
 三、回测再二次输出（必须执行）
 
-1、先出一版文案给自己回测，看是否符合prompt的要求。
-2、每一个盲盒（股票）用150字以内的字数用备注3的语言风格复述一次，作为输出的文案。
-3、筛选并替换所有股票和投资和市场的相关用词。
-4、检查文章是否有强烈个人观点，没有就加上观点返回第2步
+1、先出一版文案草稿给自己回测，看是否符合prompt的要求。
+2、每一个盲盒（股票）用150字以内的字数，按照备注3的语言风格，以主观的视角复述一次草稿，作为输出的文案。
+3、筛选出文案里面所有关于股票和投资和市场和赌博的相关用词，然后替换成合法合规的生活化用词。
+4、检查文章是否有强烈个人观点，没有就加上观点然后返回第3步
 4、检查文章是否有逻辑错误。
-5、检查字数限制是否正确。字数超过就返回第3步。
+5、检查字数限制是否正确。
 6、特别检查输出格式
 7、不用交代过程，只给出最终版文案。
 
 ━━━━━━━━━━━━━━
 
-备注5、结尾后加上标签
+备注5、在每一个盲盒点评的结尾后加上标签
 #ASX #澳洲
 ⚠️仅个人记录，不构成投资建议
 
@@ -2408,7 +2399,6 @@ First, generate an initial draft of the copy for self-backtesting to ensure it m
 === 输出任务 ===
 {instruction}
 
-规则：数据来自公开渠道，不构成投资建议。数据矛盾时优先级：公告原文>新闻>技术指标。禁止重复罗列原始数字，转化为判断语言。
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
 # ════════════════════════════════════════════════════════════
