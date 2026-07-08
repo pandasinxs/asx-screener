@@ -2276,7 +2276,8 @@ Avoid:
 
 Backtest Before Final Output (Mandatory)
 
-a. generate an initial draft of the copy for self-backtesting to ensure it meets all prompt requirements. If not, redraft another one and repeat this step.
+a. generate an initial draft of the copy for self-backtesting to ensure it meets all prompt requirements. 
+   If not, redraft another one and repeat this step.
 b. Verify if the draft delivers a strong personal perspective. 
 c. double-check that the output formatting is entirely correct. 
 D. Do not explain your process—output only the final version of the copy.
@@ -2317,14 +2318,14 @@ D. Do not explain your process—output only the final version of the copy.
 1. 催化剂（必须包含）
 - 今天发生了什么（必须带上股票代码）
 - 如果有公告必须带一句总结
-- 不单列数据，用人话解释
+- 结合数据但不单列数据，用人话解释
 
 --------------------------------
 2. 历史背景 + 关注连续性
 可以体现：
 - 之前发生过什么比较大的催化剂
 - 市场之前怎么反应
-- 你为什么一直在观察它
+- 和今天发生的事情有什么关联
 
 要求：
 
@@ -2333,9 +2334,7 @@ D. Do not explain your process—output only the final version of the copy.
 - 像“持续观察者视角”，不是一次性解读
 
 --------------------------------
-3. 用一句话分析：
-
-结构判断 +趋势分析
+3. 结构判断 + 趋势分析 （1-2句话）
 
 允许乐观又真实的表达，类似：
 -短期/中期/长期趋势向好
@@ -2368,15 +2367,15 @@ D. Do not explain your process—output only the final version of the copy.
 1、先出一版文案草稿给自己回测，看是否符合prompt的要求。
 2、每一个盲盒（股票）用150字以内的字数，按照备注3的语言风格，以主观的视角复述一次草稿，作为输出的文案。
 3、筛选出文案里面所有关于股票和投资和市场和赌博的相关用词，然后替换成合法合规的生活化用词。
-4、检查文章是否有强烈个人观点，没有就加上观点然后返回第3步
-4、检查文章是否有逻辑错误。
-5、检查字数限制是否正确。
-6、特别检查输出格式
+4、检查文章是否有强烈个人观点，没有就加上观点。
+5、检查文章是否有逻辑错误。
+6、检查字数限制是否正确，超过10%就返回步骤2。
 7、不用交代过程，只给出最终版文案。
 
 ━━━━━━━━━━━━━━
 
-备注5、在每一个盲盒点评的结尾后加上标签
+备注4、在每一个股票，的点评，的结尾后加上标签
+
 #ASX #澳洲
 ⚠️仅个人记录，不构成投资建议
 
