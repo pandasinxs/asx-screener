@@ -1,89 +1,41 @@
 # ============================================================
-# ASX SYSTEM — screener.py  v18
+# ASX SYSTEM — screener.py  v18.3
 #
 # 流程一：EOD选股
 #   全市场K线 → T1-T4筛选 → Top3加权评分 → 新闻/公告时间线
-#   → Gemini分析（纯Telegram阅读，不再产出JSON/SEO）
+#   → Gemini分析 → Telegram → 解析JSON标签字段 → signals.json → GitHub推送
 #
-# 流程二：SEO文章 + 信号JSON 合并生成（v18新增，取代原来从不触发的
-#   run_report_flow "seo" prompt）
-#   Top3 → 单次Gemini批量调用，产出：
-#     - 每只股票的英文SEO文章 + 中文SEO文章（Markdown，含frontmatter）
-#     - 每只股票的URL slug
-#     - 每只股票的信号标签字段（JSON_TAG/ONE_LINER，中英文）
-#   → 逐只校验（长度/frontmatter/标题数/FAQ） → 校验失败的股票跳过+
-#   Telegram告警，绝不用半成品覆盖线上内容 → 校验通过的文章写入
-#   src/content/blog/en|zh/ → signals.json重新生成 → 一次性git commit推送
+# 流程二：SEO文章逐只生成（Top1/Top2/Top3各自独立调用Gemini）
+#   → 英文+中文文章 → 校验 → 写入 → 独立commit推送GitHub
+#   → 任一失败：Telegram告警 + 该股票专属.txt Prompt人工兜底
 #
 # 流程三：每日日报Prompt（Twitter / 小红书，人工使用，不调用Gemini）
-#   Top3 Movers → 技术面+精选新闻+公告+PDF关键段落
-#   → 构建Prompt → Telegram附件
 #
-# v15新增（相对v14）：
-#   - signals_history表：记录全部T1-T4候选股（含落选），用于回测
-#   - save_signal_to_history()：ATR倍数止盈止损，is_selected区分Top3/候选
-#   - update_signal_outcomes()：每次运行自动更新历史信号结果（WIN/LOSS/TIMEOUT）
-#   - 催化剂评分注入筛选循环
-#   - T1-T4全部扫描合并排序（保证数量同时保证质量）
+# v15/v16/v17/v18/v18.1/v18.2 changelog见历史版本，此处从v18.3开始记录：
 #
-# v16新增（相对v15）：
-#   - 新增 _check_volume_quality()：量能质量检查，替代原硬性缩量要求
-#   - 允许「缩量整理」和「温和持续递增」两种量能模式通过T1-T3
-#   - 拒绝「单日脉冲爆量」和「随机震荡无方向」两种无效量能模式
-#   - 动能延续型强势股（资源类、小盘成长股）不再被系统性过滤
-#
-# v17新增（相对v16）：
-#   - 新增 _check_trend_persistence()：趋势持续性验证
-#     ADX/+DI连续维持天数比例 + MA50斜率方向性，返回0~1分值
-#     注入 tech["persistence_score"]，参与composite_score排序
-#   - 新增 _check_higher_highs_lows()：价格结构验证
-#     近40日「高点抬高+低点抬高」双重确认，作为T1/T2硬性条件
-#   - 新增 _check_ma_alignment()：均线多头排列验证
-#     MA20>MA50（全层级）+ T1/T2要求MA50>MA200，作为硬性条件
-#   - build_tech_summary() 新增 _adx_s/_pdi_s/_mdi_s 三个内部字段
-#     供 _check_trend_persistence() 使用，不对外展示
-#   - SCORE_WEIGHTS 新增 persistence 维度（权重0.10）
-#     其余权重等比下调，总和仍为1.0
-#
-# v18新增（相对v17，历史记录，部分内容已被v18.2取代）：
-#   - 首次尝试将Gemini分析与SEO文章合并为单次批量调用，
-#     该架构已在v18.2被用户否决，详见v18.2条目
-#
-# v18.1新增（相对v18，历史记录，部分内容已被v18.2取代）：
-#   - 曾短暂加入seo_article_log表做跨日防重复叙事，已在v18.2彻底删除
-#   - _write_seo_article_files() 新增 dir_en/dir_zh 可选参数，
-#     支持写入测试目录而不触碰线上BLOG_CONTENT_DIR（v18.2保留）
-#   - 新增 TEST_OUTPUT_DIR_EN/ZH + SEO_DRY_RUN 环境变量开关（v18.2保留）
-#
-# v18.2新增（相对v18.1，用户当轮反馈——当前实际架构）：
-#   - 【架构核心改动】分析(Telegram)+信号JSON(GitHub) 与 SEO文章(GitHub)
-#     彻底解耦为两条完全独立的流水线：
-#     ① run_screener_flow()：逐只调用Gemini做深度分析→Telegram，
-#        解析JSON标签字段→生成signals.json→立即push GitHub。
-#        这是v17原有行为，此次基本原样恢复，确保信号更新最快最稳定，
-#        不等待任何SEO文章调用
-#     ② run_seo_article_flow()：Top1/Top2/Top3各自独立调用一次Gemini
-#        （3次调用，每次1只股票，产出1篇英文+1篇中文SEO文章），
-#        每只股票独立校验、独立commit推送，互不连累
-#   - 不再有批量调用（v18.1的_build_seo_and_signal_prompt/
-#     _parse_seo_signal_response/_validate_seo_fields/
-#     run_seo_signal_flow 已重写为单只股票版本：
-#     _build_seo_article_prompt/_parse_seo_article_response/
-#     _validate_seo_article_fields/run_seo_article_flow）
-#   - GEMINI_CFG_SEO_BATCH 重命名为 GEMINI_CFG_SEO_ARTICLE
-#     （含义从"批量"变为"单篇"，参数值不变：max_output_tokens=65535，
-#     thinking_budget=1024）
-#   - push_to_github() 签名改为 (files: list, commit_message: str)，
-#     不再隐式默认signals.json文件，调用方必须显式传入文件列表和
-#     commit信息——避免"推signals.json"和"推SEO文章"两个独立场景
-#     共享一个隐藏默认值造成耦合
-#   - _parse_gemini_json_fields() 恢复（v18曾删除，v18.2按用户要求
-#     恢复原v17逻辑），_build_screener_prompt() 末尾"固定输出字段"
-#     段落同步恢复
-#   - 任意一只股票的SEO文章生成失败（Gemini无响应/校验不过/写入异常），
-#     除Telegram文字告警外，附带该股票专属的.txt Prompt供人工兜底，
-#     不影响另外两只股票的正常发布
-#   - seo_article_log表及配套跨日防重复叙事机制维持删除状态（v18.1已删）
+# v18.3新增（本轮，用户反馈）：
+#   1) 删除试运行模式：SEO_DRY_RUN环境变量、TEST_OUTPUT_DIR_EN/ZH、
+#      run_seo_article_flow的dry_run参数、_write_seo_article_files的
+#      dir_en/dir_zh参数全部删除，每次运行都是正式模式。
+#   2) 保留用户自己修复的bug：_validate_seo_article_fields()不再检查
+#      "faq"关键词是否出现在正文（中文文章不会出现英文单词"FAQ"，
+#      这条校验此前对中文文章必然误判）。
+#   3) 所有喂给Gemini的"data block"（技术数据/时间线/市场快照）
+#      全部改写为纯英文、不带主观定性描述，尽量给原始数值：
+#        - build_tech_summary()新增vwap_slope原始斜率值
+#        - get_market_snapshot()新增dev_from_ma50_pct原始偏离度
+#        - build_timeline_text()/_build_report_stock_block()/
+#          _build_screener_prompt()内tech_block/market_block
+#          全部改英文，去掉"量能无持续性"这类定性描述和情绪化emoji，
+#          改为陈述原始事实+中性定义说明
+#   4) 审计并补齐API调用的重试机制：
+#        - _get()/get_asx_universe()/get_market_snapshot()/
+#          _extract_pdf_keywords()/fetch_news()/send_telegram()/
+#          send_document()/push_to_github()新增重试+退避
+#        - ask_gemini()的可重试错误类型扩展到识别通用网络异常
+#          （此前只匹配限速相关字符串，网络超时会被判定为不可重试）
+#        - screener.log路径从相对路径改为绝对路径（锚定脚本目录），
+#          与announcements.db/tier_validation.log保持一致
 # ============================================================
 
 import os, io, re, sys, time, logging, json, subprocess
@@ -102,12 +54,15 @@ from google import genai
 # 0. 日志 & 环境变量
 # ════════════════════════════════════════════════════════════
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOG_PATH   = os.path.join(_SCRIPT_DIR, "screener.log")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("screener.log", encoding="utf-8"),
+        logging.FileHandler(_LOG_PATH, encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
@@ -117,12 +72,6 @@ CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID", "")
 GEMINI_KEY     = os.environ.get("GEMINI_API_KEY", "")
 gemini_client  = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
-# v18.1新增：SEO试运行开关。设置环境变量 SEO_DRY_RUN=1 后跑main()，
-# run_seo_article_flow会走试跑模式（写测试目录+发Telegram审阅，
-# 不碰GitHub；signals.json不受此开关影响，仍由run_screener_flow正常推送）。
-# 调参阶段用这个开关，不用改代码。
-SEO_DRY_RUN = os.environ.get("SEO_DRY_RUN", "0") == "1"
-
 # ════════════════════════════════════════════════════════════
 # 1. 常量 & 配置
 # ════════════════════════════════════════════════════════════
@@ -130,9 +79,6 @@ SEO_DRY_RUN = os.environ.get("SEO_DRY_RUN", "0") == "1"
 GEMINI_MODEL    = "gemini-2.5-flash"
 GEMINI_CFG_DEEP = {"thinking_config": {"thinking_budget": 512}}
 
-# v18.2改动：不再批量调用，改为逐只股票单独调用（每次1篇英文+1篇中文），
-# 单次输出量比v18的批量版（3只×双语）小得多，但依然保留生成的max_output_tokens
-# 上限（Gemini 2.5 Flash官方文档记录的实际上限），进一步降低截断风险。
 GEMINI_CFG_SEO_ARTICLE = {
     "thinking_config": {"thinking_budget": 1024},
     "max_output_tokens": 65535,
@@ -143,21 +89,16 @@ RETRY_WAIT      = 30
 TIMEOUT         = 15
 TOP_N           = 3
 
+NET_RETRY_MAX  = 3
+NET_RETRY_WAIT = 2.0
+
 ASXBOX_REPO  = os.path.expanduser("~/asxbox")
 SIGNALS_DIR  = os.path.join(ASXBOX_REPO, "src", "data", "signals")
 
-# v18新增：SEO文章目录（Astro content collection结构，已与用户确认）
 BLOG_CONTENT_DIR_EN = os.path.join(ASXBOX_REPO, "src", "content", "blog", "en")
 BLOG_CONTENT_DIR_ZH = os.path.join(ASXBOX_REPO, "src", "content", "blog", "zh")
 
-# v18.1新增：测试模式专用目录，与线上BLOG_CONTENT_DIR完全隔离，
-# 试运行时文章写在这里，绝不触碰ASXBOX_REPO的git工作区，
-# 避免测试内容被意外扫进下一次真实commit
-TEST_OUTPUT_DIR_EN = os.path.expanduser("~/asx_seo_test_output/en")
-TEST_OUTPUT_DIR_ZH = os.path.expanduser("~/asx_seo_test_output/zh")
-
-SEO_ARTICLE_MIN_CHARS = 600   # 正文最低字数（不含frontmatter），低于此视为生成失败
-# v18.1：SEO_RECENT_LOOKBACK_DAYS 及 seo_article_log 防重复叙事机制已按用户要求删除
+SEO_ARTICLE_MIN_CHARS = 600
 
 ASX_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
@@ -172,10 +113,9 @@ PDF_MAX_CHARS     = 2000
 PDF_MAX_PER_STOCK = 2
 NEWS_MAX          = 5
 
-# 回测参数（一旦开始记录不要修改，修改后前后数据不可比）
-BT_STOP_ATR_MULT   = 2   # 止损 = 入场价 - 2×ATR14
-BT_TARGET_ATR_MULT = 4   # 止盈 = 入场价 + 4×ATR14
-BT_TIMEOUT_DAYS    = 20  # 超过20个交易日算TIMEOUT
+BT_STOP_ATR_MULT   = 2
+BT_TARGET_ATR_MULT = 4
+BT_TIMEOUT_DAYS    = 20
 
 ANN_WHITELIST = {
     "Quarterly Activities Report", "Quarterly Cashflow Report",
@@ -208,15 +148,6 @@ PDF_KEY_TERMS = [
     "drill", "resource", "reserve", "acquisition", "contract",
     "milestone", "update", "completion", "approval", "forecast",
 ]
-
-# ============================================================
-# v18: SCORE_WEIGHTS 改为复用trend_strength_score，不再与其
-# 重复计算rs_vs_xjo/adx14/vol_ratio。原因：两套体系衡量同一件
-# 事但归一化区间不同，导致排序和筛选结果矛盾（真实数据验证：
-# T2候选trend_strength更低但composite_score排序更高）。
-# close_pos_pct已是_passes_tier()硬性条件，通过筛选后此项
-# 已保证达标，排序时边际信息量低，故去除。
-# ============================================================
 
 SCORE_WEIGHTS = {
     "trend_strength": 0.50,
@@ -368,6 +299,7 @@ def build_tech_summary(df: pd.DataFrame,
         "minus_di"       : round(float(mdi_s.iloc[-1]), 1),
         "vwap20"         : round(vwap_val, 3),
         "vwap_up"        : vwap_slope > 0,
+        "vwap_slope"     : round(vwap_slope, 4),
         "rs_vs_xjo"      : calc_rs(close, xjo) if xjo is not None else 1.0,
         "ma20"           : round(float(ma20.iloc[-1]), 3),
         "ma50"           : round(float(ma50.iloc[-1]), 3),
@@ -381,12 +313,10 @@ def build_tech_summary(df: pd.DataFrame,
         "price_pct_1y"   : price_pct_1y,
         "vol_consistency": vol_consistency,
         "price_events"   : price_events,
-        # ── 原始Series（供筛选函数使用，不对外展示）──────────────
         "_close"  : close,
         "_high"   : high,
         "_low"    : low,
         "_volume" : volume,
-        # ── v17新增：ADX/DI原始Series供趋势持续性检测使用 ─────────
         "_adx_s"  : adx_s,
         "_pdi_s"  : pdi_s,
         "_mdi_s"  : mdi_s,
@@ -421,33 +351,7 @@ def calc_confidence(tech: dict, tier_level: str) -> float:
     return round(min(0.92, max(0.50, base + adx_bonus + rs_bonus + vol_bonus - dist_pen)), 2)
 
 
-# ════════════════════════════════════════════════════════════
-# v16新增：量能质量检查（替代原硬性缩量要求）
-# ════════════════════════════════════════════════════════════
-
 def _check_volume_quality(volume_s: pd.Series) -> bool:
-    """
-    量能质量检查，替代原来的 vol_decline 硬性缩量要求。
-
-    允许两种模式通过（对应两类ASX强势股）：
-
-      模式A — 缩量整理（原逻辑保留）
-        近10日均量 < 前10日均量
-        → 典型场景：大盘股、基本面驱动的蓄势突破
-
-      模式B — 温和持续递增（v16新增）
-        近10日均量适度高于前期（增幅 ≤ 80%），且：
-        1. 近3日内无单日异常爆量（单日量 ≤ 近期均量3倍）
-        2. 近5日量能方向性向上（线性回归斜率为正且斜率/均值 > 1%）
-        → 典型场景：资源股、小盘成长股的动能延续型上涨
-
-    拒绝的情况：
-      - 单日脉冲爆量后快速萎缩（量能不可持续）
-      - 近期量能随机震荡、无方向性
-      - 近期均量增幅超过80%（可能是异常事件驱动而非趋势性放量）
-
-    注意：T4层级的 vol_decline=False，不调用此函数，完全不检查量能模式。
-    """
     if len(volume_s) < 20:
         return False
 
@@ -464,24 +368,18 @@ def _check_volume_quality(volume_s: pd.Series) -> bool:
 
     ratio = recent_mean / prior_mean
 
-    # ── 模式A：缩量整理（原逻辑，直接通过）──────────────────────
     if ratio < 1.0:
         return True
 
-    # ── 模式B：温和递增，以下三个条件必须全部满足 ────────────────
-
-    # 条件1：增幅上限80%，排除异常事件驱动的爆量
     if ratio > 1.8:
         log.debug(f"_check_volume_quality: 量能增幅过大({ratio:.2f}x)，拒绝")
         return False
 
-    # 条件2：近3日内无单日爆量脉冲
     max_single = float(vol_last3.max())
     if recent_mean > 0 and max_single > recent_mean * 3.0:
         log.debug(f"_check_volume_quality: 单日脉冲检测触发({max_single:.0f} > {recent_mean*3:.0f})，拒绝")
         return False
 
-    # 条件3：近5日量能方向性检查（线性回归斜率）
     vol5   = vol_last5.values.astype(float)
     x_vals = list(range(5))
     mean_x = 2.0
@@ -506,32 +404,12 @@ def _check_volume_quality(volume_s: pd.Series) -> bool:
     return True
 
 
-# ════════════════════════════════════════════════════════════
-# v17新增：趋势持续性验证 / 价格结构验证 / 均线多头排列验证
-# ════════════════════════════════════════════════════════════
-
 def _check_trend_persistence(close: pd.Series,
                               adx_s: pd.Series,
                               pdi_s: pd.Series,
                               mdi_s: pd.Series) -> float:
-    """
-    趋势持续性验证：不是看今天的快照，而是看这个趋势维持了多久。
-
-    逻辑：
-      同样 ADX=30 的两只股票，一只刚刚突破28，另一只已持续3周在30以上，
-      后者的趋势可靠性远高于前者。
-
-    计分维度（满分1.0）：
-      1. ADX过去10日持续高于20的天数比例  → 最高贡献0.40
-      2. +DI过去10日持续大于-DI的天数比例 → 最高贡献0.40
-      3. MA50过去20日斜率方向性（线性回归）→ 最高贡献0.20
-
-    返回值：persistence_score（0.0~1.0），注入composite_score参与排序。
-    不作为硬性过滤条件，避免过度收窄信号池。
-    """
     score = 0.0
 
-    # ── 维度1：ADX持续性（过去10日）────────────────────────────
     try:
         adx_10 = adx_s.iloc[-10:].dropna()
         if len(adx_10) >= 5:
@@ -540,7 +418,6 @@ def _check_trend_persistence(close: pd.Series,
     except Exception:
         pass
 
-    # ── 维度2：+DI > -DI 持续性（过去10日）──────────────────────
     try:
         pdi_10 = pdi_s.iloc[-10:].dropna()
         mdi_10 = mdi_s.iloc[-10:].dropna()
@@ -555,7 +432,6 @@ def _check_trend_persistence(close: pd.Series,
     except Exception:
         pass
 
-    # ── 维度3：MA50斜率方向性（过去20日线性回归）────────────────
     try:
         ma50        = close.rolling(50).mean()
         ma50_recent = ma50.iloc[-20:].dropna()
@@ -570,7 +446,6 @@ def _check_trend_persistence(close: pd.Series,
                 if den > 0:
                     slope     = num / den
                     slope_pct = slope / mean_y
-                    # 斜率为正且有实质意义（>0.05%/日）才加分
                     if slope > 0 and slope_pct > 0.0005:
                         score += 0.20
     except Exception:
@@ -582,21 +457,10 @@ def _check_trend_persistence(close: pd.Series,
 def _check_higher_highs_lows(high: pd.Series,
                               low: pd.Series,
                               lookback: int = 40) -> bool:
-    """
-    价格结构验证：近40日是否存在「高点抬高 + 低点抬高」双重确认。
-
-    这是上升趋势的价格本质定义（道氏理论）：
-      - Higher High：后20日最高点 > 前20日最高点
-      - Higher Low ：后20日最低点 > 前20日最低点
-      两者必须同时满足，排除单边拉升后低点下移的假趋势。
-
-    作为T1/T2的硬性过滤条件。
-    T3/T4不要求，避免过度收窄信号池。
-    """
     if len(high) < lookback or len(low) < lookback:
         return False
 
-    mid = lookback // 2  # = 20
+    mid = lookback // 2
 
     recent_high = high.iloc[-mid:]
     prior_high  = high.iloc[-lookback:-mid]
@@ -617,28 +481,14 @@ def _check_higher_highs_lows(high: pd.Series,
 
 
 def _check_ma_alignment(tech: dict, tier_level: str) -> bool:
-    """
-    均线多头排列验证：MA20 > MA50 > MA200（层级递进要求）。
-
-    多头排列是机构资金持续流入的结构性证明，比单看价格和MA50更可靠。
-
-    规则：
-      全层级（T1-T4）：MA20 > MA50（短期趋势确认）
-      T1/T2额外要求  ：MA50 > MA200（中长期趋势确认，MA200数据不足时豁免）
-
-    MA200数据不足200日时，T1/T2不因此被拒绝，仅豁免该条件，
-    避免上市不足一年的优质新股被系统性过滤。
-    """
     ma20  = tech.get("ma20",  0.0)
     ma50  = tech.get("ma50",  0.0)
-    ma200 = tech.get("ma200")  # 可能为None（数据不足200日）
+    ma200 = tech.get("ma200")
 
-    # 基础条件：MA20 > MA50（全层级硬性要求）
     if ma20 <= ma50:
         log.debug(f"_check_ma_alignment: MA20({ma20:.3f}) <= MA50({ma50:.3f})，拒绝")
         return False
 
-    # T1/T2额外要求：MA50 > MA200
     if tier_level in ("T1", "T2") and ma200 is not None:
         if ma50 <= ma200:
             log.debug(f"_check_ma_alignment [{tier_level}]: MA50({ma50:.3f}) <= MA200({ma200:.3f})，拒绝")
@@ -646,69 +496,36 @@ def _check_ma_alignment(tech: dict, tier_level: str) -> bool:
 
     return True
 
-# ============================================================
-# 趋势强度综合评分 v2 —— 修复"四个tier分布几乎一样"的缺陷
-#
-# v1问题（已用真实数据验证）：只有volume_multiple一项的归一化区间
-# 随tier变化，其余6项区间写死，导致T1-T4的trend_strength_score
-# 均值/中位数/标准差几乎完全一致（相差<0.02），四个层级实质上
-# 变成了同一个筛选器，违背"T1最严格、T4最宽松"的分层设计初衷。
-#
-# 修复：让全部7项的归一化区间都参照原v17硬性门槛参数，
-# 按tier动态生成，而不是只有一项动态、其余写死。
-# ============================================================
-
 def _norm(val: float, lo: float, hi: float) -> float:
-    """线性归一化到0-1，超出范围截断"""
     if hi <= lo:
         return 0.0
     return max(0.0, min(1.0, (val - lo) / (hi - lo)))
 
 
 def calc_trend_strength_score(tech: dict, tier: dict) -> dict:
-    """
-    计算7个强相关条件的加权综合分数，返回0-1的trend_strength_score。
-
-    v2改动：全部7项归一化区间均参照原v17硬性门槛动态生成，
-    确保T1（严格tier）在每一项上的评分标准都比T4（宽松tier）更严苛，
-    而不是只有volume_multiple一项体现tier差异。
-
-    区间生成规则：以原v17硬性门槛为"评0.5分"的锚点，
-    向上/向下各扩展一定幅度作为0分/1分的边界，
-    这样阈值校准出来的分数在语义上更接近"是否达到原硬性标准附近"。
-    """
     lc     = tech["price"]
     w52_hi = tech["w52_hi"]
 
     scores = {}
 
-    # 1. volume_multiple：锚点=tier["vol_mult"]，下限0.5倍锚点，上限1.5倍锚点
     vol_anchor = tier["vol_mult"]
     scores["volume_multiple"] = _norm(
         tech.get("vol_ratio", 1.0), vol_anchor * 0.5, vol_anchor * 1.5
     )
 
-    # 2. near_52w_hi：锚点=tier["near_52w_hi"]对应的门槛
-    #    v17里near_52w_hi是布尔值(T1/T2=True要求>=90%，T3/T4=False无要求)，
-    #    转换成动态锚点：True→0.90，False→0.75（仍给一定权重，但标准更松）
     dist_ratio = lc / w52_hi if w52_hi > 0 else 0.7
     near_hi_anchor = 0.90 if tier["near_52w_hi"] else 0.75
     scores["near_52w_hi"] = _norm(dist_ratio, near_hi_anchor - 0.15, near_hi_anchor + 0.10)
 
-    # 3. ma_alignment：MA20相对MA50溢价。T1/T2额外要求MA50>MA200（更严格），
-    #    用tier level间接调整锚点：T1/T2锚点更高
     ma20 = tech.get("ma20", 0)
     ma50 = tech.get("ma50", 1)
     ma_premium = (ma20 / ma50 - 1) if ma50 > 0 else 0
     ma_anchor  = 0.02 if tier["level"] in ("T1", "T2") else 0.0
     scores["ma_alignment"] = _norm(ma_premium, ma_anchor - 0.03, ma_anchor + 0.05)
 
-    # 4. relative_strength：锚点=tier["rs_min"]（原v17硬性门槛，T1=1.05...T4=0.98）
     rs_anchor = tier["rs_min"]
     scores["relative_strength"] = _norm(tech.get("rs_vs_xjo", 1.0), rs_anchor - 0.10, rs_anchor + 0.15)
 
-    # 5. hh_hl_structure：T1/T2原本是硬性要求（必须同时HH+HL），
-    #    T3/T4不要求。锚点体现这个差异
     high_s = tech["_high"]
     low_s  = tech["_low"]
     hh_anchor = 0.02 if tier["level"] in ("T1", "T2") else -0.02
@@ -720,10 +537,8 @@ def calc_trend_strength_score(tech: dict, tier: dict) -> dict:
     else:
         scores["hh_hl_structure"] = 0.0
 
-    # 6. ma50_trend：MA50斜率，用tier的adx_min间接反映"要求趋势有多强"
-    #    ADX门槛越高的tier，对趋势斜率的要求也应该越高
     close_s = tech["_close"]
-    slope_anchor = (tier["adx_min"] - 15) / 100  # T1(28)→0.13%，T4(15)→0%
+    slope_anchor = (tier["adx_min"] - 15) / 100
     if len(close_s) >= 61:
         ma50_now  = float(close_s.rolling(50).mean().iloc[-1])
         ma50_prev = float(close_s.rolling(50).mean().iloc[-11])
@@ -732,8 +547,6 @@ def calc_trend_strength_score(tech: dict, tier: dict) -> dict:
     else:
         scores["ma50_trend"] = 0.0
 
-    # 7. vwap_position：锚点固定（vwap_above在v17里全层级都要求True，
-    #    没有tier间差异，保持原样即可）
     vwap20 = tech.get("vwap20", lc)
     vwap_premium = (lc / vwap20 - 1) if vwap20 > 0 else 0
     scores["vwap_position"] = _norm(vwap_premium, -0.03, 0.05)
@@ -759,8 +572,6 @@ def calc_trend_strength_score(tech: dict, tier: dict) -> dict:
 # signals.json生成 & GitHub推送
 # ════════════════════════════════════════════════════════════
 
-# v18.2恢复：分析Gemini调用重新自己解析JSON标签字段（v17原有逻辑），
-# 与SEO文章生成彻底解耦——signals.json的更新不再等待任何SEO调用。
 def _parse_gemini_json_fields(text: str) -> dict:
     patterns = {
         "tag_en":       r"【JSON_TAG_EN】(.+)",
@@ -810,14 +621,6 @@ def generate_signals_json(signals: list) -> bool:
 
 
 def push_to_github(files: list, commit_message: str) -> bool:
-    """
-    v18.2改动：不再隐式默认signals.json文件，改为调用方显式传入
-    要提交的文件相对路径列表和commit信息。原因：现在有两种完全独立的
-    调用场景——① run_screener_flow推signals.json（最高优先级，第一时间
-    更新）② run_seo_article_flow逐只推单只股票的md文件——两者不应该
-    共享一个隐藏的"默认总是带上signals.json"假设，否则两个场景互相
-    耦合，任何一边改动都可能悄悄影响另一边。
-    """
     if not files:
         log.info("push_to_github: 文件列表为空，跳过")
         return True
@@ -828,22 +631,62 @@ def push_to_github(files: list, commit_message: str) -> bool:
         )
         branch = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "main"
         log.info(f"push_to_github: branch={branch}，文件={files}")
-        cmds = [
-            ["git", "-C", ASXBOX_REPO, "pull", "--no-rebase", "origin", branch],
-            ["git", "-C", ASXBOX_REPO, "add"] + files,
-            ["git", "-C", ASXBOX_REPO, "commit", "-m", commit_message],
-            ["git", "-C", ASXBOX_REPO, "push", "origin", branch],
-        ]
-        for cmd in cmds:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode != 0:
+
+        def _run_with_retry(cmd, label):
+            result = None
+            for attempt in range(1, NET_RETRY_MAX + 1):
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    if attempt > 1:
+                        log.info(f"{label}: 第{attempt}次重试成功")
+                    return result
                 if "nothing to commit" in result.stdout + result.stderr:
-                    log.info("push_to_github: 无变更，跳过commit")
-                    return True
-                log.error(f"push_to_github失败: {' '.join(cmd)}\n"
-                          f"stdout:{result.stdout}\nstderr:{result.stderr}")
-                return False
-            log.info(f"git: {' '.join(cmd[2:])} → OK")
+                    return result
+                if attempt < NET_RETRY_MAX:
+                    wait = NET_RETRY_WAIT * attempt
+                    log.warning(f"{label}: 第{attempt}次失败，{wait:.0f}s后重试...\n"
+                                f"stdout:{result.stdout}\nstderr:{result.stderr}")
+                    time.sleep(wait)
+                else:
+                    log.error(f"{label}: 达到{NET_RETRY_MAX}次重试上限\n"
+                              f"stdout:{result.stdout}\nstderr:{result.stderr}")
+            return result
+
+        pull_result = _run_with_retry(
+            ["git", "-C", ASXBOX_REPO, "pull", "--no-rebase", "origin", branch], "git pull"
+        )
+        if pull_result.returncode != 0 and "nothing to commit" not in (pull_result.stdout + pull_result.stderr):
+            return False
+
+        add_result = subprocess.run(
+            ["git", "-C", ASXBOX_REPO, "add"] + files,
+            capture_output=True, text=True, timeout=30
+        )
+        if add_result.returncode != 0:
+            log.error(f"push_to_github: git add失败\nstdout:{add_result.stdout}\nstderr:{add_result.stderr}")
+            return False
+        log.info("git: add → OK")
+
+        commit_result = subprocess.run(
+            ["git", "-C", ASXBOX_REPO, "commit", "-m", commit_message],
+            capture_output=True, text=True, timeout=30
+        )
+        if commit_result.returncode != 0:
+            if "nothing to commit" in commit_result.stdout + commit_result.stderr:
+                log.info("push_to_github: 无变更，跳过commit")
+                return True
+            log.error(f"push_to_github: git commit失败\n"
+                      f"stdout:{commit_result.stdout}\nstderr:{commit_result.stderr}")
+            return False
+        log.info("git: commit → OK")
+
+        push_result = _run_with_retry(
+            ["git", "-C", ASXBOX_REPO, "push", "origin", branch], "git push"
+        )
+        if push_result.returncode != 0:
+            return False
+        log.info("git: push → OK")
+
         log.info(f"push_to_github: 推送成功 branch={branch}")
         return True
     except subprocess.TimeoutExpired:
@@ -858,39 +701,51 @@ def push_to_github(files: list, commit_message: str) -> bool:
 # ════════════════════════════════════════════════════════════
 
 def _get(url: str, params: dict = None, label: str = "") -> Optional[dict]:
-    try:
-        r = requests.get(url, params=params, headers=ASX_HEADERS, timeout=TIMEOUT)
-        r.raise_for_status()
-        return r.json()
-    except requests.HTTPError as e:
-        log.error(f"HTTP错误 [{label}] {url}: {e}")
-    except requests.ConnectionError as e:
-        log.error(f"连接错误 [{label}] {url}: {e}")
-    except requests.Timeout:
-        log.error(f"超时 [{label}] {url}")
-    except Exception as e:
-        log.error(f"请求异常 [{label}] {url}: {e}")
+    for attempt in range(1, NET_RETRY_MAX + 1):
+        try:
+            r = requests.get(url, params=params, headers=ASX_HEADERS, timeout=TIMEOUT)
+            r.raise_for_status()
+            return r.json()
+        except requests.HTTPError as e:
+            log.error(f"HTTP错误 [{label}] {url}: {e}")
+            return None
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt < NET_RETRY_MAX:
+                wait = NET_RETRY_WAIT * attempt
+                log.warning(f"网络异常 [{label}] 第{attempt}次: {e}，{wait:.0f}s后重试...")
+                time.sleep(wait)
+            else:
+                log.error(f"网络异常 [{label}] 达到{NET_RETRY_MAX}次重试上限: {e}")
+        except Exception as e:
+            log.error(f"请求异常 [{label}] {url}: {e}")
+            return None
     return None
 
 
 def get_asx_universe() -> list:
-    try:
-        df  = pd.read_csv(
-            "https://www.asx.com.au/asx/research/ASXListedCompanies.csv",
-            skiprows=1, encoding="latin1",
-        )
-        col = next((c for c in df.columns if "code" in c.lower()), None)
-        if not col:
-            log.error("ASX列表列名未找到")
-            return []
-        codes  = df[col].dropna().astype(str).str.strip()
-        valid  = codes[codes.str.match(r"^[A-Z]{1,5}$")]
-        result = [f"{c}.AX" for c in valid]
-        log.info(f"ASX股票池：{len(result)} 只")
-        return result
-    except Exception as e:
-        log.error(f"get_asx_universe失败: {e}")
-        return []
+    for attempt in range(1, NET_RETRY_MAX + 1):
+        try:
+            df  = pd.read_csv(
+                "https://www.asx.com.au/asx/research/ASXListedCompanies.csv",
+                skiprows=1, encoding="latin1",
+            )
+            col = next((c for c in df.columns if "code" in c.lower()), None)
+            if not col:
+                log.error("ASX列表列名未找到")
+                return []
+            codes  = df[col].dropna().astype(str).str.strip()
+            valid  = codes[codes.str.match(r"^[A-Z]{1,5}$")]
+            result = [f"{c}.AX" for c in valid]
+            log.info(f"ASX股票池：{len(result)} 只")
+            return result
+        except Exception as e:
+            if attempt < NET_RETRY_MAX:
+                wait = NET_RETRY_WAIT * attempt
+                log.warning(f"get_asx_universe第{attempt}次失败: {e}，{wait:.0f}s后重试...")
+                time.sleep(wait)
+            else:
+                log.error(f"get_asx_universe达到{NET_RETRY_MAX}次重试上限: {e}")
+    return []
 
 
 def download_ohlcv(tickers: list, period: str = "1y",
@@ -936,28 +791,37 @@ def get_market_snapshot() -> dict:
         "date": date.today().isoformat(),
         "xjo_close": 0.0, "xjo_change_pct": 0.0,
         "market_status": "normal",
+        "dev_from_ma50_pct": None,
         "sector_leaders": [],
         "xjo_series": None,
     }
-    try:
-        xjo = yf.download("^AXJO", period="1y", interval="1d", progress=False)
-        if not xjo.empty and len(xjo) >= 50:
-            close = xjo["Close"].squeeze()
-            snap["xjo_series"]     = close
-            snap["xjo_close"]      = round(float(close.iloc[-1]), 2)
-            pct = (float(close.iloc[-1]) / float(close.iloc[-2]) - 1) * 100
-            snap["xjo_change_pct"] = round(pct, 2)
-            ma50 = close.rolling(50).mean()
-            dev  = (float(close.iloc[-1]) - float(ma50.iloc[-1])) / float(ma50.iloc[-1])
-            drop = (close.resample("W").last().pct_change().iloc[-2:] < -0.05).any()
-            if dev < -0.03 or drop:
-                snap["market_status"] = "red"
-            elif dev < 0:
-                snap["market_status"] = "yellow"
-            elif pct > 1.0:
-                snap["market_status"] = "bullish"
-    except Exception as e:
-        log.error(f"大盘XJO失败: {e}")
+    for attempt in range(1, NET_RETRY_MAX + 1):
+        try:
+            xjo = yf.download("^AXJO", period="1y", interval="1d", progress=False)
+            if not xjo.empty and len(xjo) >= 50:
+                close = xjo["Close"].squeeze()
+                snap["xjo_series"]     = close
+                snap["xjo_close"]      = round(float(close.iloc[-1]), 2)
+                pct = (float(close.iloc[-1]) / float(close.iloc[-2]) - 1) * 100
+                snap["xjo_change_pct"] = round(pct, 2)
+                ma50 = close.rolling(50).mean()
+                dev  = (float(close.iloc[-1]) - float(ma50.iloc[-1])) / float(ma50.iloc[-1])
+                snap["dev_from_ma50_pct"] = round(dev * 100, 2)
+                drop = (close.resample("W").last().pct_change().iloc[-2:] < -0.05).any()
+                if dev < -0.03 or drop:
+                    snap["market_status"] = "red"
+                elif dev < 0:
+                    snap["market_status"] = "yellow"
+                elif pct > 1.0:
+                    snap["market_status"] = "bullish"
+            break
+        except Exception as e:
+            if attempt < NET_RETRY_MAX:
+                wait = NET_RETRY_WAIT * attempt
+                log.warning(f"大盘XJO第{attempt}次失败: {e}，{wait:.0f}s后重试...")
+                time.sleep(wait)
+            else:
+                log.error(f"大盘XJO达到{NET_RETRY_MAX}次重试上限: {e}")
 
     sector_map = {
         "金融": "^AXFJ", "资源": "^AXMJ", "医疗": "^AXHJ",
@@ -965,16 +829,22 @@ def get_market_snapshot() -> dict:
     }
     changes = []
     for name, sym in sector_map.items():
-        try:
-            df_s = yf.download(sym, period="5d", interval="1d", progress=False)
-            if not df_s.empty and len(df_s) >= 2:
-                c = df_s["Close"].squeeze()
-                changes.append((name, round((float(c.iloc[-1]) / float(c.iloc[-2]) - 1) * 100, 2)))
-        except Exception as e:
-            log.warning(f"板块数据失败 [{name}]: {e}")
+        for attempt in range(1, NET_RETRY_MAX + 1):
+            try:
+                df_s = yf.download(sym, period="5d", interval="1d", progress=False)
+                if not df_s.empty and len(df_s) >= 2:
+                    c = df_s["Close"].squeeze()
+                    changes.append((name, round((float(c.iloc[-1]) / float(c.iloc[-2]) - 1) * 100, 2)))
+                break
+            except Exception as e:
+                if attempt < NET_RETRY_MAX:
+                    time.sleep(NET_RETRY_WAIT * attempt)
+                else:
+                    log.warning(f"板块数据失败 [{name}] 达到重试上限: {e}")
         time.sleep(0.1)
     snap["sector_leaders"] = sorted(changes, key=lambda x: x[1], reverse=True)[:3]
-    log.info(f"大盘: XJO {snap['xjo_change_pct']:+.2f}% 状态:{snap['market_status']}")
+    log.info(f"大盘: XJO {snap['xjo_change_pct']:+.2f}% 状态:{snap['market_status']} "
+             f"偏离MA50:{snap['dev_from_ma50_pct']}%")
     return snap
 
 
@@ -1012,13 +882,6 @@ def fetch_fundamentals(ticker: str, retries: int = 3) -> dict:
                     time.sleep(1.5 * attempt)
                     continue
                 else:
-                    # 修复：达到重试上限仍无有效市值时，直接break跳出循环，
-                    # 走向函数末尾的统一兜底return。原代码这里没有break，
-                    # 会继续执行下面的return语句，用值为0/None的market_cap
-                    # 计算round(market_cap / 1_000_000, 1)——如果market_cap是
-                    # None（yfinance偶发返回None而非0），会触发TypeError，
-                    # 虽然被外层except捕获不会导致程序崩溃，但会产生
-                    # 误导性的重复日志，且逻辑本身不清晰。
                     log.error(f"fetch_fundamentals [{ticker}] 达到{retries}次仍无有效市值")
                     break
 
@@ -1125,7 +988,6 @@ def _init_ann_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_sh_outcome "
                 "ON signals_history(outcome)"
             )
-            # v18.1：seo_article_log表已按用户要求删除（不再做跨日防重复叙事）
             conn.commit()
         log.info(f"公告数据库就绪：{ANN_DB_PATH}")
     except Exception as e:
@@ -1400,44 +1262,50 @@ def fetch_announcements(code: str, today_ann: Optional[dict] = None) -> list:
 
 
 def _extract_pdf_keywords(url: str) -> str:
-    try:
-        resp = requests.get(url, timeout=TIMEOUT, headers=ASX_HEADERS, stream=True)
-        resp.raise_for_status()
-        ct = resp.headers.get("Content-Type", "")
-        if "pdf" not in ct.lower() and not url.lower().endswith(".pdf"):
-            log.warning(f"_extract_pdf_keywords: 非PDF [{url[:60]}] CT:{ct}")
+    for attempt in range(1, NET_RETRY_MAX + 1):
+        try:
+            resp = requests.get(url, timeout=TIMEOUT, headers=ASX_HEADERS, stream=True)
+            resp.raise_for_status()
+            ct = resp.headers.get("Content-Type", "")
+            if "pdf" not in ct.lower() and not url.lower().endswith(".pdf"):
+                log.warning(f"_extract_pdf_keywords: 非PDF [{url[:60]}] CT:{ct}")
+                return ""
+            pages_text = []
+            with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+                for page in pdf.pages[:12]:
+                    t = page.extract_text()
+                    if t:
+                        pages_text.append(t)
+            full_text  = "\n".join(pages_text)
+            paragraphs = re.split(r"\n{2,}", full_text)
+            key_paras  = []
+            for para in paragraphs:
+                hits = sum(1 for kw in PDF_KEY_TERMS if kw in para.lower())
+                if hits >= 1 and len(para.strip()) > 30:
+                    key_paras.append((hits, para.strip()))
+            key_paras.sort(key=lambda x: x[0], reverse=True)
+            extracted = re.sub(r"[ \t]+", " ",
+                               "\n\n".join(p for _, p in key_paras[:8])).strip()
+            if len(extracted) > PDF_MAX_CHARS:
+                extracted = extracted[:PDF_MAX_CHARS] + "\n...[截断]"
+            if not extracted:
+                log.debug(f"PDF无关键词命中，返回前500字符 [{url[:60]}]")
+                return full_text[:500]
+            log.debug(f"PDF提取成功 [{url[:60]}]: {len(extracted)} 字符")
+            return extracted
+        except requests.HTTPError as e:
+            log.error(f"PDF下载HTTP错误 [{url[:60]}]: {e}")
             return ""
-        pages_text = []
-        with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-            for page in pdf.pages[:12]:
-                t = page.extract_text()
-                if t:
-                    pages_text.append(t)
-        full_text  = "\n".join(pages_text)
-        paragraphs = re.split(r"\n{2,}", full_text)
-        key_paras  = []
-        for para in paragraphs:
-            hits = sum(1 for kw in PDF_KEY_TERMS if kw in para.lower())
-            if hits >= 1 and len(para.strip()) > 30:
-                key_paras.append((hits, para.strip()))
-        key_paras.sort(key=lambda x: x[0], reverse=True)
-        extracted = re.sub(r"[ \t]+", " ",
-                           "\n\n".join(p for _, p in key_paras[:8])).strip()
-        if len(extracted) > PDF_MAX_CHARS:
-            extracted = extracted[:PDF_MAX_CHARS] + "\n...[截断]"
-        if not extracted:
-            log.debug(f"PDF无关键词命中，返回前500字符 [{url[:60]}]")
-            return full_text[:500]
-        log.debug(f"PDF提取成功 [{url[:60]}]: {len(extracted)} 字符")
-        return extracted
-    except requests.HTTPError as e:
-        log.error(f"PDF下载HTTP错误 [{url[:60]}]: {e}")
-    except requests.ConnectionError as e:
-        log.error(f"PDF下载连接错误 [{url[:60]}]: {e}")
-    except requests.Timeout:
-        log.error(f"PDF下载超时 [{url[:60]}]")
-    except Exception as e:
-        log.error(f"PDF提取失败 [{url[:60]}]: {e}")
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt < NET_RETRY_MAX:
+                wait = NET_RETRY_WAIT * attempt
+                log.warning(f"PDF下载网络异常 [{url[:60]}] 第{attempt}次: {e}，{wait:.0f}s后重试...")
+                time.sleep(wait)
+            else:
+                log.error(f"PDF下载网络异常 [{url[:60]}] 达到{NET_RETRY_MAX}次重试上限: {e}")
+        except Exception as e:
+            log.error(f"PDF提取失败 [{url[:60]}]: {e}")
+            return ""
     return ""
 
 
@@ -1447,32 +1315,40 @@ def fetch_news(ticker: str, company_name: str = "") -> list:
     raw    = []
     for q in [f"ASX:{code}",
                f"{company_name} ASX" if company_name else f"{code} ASX Australia"]:
-        try:
-            url  = GOOGLE_RSS.format(q=requests.utils.quote(q))
-            resp = requests.get(url, timeout=TIMEOUT,
-                                headers={"User-Agent": "Mozilla/5.0"})
-            resp.raise_for_status()
-            root = ET.fromstring(resp.content)
-            for item in root.findall(".//item")[:8]:
-                title = item.findtext("title", "").strip()
-                pub   = item.findtext("pubDate", "")
-                link  = item.findtext("link", "")
-                src   = item.findtext("source", "Google News")
-                try:
-                    pub_date = parsedate_to_datetime(pub).strftime("%Y-%m-%d")
-                except Exception:
-                    pub_date = date.today().isoformat()
-                if title and pub_date >= cutoff:
-                    raw.append({"title": title[:100], "date": pub_date,
-                                "source": str(src)[:40], "url": link})
-        except requests.HTTPError as e:
-            log.error(f"Google RSS HTTP错误 [{q}]: {e}")
-        except requests.ConnectionError as e:
-            log.error(f"Google RSS 连接错误 [{q}]: {e}")
-        except ET.ParseError as e:
-            log.error(f"Google RSS XML解析错误 [{q}]: {e}")
-        except Exception as e:
-            log.error(f"Google RSS 未知错误 [{q}]: {e}")
+        for attempt in range(1, NET_RETRY_MAX + 1):
+            try:
+                url  = GOOGLE_RSS.format(q=requests.utils.quote(q))
+                resp = requests.get(url, timeout=TIMEOUT,
+                                    headers={"User-Agent": "Mozilla/5.0"})
+                resp.raise_for_status()
+                root = ET.fromstring(resp.content)
+                for item in root.findall(".//item")[:8]:
+                    title = item.findtext("title", "").strip()
+                    pub   = item.findtext("pubDate", "")
+                    link  = item.findtext("link", "")
+                    src   = item.findtext("source", "Google News")
+                    try:
+                        pub_date = parsedate_to_datetime(pub).strftime("%Y-%m-%d")
+                    except Exception:
+                        pub_date = date.today().isoformat()
+                    if title and pub_date >= cutoff:
+                        raw.append({"title": title[:100], "date": pub_date,
+                                    "source": str(src)[:40], "url": link})
+                break
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt < NET_RETRY_MAX:
+                    time.sleep(NET_RETRY_WAIT * attempt)
+                else:
+                    log.error(f"Google RSS 网络异常达到重试上限 [{q}]: {e}")
+            except requests.HTTPError as e:
+                log.error(f"Google RSS HTTP错误 [{q}]: {e}")
+                break
+            except ET.ParseError as e:
+                log.error(f"Google RSS XML解析错误 [{q}]: {e}")
+                break
+            except Exception as e:
+                log.error(f"Google RSS 未知错误 [{q}]: {e}")
+                break
         time.sleep(0.4)
     try:
         for n in (yf.Ticker(ticker).news or [])[:10]:
@@ -1503,23 +1379,23 @@ def build_timeline_text(code: str, announcements: list, news: list,
     events = []
     for a in announcements:
         sig       = a.get("significance", 0)
-        flag      = "⭐" if a["sensitive"] else "📋"
-        sig_label = f"[重要度:{sig}]" if sig >= 5 else ""
-        line      = f"{flag}{sig_label}[公告] {a['headline']}"
+        sens_tag  = "[Price-sensitive]" if a["sensitive"] else "[Routine]"
+        sig_label = f"[Significance:{sig}/10]" if sig >= 5 else ""
+        line      = f"{sens_tag}{sig_label}[Announcement] {a['headline']}"
         pdf_txt   = a.get("pdf_text", "")
         if pdf_txt:
-            line += f"\n    📄PDF关键内容: {pdf_txt[:400]}"
+            line += f"\n    [PDF excerpt]: {pdf_txt[:400]}"
         events.append({"date": a["date"], "text": line,
                         "sort_key": (a["date"], sig)})
     for n in news:
         events.append({"date": n["date"],
-                        "text": f"📰[新闻] {n['title']} ({n['source']})",
+                        "text": f"[News] {n['title']} (source: {n['source']})",
                         "sort_key": (n["date"], 0)})
     if today_ann and code in today_ann:
-        ta   = today_ann[code]
-        flag = "⭐" if ta["sensitive"] else "📋"
+        ta       = today_ann[code]
+        sens_tag = "[Price-sensitive]" if ta["sensitive"] else "[Routine]"
         events.append({"date": date.today().isoformat(),
-                        "text": f"{flag}[今日公告] {ta['headline']}",
+                        "text": f"{sens_tag}[Today's announcement] {ta['headline']}",
                         "sort_key": (date.today().isoformat(), 10)})
     seen, lines = set(), []
     for e in sorted(events, key=lambda x: x["sort_key"], reverse=True):
@@ -1527,25 +1403,15 @@ def build_timeline_text(code: str, announcements: list, news: list,
         if key not in seen:
             seen.add(key)
             lines.append(f"{e['date']}  {e['text']}")
-    return "\n".join(lines[:20]) if lines else "暂无近期公告/新闻"
+    return "\n".join(lines[:20]) if lines else "No announcements or news found in the lookback window."
 
-
-# ════════════════════════════════════════════════════════════
-# v18新增：SEO文章辅助函数（安全文件名清洗）
-# v18.1：_get_recent_seo_angles / _save_seo_article_log 已按用户要求删除
-# ════════════════════════════════════════════════════════════
 
 def _extract_frontmatter_title(md_content: str) -> str:
-    """从生成的Markdown里提取title字段，仅用于日志记录，失败不影响主流程。"""
     m = re.search(r'title:\s*"([^"]*)"', md_content)
     return m.group(1) if m else ""
 
 
 def _sanitize_slug(raw: str) -> str:
-    """
-    文件名安全清洗：绝不直接信任Gemini输出的字符串去拼文件路径，
-    只保留小写字母/数字，其余一律转连字符，防止路径穿越或非法文件名。
-    """
     s = raw.strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s)
     s = re.sub(r"-{2,}", "-", s).strip("-")
@@ -1556,22 +1422,22 @@ def _sanitize_slug(raw: str) -> str:
 # 4. Gemini
 # ════════════════════════════════════════════════════════════
 
+def _is_retryable_error(err_text: str, exc: Exception) -> bool:
+    rate_limit_markers = ("429", "503", "RESOURCE_EXHAUSTED", "overloaded", "quota")
+    if any(k in err_text for k in rate_limit_markers):
+        return True
+    network_markers = ("timeout", "timed out", "connection", "temporarily unavailable",
+                       "reset by peer", "deadline exceeded")
+    if any(k in err_text.lower() for k in network_markers):
+        return True
+    exc_type_name = type(exc).__name__.lower()
+    if any(k in exc_type_name for k in ("timeout", "connection")):
+        return True
+    return False
+
+
 def ask_gemini(prompt: str, label: str = "", config: Optional[dict] = None,
                return_meta: bool = False):
-    """
-    调用Gemini生成内容。
-
-    v18新增两个可选参数（向后兼容，不传时行为与v17完全一致）：
-      config      ：覆盖默认的GEMINI_CFG_DEEP，SEO文章调用使用独立的
-                    GEMINI_CFG_SEO_ARTICLE（更大的max_output_tokens）
-      return_meta ：True时返回(text, finish_reason, thoughts_tokens,
-                    output_tokens)四元组，用于诊断MAX_TOKENS截断——
-                    Gemini 2.5系列的thinking token与正文token共享
-                    同一个max_output_tokens预算池，且thinking_budget
-                    不保证被严格遵守，一旦真的触发截断，这里能给出
-                    精确的token消耗数字，而不是靠正则猜测。
-                    False（默认）时只返回文本字符串，与旧调用方完全兼容。
-    """
     empty_result = ("", "", 0, 0) if return_meta else ""
     if not gemini_client:
         log.warning("Gemini未配置")
@@ -1616,12 +1482,12 @@ def ask_gemini(prompt: str, label: str = "", config: Optional[dict] = None,
 
         except Exception as e:
             err = str(e)
-            if any(k in err for k in ("429", "503", "RESOURCE_EXHAUSTED", "overloaded", "quota")):
+            if _is_retryable_error(err, e):
                 if attempt < RETRY_MAX:
-                    log.warning(f"Gemini限速 [{label}] {attempt}/{RETRY_MAX}，{RETRY_WAIT}s后重试...")
+                    log.warning(f"Gemini可重试错误 [{label}] {attempt}/{RETRY_MAX}: {err[:200]}，{RETRY_WAIT}s后重试...")
                     time.sleep(RETRY_WAIT)
                 else:
-                    log.error(f"Gemini [{label}] 达到10分钟上限，放弃")
+                    log.error(f"Gemini [{label}] 达到{RETRY_MAX}次重试上限，放弃: {err[:200]}")
                     return empty_result
             else:
                 log.error(f"Gemini不可重试错误 [{label}]: {err}")
@@ -1639,38 +1505,53 @@ def send_telegram(text: str) -> None:
     url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
     for chunk in chunks:
-        try:
-            r = requests.post(url, json={
-                "chat_id": CHAT_ID, "text": chunk,
-                "parse_mode": "HTML", "disable_web_page_preview": True,
-            }, timeout=10)
-            r.raise_for_status()
-        except requests.HTTPError as e:
-            log.error(f"Telegram HTTP错误: {e}")
-        except Exception as e:
-            log.error(f"Telegram发送失败: {e}")
+        for attempt in range(1, NET_RETRY_MAX + 1):
+            try:
+                r = requests.post(url, json={
+                    "chat_id": CHAT_ID, "text": chunk,
+                    "parse_mode": "HTML", "disable_web_page_preview": True,
+                }, timeout=10)
+                r.raise_for_status()
+                break
+            except requests.HTTPError as e:
+                log.error(f"Telegram HTTP错误（不重试，需人工检查token/chat_id）: {e}")
+                break
+            except Exception as e:
+                if attempt < NET_RETRY_MAX:
+                    wait = NET_RETRY_WAIT * attempt
+                    log.warning(f"Telegram发送失败 第{attempt}次: {e}，{wait:.0f}s后重试...")
+                    time.sleep(wait)
+                else:
+                    log.error(f"Telegram发送失败，达到{NET_RETRY_MAX}次重试上限: {e}")
         time.sleep(0.5)
 
 
 def send_document(filename: str, content: str, caption: str = "") -> None:
-    """Prompt以.txt附件发送，避免长消息被Telegram分割"""
     if not TELEGRAM_TOKEN or not CHAT_ID:
         log.warning("Telegram未配置，跳过send_document")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
-    try:
-        r = requests.post(
-            url,
-            data={"chat_id": CHAT_ID, "caption": caption},
-            files={"document": (filename, content.encode("utf-8"), "text/plain")},
-            timeout=30,
-        )
-        r.raise_for_status()
-        log.info(f"文件发送成功: {filename} ({len(content)} 字符)")
-    except requests.HTTPError as e:
-        log.error(f"send_document HTTP错误 [{filename}]: {e}")
-    except Exception as e:
-        log.error(f"send_document失败 [{filename}]: {e}")
+    for attempt in range(1, NET_RETRY_MAX + 1):
+        try:
+            r = requests.post(
+                url,
+                data={"chat_id": CHAT_ID, "caption": caption},
+                files={"document": (filename, content.encode("utf-8"), "text/plain")},
+                timeout=30,
+            )
+            r.raise_for_status()
+            log.info(f"文件发送成功: {filename} ({len(content)} 字符)")
+            return
+        except requests.HTTPError as e:
+            log.error(f"send_document HTTP错误（不重试）[{filename}]: {e}")
+            return
+        except Exception as e:
+            if attempt < NET_RETRY_MAX:
+                wait = NET_RETRY_WAIT * attempt
+                log.warning(f"send_document失败 第{attempt}次 [{filename}]: {e}，{wait:.0f}s后重试...")
+                time.sleep(wait)
+            else:
+                log.error(f"send_document失败，达到{NET_RETRY_MAX}次重试上限 [{filename}]: {e}")
 
 # ════════════════════════════════════════════════════════════
 # 6. Prompt构建
@@ -1678,46 +1559,57 @@ def send_document(filename: str, content: str, caption: str = "") -> None:
 
 def _build_screener_prompt(signal: dict, timeline: str, tier_label: str) -> str:
     t = signal
-    ma200_str  = f"MA200:{t['ma200']}" if t.get("ma200") else "MA200:数据不足"
-    vol_c_str  = "✅ 近5日量能逐步递增" if t.get("vol_consistency") else "量能无持续性"
-    pct_1y_str = f"{t.get('price_pct_1y', 50)}%分位（1年历史）"
-    pe         = t.get("price_events", [])
-    pe_str     = "\n".join(
-        f"  {e['date']} 单日{'+' if e['change_pct'] > 0 else ''}{e['change_pct']}%"
+    ma200_line = (f"MA200: {t['ma200']}" if t.get("ma200")
+                 else "MA200: N/A (fewer than 200 trading days of price history available)")
+    pct_1y_line = f"Current close is at the {t.get('price_pct_1y', 50)}th percentile of trailing 1-year daily closes"
+    pe          = t.get("price_events", [])
+    pe_str      = "\n".join(
+        f"  {e['date']}  single-session move: {'+' if e['change_pct'] > 0 else ''}{e['change_pct']}%"
         for e in pe[:6]
-    ) if pe else "  近6个月无±5%单日大幅波动"
+    ) if pe else "  No single-session move of +/-5% or greater in the trailing ~6 months"
 
     tier_bonus_val = TIER_BONUS.get(t.get("tier_level", ""), 0.0)
 
     tech_block = (
-        f"价格:{t['price']}({t['change_pct']:+.2f}%) | "
-        f"1年历史分位:{pct_1y_str} | {vol_c_str}\n"
-        f"MA20:{t['ma20']} MA50:{t['ma50']} {ma200_str}\n"
-        f"RSI:{t['rsi14']} ADX:{t['adx14']} +DI:{t['plus_di']} -DI:{t['minus_di']}\n"
-        f"VWAP20:{'上升' if t['vwap_up'] else '下降'} 量比:{t['vol_ratio']}x\n"
-        f"RS(vsXJO):{t['rs_vs_xjo']} ATR:{t['atr14_pct']}% "
-        f"52W高:{t['w52_hi']}(距{t['dist_52w_hi_pct']}%) 低:{t['w52_lo']}\n"
-        f"近6月最大回撤:{t['max_dd_6m_pct']}%\n"
-        f"趋势强度评分:{t.get('trend_strength_score', 'N/A')}"
-        f"（筛选/排序核心依据，0-1分，{tier_label}门槛为{TREND_SCORE_THRESHOLD.get(t.get('tier_level',''), 'N/A')}）\n"
-        f"趋势持续性:{t.get('persistence_score', 0.0)}（趋势维持时长，非当前强度）\n"
-        f"综合评分:{t.get('composite_score', 'N/A')}"
-        f"（已含{tier_label}层级加成+{tier_bonus_val}，不同层级间的绝对值不可直接横向比较）"
+        f"Price: {t['price']} (daily change: {t['change_pct']:+.2f}%)\n"
+        f"{pct_1y_line}\n"
+        f"5-day volume sequence monotonically non-decreasing: {t.get('vol_consistency')} "
+        f"(definition: true if each of the last 5 daily volumes is >= the prior day's volume)\n"
+        f"MA20: {t['ma20']} | MA50: {t['ma50']} | {ma200_line}\n"
+        f"RSI(14): {t['rsi14']} | ADX(14): {t['adx14']} | +DI: {t['plus_di']} | -DI: {t['minus_di']}\n"
+        f"VWAP(20): {t['vwap20']} | VWAP 5-session slope: {t.get('vwap_slope', 'N/A')} "
+        f"(raw slope value; positive = VWAP has risen over the last 5 sessions)\n"
+        f"Volume ratio (today's volume / 20-day average volume): {t['vol_ratio']}x\n"
+        f"Relative strength vs XJO index, 20-day (ratio of returns): {t['rs_vs_xjo']} "
+        f"(1.0 = matched the index's return; >1.0 = outperformed; <1.0 = underperformed)\n"
+        f"ATR(14) as % of price: {t['atr14_pct']}%\n"
+        f"52-week high: {t['w52_hi']} (current price is {t['dist_52w_hi_pct']}% from this high) | "
+        f"52-week low: {t['w52_lo']}\n"
+        f"Max drawdown, trailing 6 months: {t['max_dd_6m_pct']}%\n"
+        f"Trend strength score: {t.get('trend_strength_score', 'N/A')} "
+        f"(0-1 scale, weighted composite of 7 technical sub-factors; this tier's [{tier_label}] "
+        f"pass threshold on this metric alone is {TREND_SCORE_THRESHOLD.get(t.get('tier_level',''), 'N/A')})\n"
+        f"Trend persistence score: {t.get('persistence_score', 0.0)} "
+        f"(0-1 scale, measures how long the current trend has been sustained over the trailing "
+        f"10-20 sessions; this is a duration measure, not a strength measure)\n"
+        f"Composite score: {t.get('composite_score', 'N/A')} "
+        f"(includes a fixed +{tier_bonus_val} bonus for tier {tier_label}; composite scores are "
+        f"not directly comparable across different tiers)"
     )
 
     return f"""你是一位专注ASX市场的资深机构分析师。今天是{date.today().isoformat()}。
 
 ===== 分析标的 =====
 {t['ticker']} | 筛选等级:{tier_label} | 综合评分:{t.get('composite_score','N/A')}
-{t.get('company_name','未知')} ({t.get('sector','未知')}/{t.get('industry','未知')}) 市值:{t.get('market_cap_m',0)}M AUD
+{t.get('company_name','Unknown')} (Sector: {t.get('sector','Unknown')} / Industry: {t.get('industry','Unknown')}) Market cap: {t.get('market_cap_m',0)}M AUD
 
-===== 技术指标（1年数据）=====
+===== TECHNICAL DATA (raw, 1-year lookback) =====
 {tech_block}
 
-===== 近6个月单日大幅波动节点 =====
+===== SINGLE-SESSION MOVES OF +/-5% OR GREATER, TRAILING ~6 MONTHS =====
 {pe_str}
 
-===== 精选新闻/公告时间线（已过滤噪音，按重要度排序）=====
+===== NEWS & ANNOUNCEMENTS TIMELINE (noise-filtered, sorted by significance) =====
 {timeline}
 
 ===== 分析任务 =====
@@ -1746,79 +1638,82 @@ def _build_screener_prompt(signal: dict, timeline: str, tier_label: str) -> str:
 
 def _build_report_stock_block(ticker: str, tech: dict, fund: dict,
                                timeline: str, pdf_texts: list, rank: int) -> str:
-    ma200_str  = f"MA200:{tech['ma200']}" if tech.get("ma200") else "MA200:N/A"
-    vol_c_str  = "量能连续递增✅" if tech.get("vol_consistency") else "量能无持续性"
-    pct_1y_str = f"{tech.get('price_pct_1y', 50)}%分位(1年)"
-    pe         = tech.get("price_events", [])
-    pe_str     = " | ".join(
+    ma200_line = (f"MA200: {tech['ma200']}" if tech.get("ma200")
+                 else "MA200: N/A (fewer than 200 trading days of price history)")
+    pct_1y_line = f"Current close is at the {tech.get('price_pct_1y', 50)}th percentile of trailing 1-year daily closes"
+    pe          = tech.get("price_events", [])
+    pe_str      = " | ".join(
         f"{e['date']}:{'+' if e['change_pct'] > 0 else ''}{e['change_pct']}%"
         for e in pe[:5]
-    ) if pe else "近6个月无大幅波动"
+    ) if pe else "No single-session move of +/-5% or greater in the trailing ~6 months"
 
     trend_score = tech.get("trend_strength_score")
-    trend_score_str = (f"{trend_score}" if trend_score is not None
-                       else "N/A（非screener筛选信号，见下方降级模式说明）")
+    trend_score_str = (
+        f"{trend_score} (0-1 scale, weighted composite of 7 technical sub-factors)"
+        if trend_score is not None
+        else "N/A (this stock was sourced from the top-movers-by-% fallback list, not the tier screener; see degraded-mode note below)"
+    )
 
-    composite = tech.get("composite_score")
+    composite  = tech.get("composite_score")
     tier_level = tech.get("tier_level", "")
     if composite is None:
         composite_str = "N/A"
-        bonus_note = "（降级模式：大盘红灯或涨幅榜数据，未经tier筛选，无有效综合评分）"
+        bonus_note = ("(Degraded mode: this data came from a red-market day or a day when no tier "
+                     "candidates passed, not from the tier screener; there is no valid composite score.)")
     else:
-        composite_str = f"{composite}"
+        composite_str  = f"{composite}"
         tier_bonus_val = TIER_BONUS.get(tier_level, 0.0)
-        bonus_note = f"（已含层级加成+{tier_bonus_val}）"
+        bonus_note = (f"(Includes a fixed +{tier_bonus_val} bonus for tier {tier_level or 'N/A'}; "
+                     f"composite scores are not directly comparable across different tiers.)")
 
     tech_line = (
-        f"价格:{tech['price']}({tech['change_pct']:+.2f}%) {pct_1y_str} {vol_c_str}\n"
-        f"MA50:{tech['ma50']} {ma200_str} RSI:{tech['rsi14']} ADX:{tech['adx14']} "
-        f"量比:{tech['vol_ratio']}x RS:{tech['rs_vs_xjo']} "
-        f"ATR:{tech['atr14_pct']}% 52W高:{tech['w52_hi']}(距{tech['dist_52w_hi_pct']}%)\n"
-        f"近6月最大回撤:{tech['max_dd_6m_pct']}%\n"
-        f"趋势强度评分:{trend_score_str} | 趋势持续性:{tech.get('persistence_score', 0.0)}\n"
-        f"综合评分:{composite_str}{bonus_note}\n"
-        f"大涨大跌节点：{pe_str}"
+        f"Price: {tech['price']} (daily change: {tech['change_pct']:+.2f}%)\n"
+        f"{pct_1y_line}\n"
+        f"5-day volume sequence monotonically non-decreasing: {tech.get('vol_consistency')} "
+        f"(definition: true if each of the last 5 daily volumes is >= the prior day's volume)\n"
+        f"MA50: {tech['ma50']} | {ma200_line}\n"
+        f"RSI(14): {tech['rsi14']} | ADX(14): {tech['adx14']}\n"
+        f"Volume ratio (today's volume / 20-day average volume): {tech['vol_ratio']}x\n"
+        f"Relative strength vs XJO index, 20-day (ratio of returns): {tech['rs_vs_xjo']} "
+        f"(1.0 = matched the index's return; >1.0 = outperformed)\n"
+        f"ATR(14) as % of price: {tech['atr14_pct']}%\n"
+        f"52-week high: {tech['w52_hi']} (current price is {tech['dist_52w_hi_pct']}% from this high)\n"
+        f"Max drawdown, trailing 6 months: {tech['max_dd_6m_pct']}%\n"
+        f"Trend strength score: {trend_score_str}\n"
+        f"Trend persistence score: {tech.get('persistence_score', 0.0)} "
+        f"(0-1 scale, measures how long the current trend has been sustained over the trailing "
+        f"10-20 sessions; this is a duration measure, not a strength measure)\n"
+        f"Composite score: {composite_str} {bonus_note}\n"
+        f"Single-session moves of +/-5% or greater, trailing ~6 months: {pe_str}"
     )
 
     block = (
         f"\n{'='*50}\n"
         f"#{rank} {ticker} | {fund.get('company_name', ticker)}\n"
-        f"板块:{fund.get('sector','未知')} | 市值:{fund.get('market_cap_m',0)}M AUD\n"
+        f"Sector: {fund.get('sector','Unknown')} | Market cap: {fund.get('market_cap_m',0)}M AUD\n"
         f"{'='*50}\n"
-        f"【技术面数据】\n{tech_line}\n\n"
-        f"【精选新闻/公告时间线（含PDF关键段落，已过滤噪音）】\n{timeline}"
+        f"[TECHNICAL DATA]\n{tech_line}\n\n"
+        f"[NEWS & ANNOUNCEMENTS TIMELINE (noise-filtered, sorted by significance)]\n{timeline}"
     )
     for i, txt in enumerate(pdf_texts[:PDF_MAX_PER_STOCK], 1):
         if len(txt) > 400:
-            block += f"\n\n【价格敏感公告完整原文#{i}（供撰文引用）】\n{txt}"
+            block += f"\n\n[Full text excerpt of price-sensitive announcement #{i}, for citation]\n{txt}"
     return block
 
 
-# ════════════════════════════════════════════════════════════
-# v18新增：SEO文章 + 信号JSON 合并批量Prompt构建 / 解析 / 校验 / 写入
-# ════════════════════════════════════════════════════════════
-
 def _build_seo_article_prompt(market_snap: dict, stock_package: dict) -> str:
-    """
-    v18.2改动：单只股票独立调用（不再批量3只一次性调用）。
-    信号标签字段（JSON_TAG/ONE_LINER）已不再由这里产出——那部分已经
-    恢复到_build_screener_prompt()里，由screener分析调用负责。
-    这里只负责一件事：一篇英文SEO文章 + 一篇中文SEO文章 + 一个slug。
-    结构要求（frontmatter/8章节/FAQ/风格铁律/硬性约束/自检环节）
-    完整保留，不因为改成单只调用而删减。
-    """
+    dev_ma50 = market_snap.get("dev_from_ma50_pct")
+    dev_str  = f"{dev_ma50}%" if dev_ma50 is not None else "N/A"
     sector_str = "、".join(
         f"{s}({p:+.1f}%)" for s, p in market_snap.get("sector_leaders", [])
-    ) or "数据暂缺"
-    status_map = {
-        "red": "大幅下跌⚠️", "yellow": "轻微走弱",
-        "bullish": "强势上涨", "normal": "窄幅震荡",
-    }
+    ) or "No data available"
     market_block = (
         f"Date: {market_snap.get('date', date.today().isoformat())}\n"
         f"ASX200: {market_snap.get('xjo_close',0)} "
-        f"({market_snap.get('xjo_change_pct',0):+.2f}%, "
-        f"{status_map.get(market_snap.get('market_status','normal'),'normal')})\n"
+        f"(daily change: {market_snap.get('xjo_change_pct',0):+.2f}%)\n"
+        f"Market status classification: {market_snap.get('market_status','normal')} "
+        f"(internal categorical label; underlying data: ASX200 deviation from its 50-day moving "
+        f"average is {dev_str})\n"
         f"Sector leaders today: {sector_str}"
     )
 
@@ -1991,13 +1886,6 @@ BACKTEST BEFORE FINAL OUTPUT (MANDATORY EXECUTION)
 
 def _parse_seo_article_response(raw_text: str, ticker: str,
                                  gemini_meta: Optional[dict] = None) -> dict:
-    """
-    v18.2改动：单只股票解析，不再需要按ticker拆block（每次调用本来就只有
-    一只股票）。只提取slug/英文文章/中文文章，JSON标签字段不再由这里产出。
-
-    gemini_meta（可选）：{"finish_reason", "thoughts_tokens", "output_tokens"}
-    用于在marker缺失时给出精确失败原因，而不是"疑似截断"这种猜测性描述。
-    """
     gemini_meta     = gemini_meta or {}
     finish_reason   = gemini_meta.get("finish_reason", "")
     thoughts_tokens = gemini_meta.get("thoughts_tokens", 0)
@@ -2036,10 +1924,6 @@ def _parse_seo_article_response(raw_text: str, ticker: str,
 
 
 def _validate_seo_article_fields(fields: dict) -> tuple:
-    """
-    任何一项不通过 → 这只股票的文章本次跳过，绝不用半成品覆盖GitHub。
-    v18.2改动：去掉JSON_TAG/ONE_LINER相关校验（这些字段已不在这次调用产出）。
-    """
     if not fields.get("_valid", False):
         return False, fields.get("_fail_reason", "解析失败")
 
@@ -2061,30 +1945,12 @@ def _validate_seo_article_fields(fields: dict) -> tuple:
 
     return True, ""
 
-def _write_seo_article_files(ticker: str, slug: str, content_en: str, content_zh: str,
-                              dir_en: Optional[str] = None, dir_zh: Optional[str] = None) -> tuple:
-    """
-    文件名格式（已与用户确认，固定不变）：
-        {YYYY-MM-DD}-{完整ticker含.AX}-{slug}.md
-        例：2026-07-07-BHP.AX-iron-ore-rally-continuation.md
-    中英文文件用完全相同的文件名，只是分别存放在不同目录。
-    文件名不依赖Gemini输出的整体格式——Gemini只负责生成slug这一个
-    3-6个单词的短语（通过SEO_SLUG marker提取），日期和ticker都是
-    外部代码拼装的，slug本身还会经过_sanitize_slug()二次清洗
-    （只保留小写字母数字和连字符），所以最终文件名的正确性不依赖
-    Gemini有没有守规矩。
-
-    v18.1新增dir_en/dir_zh参数：不传时使用线上真实目录
-    （BLOG_CONTENT_DIR_EN/ZH）；试运行(dry_run)时由调用方传入
-    TEST_OUTPUT_DIR_EN/ZH，两套目录完全隔离。
-    """
-    dir_en = dir_en or BLOG_CONTENT_DIR_EN
-    dir_zh = dir_zh or BLOG_CONTENT_DIR_ZH
+def _write_seo_article_files(ticker: str, slug: str, content_en: str, content_zh: str) -> tuple:
     filename = f"{date.today().isoformat()}-{ticker}-{slug}.md"
-    os.makedirs(dir_en, exist_ok=True)
-    os.makedirs(dir_zh, exist_ok=True)
-    path_en = os.path.join(dir_en, filename)
-    path_zh = os.path.join(dir_zh, filename)
+    os.makedirs(BLOG_CONTENT_DIR_EN, exist_ok=True)
+    os.makedirs(BLOG_CONTENT_DIR_ZH, exist_ok=True)
+    path_en = os.path.join(BLOG_CONTENT_DIR_EN, filename)
+    path_zh = os.path.join(BLOG_CONTENT_DIR_ZH, filename)
     with open(path_en, "w", encoding="utf-8") as f:
         f.write(content_en)
     with open(path_zh, "w", encoding="utf-8") as f:
@@ -2093,18 +1959,17 @@ def _write_seo_article_files(ticker: str, slug: str, content_en: str, content_zh
 
 
 def serialize_to_prompt(market_snap: dict, stocks_block: str, platform: str) -> str:
+    dev_ma50 = market_snap.get("dev_from_ma50_pct")
+    dev_str  = f"{dev_ma50}%" if dev_ma50 is not None else "N/A"
     sector_str = "、".join(
         f"{s}({p:+.1f}%)" for s, p in market_snap.get("sector_leaders", [])
     ) or "数据暂缺"
-    status_map = {
-        "red": "大幅下跌⚠️", "yellow": "轻微走弱",
-        "bullish": "强势上涨", "normal": "窄幅震荡",
-    }
     market_block = (
         f"日期：{market_snap.get('date', date.today().isoformat())}\n"
         f"ASX200：{market_snap.get('xjo_close',0)} "
-        f"({market_snap.get('xjo_change_pct',0):+.2f}%，"
-        f"{status_map.get(market_snap.get('market_status','normal'),'正常')})\n"
+        f"（当日涨跌幅：{market_snap.get('xjo_change_pct',0):+.2f}%）\n"
+        f"大盘状态分类：{market_snap.get('market_status','normal')}"
+        f"（内部分类标签；驱动该分类的原始数据：ASX200偏离50日均线 {dev_str}）\n"
         f"今日领涨板块：{sector_str}"
     )
 
@@ -2402,32 +2267,12 @@ D. Do not explain your process—output only the final version of the copy.
 # 7. 选股筛选
 # ════════════════════════════════════════════════════════════
 
-# ============================================================
-# _passes_tier() 最终替换版
-#
-# 改动：原有7个高相关硬性条件(volume_multiple/near_52w_hi/
-# ma_alignment/relative_strength/hh_hl_structure/ma50_trend/
-# vwap_position)合并为trend_strength_score加权评分。
-#
-# 保留硬性AND的条件（"能不能交易"问题，不是"趋势强弱"问题）：
-# liquidity / consolidation / volume_quality / di_direction /
-# adx_strength / rsi_range / close_position
-#
-# 阈值来源：用真实ASX全市场1628只股票数据反推校准
-# （2026-07-04诊断，trend_strength_score v2版本）
-# ============================================================
-
 TREND_SCORE_THRESHOLD = {
-    "T1": 0.45,   # trend_strength_score层面通过率约7.6%（123/1628）
-    "T2": 0.40,   # 约12.8%（209/1628）
-    "T3": 0.35,   # 约31.0%（504/1628）
-    "T4": 0.30,   # 约45.5%（740/1628）
+    "T1": 0.45,
+    "T2": 0.40,
+    "T3": 0.35,
+    "T4": 0.30,
 }
-# 注：以上是trend_strength_score单独层面的通过率，
-# 叠加liquidity/consolidation/volume_quality/di_direction/
-# adx_strength/rsi_range/close_position这7个硬性条件后，
-# 最终真实通过率会显著更低，需要跑一次完整run_screener_flow()
-# 验证实际效果，而不是只看这一层的数字。
 
 def _passes_tier(tech: dict, tier: dict) -> bool:
     lc        = tech["price"]
@@ -2437,38 +2282,30 @@ def _passes_tier(tech: dict, tier: dict) -> bool:
     high_s    = tech["_high"]
     low_s     = tech["_low"]
 
-    # ── 硬性条件1：最低流动性（"能不能交易"问题，不参与评分）──────
     if float(volume_s.iloc[-20:].mean()) * lc < 300_000:
         return False
 
-    # ── 硬性条件2：整理幅度（防止追涨过高风险位）──────────────────
     r15 = pd.concat([high_s, low_s], axis=1).iloc[-15:]
     pr  = (float(r15.iloc[:, 0].max()) - float(r15.iloc[:, 1].min())) / lc
     if pr > tier["consol"]:
         return False
 
-    # ── 硬性条件3：v16量能质量检查（排除爆量脉冲/无方向震荡）──────
     if tier["vol_decline"]:
         if not _check_volume_quality(volume_s):
             return False
 
-    # ── 硬性条件4：DI方向（趋势方向性的基础判断，不模糊化）────────
     if tier["di_cross"] and tech["plus_di"] <= tech["minus_di"]:
         return False
 
-    # ── 硬性条件5：ADX强度门槛（是否存在明确趋势）─────────────────
     if tech["adx14"] < tier["adx_min"]:
         return False
 
-    # ── 硬性条件6：RSI区间（防止追高/抄底两个极端）────────────────
     if not (tier["rsi_lo"] <= tech["rsi14"] <= tier["rsi_hi"]):
         return False
 
-    # ── 硬性条件7：收盘位置（当天买盘强度，短周期信号）────────────
     if close_pos < tier["close_pos"]:
         return False
 
-    # ── 趋势强度综合评分（替代原7个高相关硬性AND条件）─────────────
     trend_result = calc_trend_strength_score(tech, tier)
     tech["trend_strength_score"] = trend_result["trend_strength_score"]
     tech["trend_sub_scores"]     = trend_result["sub_scores"]
@@ -2542,9 +2379,6 @@ def select_top3(all_data: dict, market_snap: dict,
     raw_signals.sort(key=lambda x: x["composite_score"], reverse=True)
     raw_signals = raw_signals[:10]
 
-    # 市值过滤：Top10候选池全部要求通过（不只是Top3），
-    # 因为Top4-Top10现在也要进入watchlist做盘中监测，
-    # 同样需要满足最低市值门槛，避免监测流动性太差的股票
     filtered_pool = []
     for s in raw_signals:
         fund = fetch_fundamentals(s["ticker"])
@@ -2557,8 +2391,6 @@ def select_top3(all_data: dict, market_snap: dict,
         s["take_profit"] = round(s["price"] * 1.20, 3)
         filtered_pool.append(s)
 
-    # Top3：仍然是市值过滤后的候选池里排名最前的3只，
-    # 用于JSON推送/SEO文章/Gemini分析/详细Telegram，逻辑不变
     signals = filtered_pool[:TOP_N]
 
     tier_summary = {}
@@ -2577,9 +2409,6 @@ def select_top3(all_data: dict, market_snap: dict,
             )
         log.info(f"signals_history写入：{len(raw_signals)} 条候选（Top3已标记）")
 
-        # 改动：watchlist写入范围从signals（Top3）扩大到
-        # filtered_pool（市值过滤后的Top10全部），
-        # Top1-Top10同等对待，不做优先级区分
         wdb.init_watchlist_db()
         for s in filtered_pool:
             wdb.upsert_watchlist(
@@ -2599,9 +2428,6 @@ VALIDATION_LOG_PATH = os.path.join(
 
 def log_tier_validation(raw_signals: list, signals: list,
                         tier_label: str, market_snap: dict) -> None:
-    """
-    记录本次运行的T1-T4筛选质量诊断信息到独立日志文件。
-    """
     today = date.today().isoformat()
 
     tier_counts = {}
@@ -2673,13 +2499,6 @@ def log_tier_validation(raw_signals: list, signals: list,
         log.error(f"验证日志写入失败: {e}")
 
 def _passes_tier_diagnostic(tech: dict, tier: dict) -> dict:
-    """
-    诊断版本的_passes_tier，不做提前return，
-    而是记录每一个条件的通过/失败情况，返回完整字典。
-    
-    用途：临时诊断工具，找出T1/T2为什么几乎不触发。
-    正式筛选逻辑仍用_passes_tier()，不受影响。
-    """
     lc        = tech["price"]
     vol_ratio = tech["vol_ratio"]
     close_pos = tech["close_pos_pct"] / 100.0
@@ -2701,14 +2520,14 @@ def _passes_tier_diagnostic(tech: dict, tier: dict) -> dict:
     if tier["vol_decline"]:
         checks["volume_quality"] = _check_volume_quality(volume_s)
     else:
-        checks["volume_quality"] = True  # T4不检查，视为通过
+        checks["volume_quality"] = True
 
     checks["ma_alignment"] = _check_ma_alignment(tech, tier["level"])
 
     if tier["level"] in ("T1", "T2"):
         checks["hh_hl_structure"] = _check_higher_highs_lows(high_s, low_s)
     else:
-        checks["hh_hl_structure"] = True  # T3/T4不要求
+        checks["hh_hl_structure"] = True
 
     checks["near_52w_hi"] = (not tier["near_52w_hi"]) or (lc >= w52_hi * 0.90)
 
@@ -2732,12 +2551,6 @@ def _passes_tier_diagnostic(tech: dict, tier: dict) -> dict:
 
 def run_tier_diagnostic(all_data: dict, market_snap: dict, 
                          tier_levels: list = ["T1", "T2"]) -> None:
-    """
-    诊断工具：对全市场股票跑指定tier的诊断版筛选，
-    统计每个条件的失败率，找出系统性瓶颈。
-    
-    独立运行，不影响正常的run_screener_flow()流程。
-    """
     xjo_s = market_snap.get("xjo_series")
     tier_map = {t["level"]: t for t in TIERS}
     
@@ -2778,17 +2591,6 @@ def run_tier_diagnostic(all_data: dict, market_snap: dict,
 
 def run_threshold_scan(all_data: dict, market_snap: dict,
                        tier_levels: list = None) -> None:
-    """
-    阈值校准工具：计算全市场股票的trend_strength_score分布，
-    输出不同阈值下各tier的通过率，供人工选定合适阈值。
-
-    这是一次性诊断工具，用真实市场数据反推TREND_SCORE_THRESHOLD，
-    不是凭空猜测的数字。
-
-    注意：此函数只计算trend_strength_score本身的分布，
-    不叠加liquidity/consolidation等其他硬性条件，
-    这样能单独看清楚这一个评分维度的真实区分能力。
-    """
     if tier_levels is None:
         tier_levels = ["T1", "T2", "T3", "T4"]
 
@@ -2832,12 +2634,6 @@ def run_threshold_scan(all_data: dict, market_snap: dict,
         log.info("")
 
 def run_screener_flow(all_data: dict, market_snap: dict) -> list:
-    """
-    v18.2：T1-T4筛选 + Gemini逐只深度分析 → Telegram + 解析JSON标签字段
-    → 生成signals.json → push GitHub。这是v17原有行为的恢复，与SEO文章
-    生成（run_seo_article_flow）彻底解耦——signals.json的更新不等待
-    任何SEO调用，保证信号发布是最快最稳定的一环。
-    """
     today   = date.today().strftime("%Y-%m-%d")
     start   = time.time()
     status  = market_snap.get("market_status", "normal")
@@ -2876,8 +2672,6 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         + market_note
     )
 
-    # Top3逐只Gemini深度分析（Telegram阅读 + 解析JSON标签字段，
-    # 用于下面生成signals.json；SEO文章由run_seo_article_flow单独负责）
     log.info(f"深度分析 Top {len(signals)} 只（Gemini）...")
     for idx, s in enumerate(signals, 1):
         code = s["ticker"].replace(".AX", "")
@@ -2893,8 +2687,6 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         if not analysis:
             analysis = "⚠️ Gemini分析暂时不可用"
 
-        # v18.2恢复：JSON标签字段解析+confidence计算，回到v17原有逻辑，
-        # 与SEO文章生成彻底解耦，signals.json不再等待任何SEO调用
         json_fields             = _parse_gemini_json_fields(analysis)
         s["_json_tag_en"]       = json_fields.get("tag_en", "")
         s["_json_tag_zh"]       = json_fields.get("tag_zh", "")
@@ -2934,8 +2726,6 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         )
         time.sleep(1.0)
 
-    # v18.2恢复：signals.json生成 + GitHub推送，独立于SEO文章，
-    # 最高优先级，第一时间更新，不等任何SEO调用结果
     valid_signals = [s for s in signals if s.get("_json_valid")]
     log.info(f"生成signals.json：{len(valid_signals)}/{len(signals)} 只有效JSON字段...")
     written = generate_signals_json(valid_signals)
@@ -2966,31 +2756,14 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
     return signals
 
 
-def run_seo_article_flow(signals: list, market_snap: dict, dry_run: bool = False) -> None:
-    """
-    v18.2重写：不再是单次批量调用，改为Top1/Top2/Top3各自独立调用Gemini
-    （3次调用，每次1只股票，产出1篇英文+1篇中文SEO文章）。
-
-    与信号JSON彻底解耦：signals.json的生成和推送已经在run_screener_flow()
-    里完成，本函数只负责文章，不再产出/依赖任何JSON标签字段。
-
-    每只股票独立处理、独立commit：
-      - 某只股票的Gemini调用/校验失败 → 该股票单独跳过+Telegram告警，
-        并把该股票专属的prompt原文作为.txt附件发送，供人工手动补救；
-        不影响其他两只股票的正常发布
-      - 某只股票成功 → 立即写文件+push，不等其他股票
-
-    dry_run=True时：写入本地测试目录（TEST_OUTPUT_DIR_EN/ZH），文章原文
-    直接发Telegram供审阅，不推送GitHub。
-    """
+def run_seo_article_flow(signals: list, market_snap: dict) -> None:
     if not signals:
         log.info("run_seo_article_flow: 无signals，跳过（大盘红灯或T1-T4均无候选）")
         return
 
     today      = date.today().isoformat()
     today_ann  = fetch_today_announcements()
-    mode_label = "🧪 测试模式" if dry_run else "正式模式"
-    log.info(f"=== SEO文章逐只生成流程启动（{mode_label}） ===")
+    log.info("=== SEO文章逐只生成流程启动 ===")
 
     success_count = 0
 
@@ -3053,34 +2826,23 @@ def run_seo_article_flow(signals: list, market_snap: dict, dry_run: bool = False
             continue
 
         try:
-            if dry_run:
-                path_en, path_zh = _write_seo_article_files(
-                    ticker, fields["slug_clean"], fields["seo_en_raw"], fields["seo_zh_raw"],
-                    dir_en=TEST_OUTPUT_DIR_EN, dir_zh=TEST_OUTPUT_DIR_ZH,
-                )
-                fname = os.path.basename(path_en)
-                send_document(fname, fields["seo_en_raw"], caption=f"🧪 {ticker} 英文文章试跑结果")
-                send_document(fname, fields["seo_zh_raw"], caption=f"🧪 {ticker} 中文文章试跑结果")
-                send_telegram(f"🧪 [Top{rank} {ticker}] 试跑完成，未推送GitHub，写入测试目录：{path_en}")
+            path_en, path_zh = _write_seo_article_files(
+                ticker, fields["slug_clean"], fields["seo_en_raw"], fields["seo_zh_raw"]
+            )
+            rel_en = os.path.relpath(path_en, ASXBOX_REPO)
+            rel_zh = os.path.relpath(path_zh, ASXBOX_REPO)
+            pushed = push_to_github(
+                [rel_en, rel_zh],
+                commit_message=f"content: {ticker} SEO article {today}",
+            )
+            if pushed:
+                send_telegram(f"✅ [Top{rank} {ticker}] SEO文章已生成并推送GitHub")
                 success_count += 1
             else:
-                path_en, path_zh = _write_seo_article_files(
-                    ticker, fields["slug_clean"], fields["seo_en_raw"], fields["seo_zh_raw"]
+                send_telegram(
+                    f"⚠️ [Top{rank} {ticker}] SEO文章已生成但GitHub推送失败，"
+                    f"请查看screener.log手动处理"
                 )
-                rel_en = os.path.relpath(path_en, ASXBOX_REPO)
-                rel_zh = os.path.relpath(path_zh, ASXBOX_REPO)
-                pushed = push_to_github(
-                    [rel_en, rel_zh],
-                    commit_message=f"content: {ticker} SEO article {today}",
-                )
-                if pushed:
-                    send_telegram(f"✅ [Top{rank} {ticker}] SEO文章已生成并推送GitHub")
-                    success_count += 1
-                else:
-                    send_telegram(
-                        f"⚠️ [Top{rank} {ticker}] SEO文章已生成但GitHub推送失败，"
-                        f"请查看screener.log手动处理"
-                    )
         except Exception as e:
             log.error(f"[{ticker}] 写文件/推送异常: {e}")
             send_telegram(f"⚠️ [Top{rank} {ticker}] SEO文章写入/推送异常: {e}，已附上Prompt人工兜底")
@@ -3091,7 +2853,7 @@ def run_seo_article_flow(signals: list, market_snap: dict, dry_run: bool = False
 
         time.sleep(1.0)
 
-    log.info(f"run_seo_article_flow完成（{mode_label}）：{success_count}/{len(signals)} 只成功")
+    log.info(f"run_seo_article_flow完成：{success_count}/{len(signals)} 只成功")
 
 # ════════════════════════════════════════════════════════════
 # 8. 日报Prompt流程
@@ -3158,8 +2920,6 @@ def run_report_flow(all_data: dict, market_snap: dict,
         f"以下2个文件已发送，复制文件内容给AI生成文章👇"
     )
 
-    # v18改动：平台列表移除"seo"——SEO文章已由run_seo_article_flow
-    # 直接调用Gemini生成并自动推送GitHub，不再需要手动Prompt流程
     for platform in ["twitter", "xiaohongshu"]:
         log.info(f"发送 [{platform}] Prompt文件...")
         prompt_text = serialize_to_prompt(market_snap, stocks_block, platform)
@@ -3177,10 +2937,9 @@ def run_report_flow(all_data: dict, market_snap: dict,
 def main() -> None:
     start = time.time()
     log.info("=" * 60)
-    log.info(f"ASX System v18 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
+    log.info(f"ASX System v18.3 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
     log.info("=" * 60)
 
-    # Step 1：大盘快照
     log.info("【Step 1】大盘快照...")
     market_snap = get_market_snapshot()
     status      = market_snap.get("market_status", "normal")
@@ -3193,7 +2952,6 @@ def main() -> None:
             "日报Prompt将改用涨幅Top3生成，供参考。"
         )
 
-    # Step 2：全市场K线
     log.info("【Step 2】下载全市场K线（1年数据）...")
     universe = get_asx_universe()
     if not universe:
@@ -3210,11 +2968,9 @@ def main() -> None:
     elapsed_dl = round((time.time() - start) / 60, 1)
     log.info(f"【Step 2】K线完成：{len(all_data)} 只，{elapsed_dl} 分钟")
 
-    # Step 2.5：更新历史信号回测结果
     log.info("【Step 2.5】更新历史信号回测结果...")
     update_signal_outcomes(all_data)
 
-    # Step 3：选股流程（仅生成Telegram分析，不再产出JSON/SEO）
     screener_signals = []
     if status != "red":
         log.info("【Step 3】选股筛选流程...")
@@ -3222,16 +2978,12 @@ def main() -> None:
     else:
         log.info("【Step 3】大盘红灯，跳过选股")
 
-    # Step 3.5：SEO文章逐只生成并推送GitHub（v18.2：与Step3的signals.json
-    # 彻底解耦，signals.json在Step3已经推送完毕，这里只负责文章）
     if screener_signals:
-        mode_note = "（🧪 SEO_DRY_RUN=1，试跑模式，不碰GitHub）" if SEO_DRY_RUN else ""
-        log.info(f"【Step 3.5】SEO文章逐只生成流程...{mode_note}")
-        run_seo_article_flow(screener_signals, market_snap, dry_run=SEO_DRY_RUN)
+        log.info("【Step 3.5】SEO文章逐只生成流程...")
+        run_seo_article_flow(screener_signals, market_snap)
     else:
         log.info("【Step 3.5】无screener信号，跳过SEO文章生成，网站保持昨日数据")
 
-    # Step 4：日报Prompt（Twitter/小红书，人工使用）
     log.info("【Step 4】日报Prompt生成流程...")
     run_report_flow(all_data, market_snap,
                     screener_signals=screener_signals if screener_signals else None)
@@ -3241,7 +2993,7 @@ def main() -> None:
     log.info(f"ASX System 全部完成，总耗时：{elapsed} 分钟")
     log.info("=" * 60)
     send_telegram(
-        f"🏁 <b>ASX System v18 全部完成</b>\n"
+        f"🏁 <b>ASX System v18.3 全部完成</b>\n"
         f"📅 {date.today().isoformat()} | ⏱ 总耗时：{elapsed} 分钟\n"
         f"选股：{'跳过（大盘红灯）' if status == 'red' else f'Top{len(screener_signals)}已完成'}\n"
         f"SEO文章/信号JSON：{'已生成，见上方推送结果' if screener_signals else '跳过'}\n"
