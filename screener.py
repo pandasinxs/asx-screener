@@ -1878,9 +1878,10 @@ BACKTEST BEFORE FINAL OUTPUT (MANDATORY EXECUTION)
    complies with SEO best practices, delivers a strong personal perspective,
    no regulatory/legal violations, no hallucinated data.
    If not, draft another one and repeat this step.
-3. Verify the format meets the criteria of md files and output exactly one EN article + one ZH article + one slug.
-4. Verify every marker above is spelled exactly as specified.
-5. Skip any explanation of this process — output ONLY the final version, using the exact
+3. Verify the text logically coherent and concise, avoiding redundant descriptions.
+4. Verify the format meets the criteria of md files and output exactly one EN article + one ZH article + one slug.
+5. Verify every marker above is spelled exactly as specified.
+6. Skip any explanation of this process — output ONLY the final version, using the exact
    marker format above."""
 
 
