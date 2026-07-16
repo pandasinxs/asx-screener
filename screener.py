@@ -2228,7 +2228,7 @@ D. Do not explain your process—output only the final version of the copy.
 三、回测再二次输出（必须执行）
 
 1、先出一版文案草稿给自己回测，看是否符合prompt的要求。
-2、每一个盲盒（股票）用150字以内的字数，按照备注3的语言风格，以主观的视角复述一次草稿，作为输出的文案。
+2、每一个盲盒（股票）用200字以内的字数，按照备注3的语言风格，以主观的视角复述一次草稿，作为输出的文案。
 3、筛选出文案里面所有关于股票和投资和市场和赌博的相关用词，然后替换成合法合规的生活化用词。
 4、检查文章是否有强烈个人观点，没有就加上观点。
 5、检查文章是否有逻辑错误。
@@ -2249,7 +2249,9 @@ D. Do not explain your process—output only the final version of the copy.
 
     instruction = instructions.get(platform, instructions["twitter"])
 
-    return f"""📋 <b>ASX日报Prompt — {platform.upper()} — {market_snap.get('date','')}</b>
+    return f"""请仔细阅读全部输入内容，深度消化，再直接给出最终回复。如果有疑问，请自己解决，我不会再给出更多解释。以下是具体prompt。
+    
+    Prompt — {platform.upper()} — {market_snap.get('date','')}
 
 你是一位专注澳大利亚股市(ASX)的资深投资分析师。以下是今日为你准备的输入数据。
 
