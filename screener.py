@@ -2036,6 +2036,14 @@ TWEET 1 — CATALYST + MARKET INTERPRETATION
 Goal:
 Explain the first reaction
 
+SHARP OPINION RULE：
+Tweet 1 must contain a non-obvious trading observation.
+
+Focus on:
+- what market participants may be misunderstanding
+- where positioning may become uncomfortable
+- what could surprise traders
+
 TWEET 2 — POSITIONING + EXPECTATION RESET
 
 - What changed in market perception
@@ -2145,6 +2153,7 @@ Avoid:
 - if ticker is mentioned in a tweet, ticker format must be for instance“$BHP.AX”
 
 --------------------------------------------------
+
 🔥 X ENGAGEMENT RULE
 
 Each tweet should contain one sharp observation that a trader would want to save or share.
