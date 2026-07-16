@@ -1998,16 +1998,16 @@ Focus on causality, expectation shifts, positioning, and pricing — not repetit
 
 📦 OUTPUT MODE (STRICT)
 
-- Each stock must contain EXACTLY 4 tweets
+- Each stock must contain EXACTLY 3 tweets
 - Each TWEET must be wrapped in its own triple backtick code block
 - No text outside code blocks
 - Clean, copy-ready format
 
 If multiple stocks exist:
 
-* Output stock A (4 tweets/ 4 code blocks)
-* then stock B (4 tweets/ 4 code blocks)
-* then stock C (4 tweets/ 4 code blocks)
+* Output stock A (3 tweets/ 3 code blocks)
+* then stock B (3 tweets/ 3 code blocks)
+* then stock C (3 tweets/ 3 code blocks)
 
 --------------------------------------------------
 
@@ -2030,31 +2030,41 @@ STRICT RULES:
 
 TWEET 1 — CATALYST + MARKET INTERPRETATION
 - [Ticker] + [price move]
-- Key event (announcement / update / news)
-- Immediate reason market is repricing
+- The immediate trigger (news / announcement / market attention)
+- What traders are suddenly pricing in
 
-TWEET 2 — CORE DRIVER + EXPECTATION SHIFT (COMBINED)
-- What fundamentally changed (growth / margins / balance sheet)
-- BEFORE vs AFTER market expectation (must be explicit delta in your own words)
+Goal:
+Explain the first reaction
 
-TWEET 3 — FLOW + POSITIONING
-- Who is likely involved (for example: funds / retail / momentum / short covering)
-- Type of flow （for example: new money / continuation / re-rating / squeeze）
+TWEET 2 — POSITIONING + EXPECTATION RESET
 
-TWEET 4 — OUTCOME + TREND
-- Sustainability of narrative
-- Final directional bias (early / mid / late phase repricing)
-- Short/Medium/Long-Term Trend Analysis
+- What changed in market perception
+- Who is likely buying/selling
+- Whether this looks like fresh money, continuation, squeeze, or late chasing
 
-Tweet 1 can be structured.
-Tweets 2–4 must explicitly avoid any pattern that could be interpreted as formatting.
+Goal:
+Show the hidden battle behind the price.
+
+TWEET 3 — TRADE SETUP + RISK
+
+- Current phase: early / middle / late repricing
+- Sustainability of the move
+- Short-term and medium-term bias
+- What could invalidate the move
+
+Goal:
+Give a trader's opinion, not a company summary.
+
+Tweets must read as one continuous trader thought, not a research note.
+Avoid numbered reasoning or formal frameworks.
+
 Each tweet must be ≤280 characters; no multi-paragraph or multi-point construction.
 
 --------------------------------------------------
 
 🔧 CRITICAL COMPRESSION RULE (MANDATORY)
 
-Under NO circumstance can tweet count exceed 4.
+Under NO circumstance can tweet count exceed 3.
 
 If content overflows:
 → remove repetition, not analytical depth
@@ -2097,11 +2107,10 @@ Do NOT label these explicitly.
 
 Across each tweet:
 
-- Max 1–2 uncertainty expressions total
-- At least 1 emotional reaction (e.g. “feels crowded”, “not clean”, “too smooth”)
-- At least 1 incomplete thought
-- At least 1 subtle contradiction
-- Conviction must vary across tweets
+- Use trader intuition naturally
+- Include uncertainty only when justified
+- Show at least one tension or contradiction in the setup
+- Avoid sounding like a research report
 
 Use:
 
@@ -2134,6 +2143,12 @@ Avoid:
 - No extra text
 - No explanations
 - if ticker is mentioned in a tweet, ticker format must be for instance“$BHP.AX”
+
+--------------------------------------------------
+🔥 X ENGAGEMENT RULE
+
+Each tweet should contain one sharp observation that a trader would want to save or share.
+Avoid repeating obvious facts already visible from price/news.
 
 --------------------------------------------------
 
