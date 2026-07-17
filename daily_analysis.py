@@ -1,11 +1,60 @@
 # ============================================================
-# daily_analysis.py  v2
+# daily_analysis.py  v3.2
 #
-# 整合了 backfill_snapshots.py 的历史数据补齐功能：
+# v3.2修复（相对v3.1）：
+#   - v3.1修了"整体price_slope掩盖回调判断"的问题，但遗留了
+#     同一类问题的两个残留场景：
+#     ① 回撤深度>25%（PULLBACK_MAX_DEPTH_PCT，可能已是真实反转
+#        而非健康回调）时，calc_pullback_health()返回is_pullback
+#        =False，若整体窗口price_slope仍为正，会被误判为
+#        "价格重心上移✅"，掩盖深跌风险。
+#     ② 回撤幅度在8%-25%区间但跌破MA50时，同样is_pullback=False，
+#        同样可能被误判为"价格重心上移✅"，掩盖破位风险。
+#   - 修复：calc_pullback_health()返回值新增broke_ma50字段标记
+#     "跌破MA50提前返回"这一具体原因；evaluate_ticker()在
+#     "回调但非缩量"判断之后、"价格重心上移"判断之前，新增两个
+#     显式分支分别捕获"深跌"和"跌破MA50"两种情况，计入warnings
+#     （不强制改变ready/watch/caution状态阈值，只是不再被
+#     笼统地标记为"价格重心上移✅"）。
+#   - 已用合成数据做四组回归验证：深跌35%场景、回撤14%但破MA50
+#     场景均正确产生警告；v3.1修复的触底反弹场景、以及正常
+#     无回调上涨场景，行为均保持不变。
+#
+# v3.1修复（相对v3）：
+#   - evaluate_ticker()中`if price_f["price_slope"] > 0`被用作
+#     是否检查回调的前置门槛，但price_slope是对整个70天窗口做
+#     线性回归，一次"暴涨后小幅回调"（例如前50天暴涨、最近
+#     10-20天回调）的整体斜率几乎总是仍为正，导致回调判断分支
+#     永远不会被触发，pullback_healthy/pullback_bottoming状态
+#     形同虚设。
+#   - 修复：不再用price_slope的正负作为回调检查的前置门槛，
+#     而是始终调用calc_pullback_health()（内部用最近20天高点
+#     独立判断回撤幅度，不依赖整体窗口斜率），回调判断优先于
+#     笼统的价格重心判断。已用合成数据验证：price_slope修复前后
+#     均为正值，修复前判定为"价格重心上移✅"（信号被掩盖），
+#     修复后正确判定为"健康回调中"/"触底反弹信号"。
+#
+# v3新增（相对v2）：
+#   - calc_pullback_health()：判断确认趋势中的回调是否健康
+#     不是反转/均值回归策略，是趋势跟随体系内部的回调入场
+#     （Pullback Entry Within Uptrend）。前提仍然是这只股票
+#     处于确认过的上升趋势（能进入watchlist本身就证明过
+#     trend_strength_score达标），只是在回调低点入场，
+#     而不是追高点突破。
+#   - evaluate_ticker()：新增pullback_healthy/pullback_bottoming
+#     两个状态，介于原有ready/watch/caution/accumulating之间
+#   - format_premarket_report()/format_postmarket_report()：
+#     展示新增的两个状态
+#
+# 参数（用户确认，基于ASX中小盘股波动率）：
+#   回调幅度区间：8%-25%（相对最近20日高点）
+#   关键均线：MA50（比MA20更宽松，给更大回调空间）
+#   止损参考：这次回调的实际最低点（不是ATR倍数）
+#
+# v2功能保留：
+#   - 整合了 backfill_snapshots.py 的历史数据补齐功能
 #   - 新股票（数据 < BACKFILL_THRESHOLD 天）自动补齐60天历史数据
 #   - 已有足够数据的股票直接进入因子分析
-#   - 每次运行结束后写入当日最新快照（postmarket模式）
-#   - backfill_snapshots.py 在此之后可以删除，不再需要
 #
 # 运行方式（crontab）：
 #   盘前：UTC 23:00（前日）= 悉尼09:00
@@ -93,6 +142,19 @@ VOL_SHRINK_SLOPE_MAX    = -0.02
 AMPLITUDE_SHRINK_SLOPE  = -0.001
 CLOSE_POS_MIN           = 0.65
 
+# v3新增：回调健康度判断（趋势跟随体系内部的回调入场，非反转策略）
+# 设计前提：这只股票必须已经通过screener.py的trend_strength_score
+# 筛选进入watchlist（本身就证明过趋势强度），这里只是在它出现
+# 回调时进一步判断"这次回调是健康的（缩量、未破MA50）还是危险的
+# （放量下跌）"，不是凭空判断任意股票是否触底反弹。
+PULLBACK_MIN_DEPTH_PCT    = 8.0   # 回调幅度下限（相对20日高点）
+PULLBACK_MAX_DEPTH_PCT    = 25.0  # 回调幅度上限，超过视为可能真反转，不再按回调处理
+PULLBACK_VOL_SHRINK_RATIO = 0.8   # 回调期间日均量/回调前10日均量，低于此值算缩量（健康）
+PULLBACK_VOL_DANGER_RATIO = 1.3   # 高于此值判定为放量下跌（危险）
+PULLBACK_LOOKBACK_DAYS    = 20    # 回溯高点窗口，与prior_high_20d概念一致
+BOTTOM_CLOSE_POS_MIN      = 0.60  # 触底信号：当日收盘位置需在日内区间60%以上
+BOTTOM_VOL_UPTICK_MIN     = 1.0   # 触底信号：当日成交量需>=前一日（温和放量）
+
 # ════════════════════════════════════════════════════════════
 # 2. Telegram
 # ════════════════════════════════════════════════════════════
@@ -170,7 +232,6 @@ def download_15m_history(ticker: str) -> Optional[pd.DataFrame]:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        # 转换到悉尼时区
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC").tz_convert(SYD_TZ)
         else:
@@ -409,7 +470,6 @@ def load_daily_summaries(ticker: str,
             "max_pct_from_prior_high", "snapshot_count",
         ])
         df["trading_date"] = pd.to_datetime(df["trading_date"])
-        # 排除不完整交易日（少于8根15分钟K线 ≈ 不足2小时数据）
         df = df[df["snapshot_count"] >= 8].copy()
         df = df.dropna(subset=["close_proxy"]).reset_index(drop=True)
         return df
@@ -621,6 +681,106 @@ def calc_momentum_factor(df: pd.DataFrame) -> dict:
 
     return result
 
+
+def calc_pullback_health(daily_df: pd.DataFrame, item: dict) -> dict:
+    """
+    v3新增：判断该股票是否处于"确认趋势中的健康回调"，
+    以及是否出现触底信号。
+
+    设计前提：这不是反转/均值回归策略，是趋势跟随体系内部的
+    回调入场（Pullback Entry Within Uptrend）。这只股票已经
+    通过screener.py的trend_strength_score筛选进入watchlist，
+    本身就证明过趋势强度——这里只是在它出现价格重心未上移时，
+    进一步判断这次下跌是"健康回调"（缩量、未破MA50，等待反弹）
+    还是"真正走坏"（放量下跌、跌破关键均线）。
+
+    参数（用户确认，基于ASX中小盘股波动率校准）：
+        回调幅度区间：8%-25%（相对最近20日高点）
+        关键均线：MA50
+        止损参考：本次回调的实际最低点
+
+    返回dict：
+        is_pullback: bool，是否处于回调区间（8%-25%回撤，未破MA50）
+        is_healthy: bool，回调是否健康（缩量，不是放量下跌）
+        is_bottoming: bool，是否出现触底反弹信号（在is_healthy基础上）
+        depth_pct: float，当前回撤幅度
+        recent_low: float，本次回调的最低点（用作止损参考）
+        vol_ratio: float，回调期间量比（供日志/推送参考）
+    """
+    result = {
+        "is_pullback": False, "is_healthy": False, "is_bottoming": False,
+        "depth_pct": 0.0, "recent_low": None, "vol_ratio": None,
+        "broke_ma50": False,
+    }
+
+    if len(daily_df) < PULLBACK_LOOKBACK_DAYS:
+        return result
+
+    high_col   = daily_df["day_high"]
+    low_col    = daily_df["day_low"]
+    close_col  = daily_df["close_proxy"]
+    vol_col    = daily_df["day_volume"]
+
+    recent_high = float(high_col.iloc[-PULLBACK_LOOKBACK_DAYS:].max())
+    if recent_high <= 0:
+        return result
+
+    current_close = float(close_col.iloc[-1])
+    depth_pct = round((recent_high - current_close) / recent_high * 100, 2)
+    result["depth_pct"] = depth_pct
+
+    if not (PULLBACK_MIN_DEPTH_PCT <= depth_pct <= PULLBACK_MAX_DEPTH_PCT):
+        return result
+
+    if len(close_col) >= 50:
+        ma50 = float(close_col.rolling(50).mean().iloc[-1])
+        if current_close < ma50:
+            result["broke_ma50"] = True
+            return result
+
+    result["is_pullback"] = True
+
+    high_idx_pos = high_col.iloc[-PULLBACK_LOOKBACK_DAYS:].values.argmax()
+    pullback_start_idx = len(daily_df) - PULLBACK_LOOKBACK_DAYS + high_idx_pos
+
+    if pullback_start_idx >= len(daily_df) - 1:
+        return result
+
+    pullback_period_low  = low_col.iloc[pullback_start_idx:]
+    pullback_period_vol  = vol_col.iloc[pullback_start_idx:]
+    pre_pullback_vol     = vol_col.iloc[max(0, pullback_start_idx - 10):pullback_start_idx]
+
+    result["recent_low"] = round(float(pullback_period_low.min()), 4)
+
+    if len(pre_pullback_vol) > 0:
+        pre_avg = float(pre_pullback_vol.mean())
+        during_avg = float(pullback_period_vol.mean())
+        if pre_avg > 0:
+            vol_ratio = round(during_avg / pre_avg, 3)
+            result["vol_ratio"] = vol_ratio
+
+            if vol_ratio <= PULLBACK_VOL_SHRINK_RATIO:
+                result["is_healthy"] = True
+            elif vol_ratio >= PULLBACK_VOL_DANGER_RATIO:
+                result["is_healthy"] = False
+
+    if result["is_healthy"]:
+        today_high  = float(high_col.iloc[-1])
+        today_low   = float(low_col.iloc[-1])
+        today_close = current_close
+        today_vol   = float(vol_col.iloc[-1])
+        prev_vol    = float(vol_col.iloc[-2]) if len(vol_col) >= 2 else today_vol
+
+        day_range = today_high - today_low
+        close_pos = (today_close - today_low) / day_range if day_range > 0 else 0.5
+
+        vol_uptick = (today_vol / prev_vol) if prev_vol > 0 else 1.0
+
+        if close_pos >= BOTTOM_CLOSE_POS_MIN and vol_uptick >= BOTTOM_VOL_UPTICK_MIN:
+            result["is_bottoming"] = True
+
+    return result
+
 # ════════════════════════════════════════════════════════════
 # 6. 仓位计算
 # ════════════════════════════════════════════════════════════
@@ -671,14 +831,27 @@ def evaluate_ticker(item: dict) -> dict:
     对单只股票完整评估：
     1. 先确保数据充足（不足则自动补齐）
     2. 加载日摘要
-    3. 计算四个因子
+    3. 计算五个因子（v3新增回调健康度）
     4. 综合判断状态
-    5. 计算仓位建议（仅status=ready时）
+    5. 计算仓位建议（ready或pullback_bottoming时）
+
+    v3.1修复：calc_pullback_health()不再依赖price_slope<=0才触发，
+    而是始终调用——它内部用最近20天高点独立判断回撤幅度，
+    不受70天整体窗口斜率正负的影响。回调判断（更具体）优先于
+    笼统的price_slope判断，只有当前不处于回调状态时才退回判断
+    "整体价格重心是否上移"。
+
+    v3.2修复：v3.1遗留了同一类问题在"当前不处于回调状态"这个
+    退回条件里的两个残留场景——① 回撤深度>PULLBACK_MAX_DEPTH_PCT
+    （可能是真实反转而非健康回调）② 回撤在8%-25%区间内但已跌破
+    MA50——这两种情况calc_pullback_health()同样返回is_pullback
+    =False，此前会被同一个price_slope>0判断误判为"价格重心
+    上移✅"。v3.2在退回price_slope判断之前，新增两个显式分支
+    分别捕获这两种情况并计入warnings，不再被笼统掩盖。
     """
     ticker = item["ticker"]
     log.info(f"评估 [{ticker}]...")
 
-    # 步骤1：确保数据充足（核心改动：新股票自动补齐）
     data_days = ensure_sufficient_data(ticker)
 
     if data_days < MIN_DAYS_FOR_ANALYSIS:
@@ -693,7 +866,6 @@ def evaluate_ticker(item: dict) -> dict:
             "message"    : f"数据积累中（{data_days}/{MIN_DAYS_FOR_ANALYSIS}天）",
         }
 
-    # 步骤2：加载日摘要
     daily_df = load_daily_summaries(ticker)
     n_days   = len(daily_df)
 
@@ -709,21 +881,17 @@ def evaluate_ticker(item: dict) -> dict:
             "message"    : f"日摘要不足（{n_days}天）",
         }
 
-    # 步骤3：计算四个因子
     vol_f   = calc_volume_factor(daily_df)
     amp_f   = calc_amplitude_factor(daily_df)
     price_f = calc_price_structure(daily_df)
     mom_f   = calc_momentum_factor(daily_df)
 
-    # 步骤4：yfinance补充数据（ATR + 当前价格）
     atr14         = load_atr(ticker)
     current_price = load_current_price(ticker)
 
-    # 步骤5：信号汇总
     signals  = []
     warnings = []
 
-    # 量能
     if (vol_f["vol_slope"] < VOL_SHRINK_SLOPE_MAX
             or vol_f["consecutive_shrink"] >= 3):
         signals.append("量能缩量整理✅")
@@ -736,15 +904,51 @@ def evaluate_ticker(item: dict) -> dict:
         else:
             warnings.append("⚠️ 近期向下放量（可能出货信号）")
 
-    # 振幅
     if amp_f["is_shrinking"]:
         conf = "（参考，数据天数有限）" if amp_f["confidence"] == "low" else ""
         signals.append(f"振幅收窄整理✅{conf}")
     else:
         warnings.append("振幅未见收窄")
 
-    # 价格结构
-    if price_f["price_slope"] > 0:
+    # v3.1修复：不再用price_f["price_slope"]的正负作为是否检查回调的
+    # 前置门槛。calc_pullback_health()内部用最近20天高点独立判断回撤
+    # 幅度，不依赖整体窗口斜率，因此应始终调用；回调判断（更具体、
+    # 信息量更大）优先于笼统的整体价格重心判断。
+    #
+    # 修复前的问题：若一只股票前50天暴涨、最近10-20天回调，
+    # 70天窗口的整体price_slope几乎总是仍为正，导致回调判断分支
+    # 永远不会被触发，pullback_healthy/pullback_bottoming状态形同虚设。
+    # 已用合成数据验证：此类"暴涨后回调"场景下price_slope恒为正，
+    # 修复前判定为"价格重心上移✅"（回调信号被完全掩盖），
+    # 修复后正确判定为"健康回调中"/"触底反弹信号"。
+    pullback_result = calc_pullback_health(daily_df, item)
+
+    if pullback_result["is_bottoming"]:
+        signals.append(
+            f"🔵 健康回调触底反弹信号✅（回撤{pullback_result['depth_pct']}%，"
+            f"量比{pullback_result['vol_ratio']}，未破MA50）"
+        )
+    elif pullback_result["is_healthy"]:
+        signals.append(
+            f"🔵 健康回调中（回撤{pullback_result['depth_pct']}%，缩量，"
+            f"等待触底信号）"
+        )
+    elif pullback_result["is_pullback"] and not pullback_result["is_healthy"]:
+        warnings.append(
+            f"⚠️ 回调但非缩量（回撤{pullback_result['depth_pct']}%，"
+            f"量比{pullback_result.get('vol_ratio','N/A')}，非健康回调）"
+        )
+    elif pullback_result["depth_pct"] > PULLBACK_MAX_DEPTH_PCT:
+        warnings.append(
+            f"⚠️ 回撤{pullback_result['depth_pct']}%，超过健康回调上限"
+            f"（{PULLBACK_MAX_DEPTH_PCT}%），存在趋势反转风险，非趋势内正常回调"
+        )
+    elif pullback_result["broke_ma50"]:
+        warnings.append(
+            f"⚠️ 回撤{pullback_result['depth_pct']}%但已跌破MA50，"
+            f"非健康回调，警惕趋势走坏"
+        )
+    elif price_f["price_slope"] > 0:
         signals.append("价格重心上移✅")
     else:
         warnings.append("价格重心未见上移")
@@ -762,17 +966,22 @@ def evaluate_ticker(item: dict) -> dict:
         elif t > 8:
             warnings.append(f"压力位测试次数过多({t}次)，突破难度大")
 
-    # 动能
     if mom_f["first_volume_spike"]:
         signals.append("🔥 第一次放量（整理结束早期信号）")
     if mom_f["price_acceleration"]:
         signals.append("价格加速上涨✅")
 
-    # 综合状态
     sig_count  = len([s for s in signals if "✅" in s or "🔥" in s])
     warn_count = len(warnings)
 
-    if sig_count >= 4 and warn_count == 0:
+    # v3.1：pullback_result现在始终有值（不再是None/dict二选一），
+    # 状态判断逻辑不变——仍优先检查触底反弹/健康回调信号，
+    # 因为这两个信号比常规ready更需要立刻提醒用户。
+    if pullback_result["is_bottoming"]:
+        status = "pullback_bottoming"
+    elif pullback_result["is_healthy"]:
+        status = "pullback_healthy"
+    elif sig_count >= 4 and warn_count == 0:
         status = "ready"
     elif sig_count >= 3 and warn_count <= 1:
         status = "watch"
@@ -781,9 +990,8 @@ def evaluate_ticker(item: dict) -> dict:
     else:
         status = "accumulating"
 
-    # 仓位建议（仅ready时）
     position_advice = None
-    if status == "ready" and atr14 and current_price:
+    if status in ("ready", "pullback_bottoming") and atr14 and current_price:
         position_advice = calculate_position(current_price, atr14)
 
     return {
@@ -810,6 +1018,9 @@ def evaluate_ticker(item: dict) -> dict:
         "atr14"           : atr14,
         "current_price"   : current_price,
         "position_advice" : position_advice,
+        "pullback_depth_pct" : pullback_result["depth_pct"],
+        "pullback_recent_low": pullback_result["recent_low"],
+        "pullback_vol_ratio" : pullback_result["vol_ratio"],
     }
 
 # ════════════════════════════════════════════════════════════
@@ -821,18 +1032,57 @@ def format_premarket_report(results: list, run_date: str) -> str:
     watch   = [r for r in results if r["status"] == "watch"]
     caution = [r for r in results if r["status"] == "caution"]
     accum   = [r for r in results if r["status"] == "accumulating"]
+    bottoming = [r for r in results if r["status"] == "pullback_bottoming"]
+    pullback  = [r for r in results if r["status"] == "pullback_healthy"]
 
     lines = [
         f"📊 <b>盘前分析简报</b> {run_date}",
         f"━━━━━━━━━━━━━━━━━━━━━━━━",
         f"监测：{len(results)}只 | 🟢今日关注：{len(ready)} | "
+        f"🔵触底反弹：{len(bottoming)} | 🔷健康回调：{len(pullback)} | "
         f"🟡观察中：{len(watch)} | 🔴注意：{len(caution)} | "
         f"⏳积累中：{len(accum)}",
         "",
     ]
 
+    if bottoming:
+        lines.append("🔵 <b>健康回调触底反弹（趋势内回调入场机会）</b>")
+        for r in bottoming:
+            lines.append(f"\n<b>{r['ticker']}</b> {r.get('company_name','')}")
+            lines.append(f"数据：{r['data_days']}天 | "
+                        f"本次回调幅度：{r.get('pullback_depth_pct','N/A')}% "
+                        f"（相对最近20日高点）")
+            for s in r["signals"]:
+                lines.append(f"  • {s}")
+
+            pos = r.get("position_advice")
+            if pos:
+                lines.append(f"\n  💼 <b>仓位建议</b>（ATR动态计算）")
+                lines.append(f"  参考入场价：${r['current_price']}")
+                lines.append(f"  建议股数：{pos['shares']}股 | "
+                             f"仓位：${pos['position_value']}"
+                             f"（总资金{pos['position_pct']}%）")
+
+            recent_low = r.get("pullback_recent_low")
+            if recent_low:
+                lines.append(f"\n  🛑 止损参考：${recent_low}"
+                            f"（本次回调最低点，跌破视为判断证伪）")
+            lines.append(f"\n  📌 入场逻辑：确认过的上升趋势中出现健康回调"
+                        f"（缩量、未破MA50），今日出现止跌企稳信号"
+                        f"（收盘位置强+温和放量）")
+            lines.append(f"  ⚠️ 基于{r['data_days']}天历史数据，"
+                        f"请结合实时盘口确认后执行\n")
+
+    if pullback:
+        lines.append("\n🔷 <b>健康回调中（等待触底信号）</b>")
+        for r in pullback:
+            lines.append(
+                f"  {r['ticker']} {r.get('company_name','')} "
+                f"（回撤{r.get('pullback_depth_pct','N/A')}%，缩量中）"
+            )
+
     if ready:
-        lines.append("🟢 <b>今日重点关注</b>")
+        lines.append("\n🟢 <b>今日重点关注</b>")
         for r in sorted(ready, key=lambda x: x["signal_count"], reverse=True):
             lines.append(f"\n<b>{r['ticker']}</b> {r.get('company_name','')}")
             lines.append(f"数据：{r['data_days']}天 | 信号：{r['signal_count']}个")
@@ -905,6 +1155,7 @@ def format_postmarket_report(results: list, run_date: str) -> str:
     status_emoji = {
         "ready": "🟢", "watch": "🟡",
         "caution": "🔴", "accumulating": "⏳",
+        "pullback_bottoming": "🔵", "pullback_healthy": "🔷",
     }
     lines = [
         f"📋 <b>收盘后状态更新</b> {run_date}",
@@ -935,7 +1186,7 @@ def main() -> None:
     args     = parser.parse_args()
     run_date = date.today().isoformat()
 
-    log.info(f"=== daily_analysis.py v2 [{args.mode}] {run_date} ===")
+    log.info(f"=== daily_analysis.py v3.2 [{args.mode}] {run_date} ===")
 
     wdb.init_watchlist_db()
     watchlist = wdb.get_active_watchlist()
@@ -955,10 +1206,6 @@ def main() -> None:
             result = evaluate_ticker(item)
             if result:
                 results.append(result)
-                # 只在盘前模式写入today_status，供intraday_monitor.py
-                # 在开盘后的15分钟轮询里读取判断是否运行三种模式。
-                # postmarket模式不写入：写了也没意义（当天已收盘），
-                # 次日premarket会重新计算并覆盖，避免多余的数据库写入。
                 if args.mode == "premarket":
                     wdb.update_today_status(
                         result["ticker"],
@@ -967,7 +1214,7 @@ def main() -> None:
                     )
         except Exception as e:
             log.error(f"评估异常 [{item['ticker']}]: {e}")
-        time.sleep(1.5)   # 避免yfinance请求过密
+        time.sleep(1.5)
 
     if not results:
         log.warning("所有股票评估失败")
@@ -981,7 +1228,9 @@ def main() -> None:
     send_telegram(report)
 
     ready_count = sum(1 for r in results if r.get("status") == "ready")
-    log.info(f"=== 完成：{len(results)}只评估，{ready_count}只今日关注 ===")
+    bottoming_count = sum(1 for r in results if r.get("status") == "pullback_bottoming")
+    log.info(f"=== 完成：{len(results)}只评估，{ready_count}只今日关注，"
+             f"{bottoming_count}只触底反弹信号 ===")
 
 
 if __name__ == "__main__":
