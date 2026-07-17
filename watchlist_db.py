@@ -66,11 +66,28 @@ def init_watchlist_db() -> None:
                     prior_high_20d    REAL,
                     prior_low_20d     REAL,
                     avg_vol_20d       REAL,
-                    -- 用于止损判定的记录
+                    -- 用于止损判定的记录（所有模式共用同一组槽位，
+                    -- 每次record_signal()都会覆盖，只反映"最近一次
+                    -- 触发的信号"，不区分模式）
                     last_signal_mode  TEXT,
                     last_signal_date  TEXT,
                     last_signal_price REAL,
                     stop_loss_price   REAL,
+                    -- v2新增：模式1突破的专属记录（intraday_monitor.py v2）
+                    -- 跟上面last_signal_*分开的理由：last_signal_*是所有
+                    -- 模式共用的槽位，如果模式2/3/4之后触发了信号，会把
+                    -- "多少天前发生过突破"这个记忆覆盖掉。模式2要做跨天
+                    -- 回踩检测，需要一个不会被其他模式覆盖的独立记录。
+                    last_breakout_date  TEXT,
+                    last_breakout_price REAL,
+                    -- v2新增：模式4（回调确认买）用的回调参考位，
+                    -- 跟ref_date共用同一次日线下载在lock_daily_reference()
+                    -- 里算出，避免每15分钟多打一次yfinance请求。
+                    -- 这是intraday_monitor.py自己独立算的一份，跟
+                    -- daily_analysis.py的pullback_recent_low是两套独立
+                    -- 实现（阈值数值需手动保持同步，不做跨文件读取）。
+                    pullback_recent_low REAL,
+                    pullback_depth_pct  REAL,
                     -- daily_analysis.py盘前分析写入的当日跨日状态，
                     -- 供intraday_monitor.py读取，决定是否对该股票
                     -- 运行三种日内模式判断（只对today_status='ready'的股票判断）
@@ -90,6 +107,14 @@ def init_watchlist_db() -> None:
                 conn.execute("ALTER TABLE watchlist ADD COLUMN today_status_date TEXT")
             if "today_signal_count" not in cols:
                 conn.execute("ALTER TABLE watchlist ADD COLUMN today_signal_count INTEGER DEFAULT 0")
+            if "last_breakout_date" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN last_breakout_date TEXT")
+            if "last_breakout_price" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN last_breakout_price REAL")
+            if "pullback_recent_low" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN pullback_recent_low REAL")
+            if "pullback_depth_pct" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN pullback_depth_pct REAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS intraday_snapshots (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -293,7 +318,9 @@ def get_active_watchlist() -> list:
                        entry_date, total_days, days_elapsed, reselect_count, source,
                        ref_date, prior_high_20d, prior_low_20d, avg_vol_20d,
                        last_signal_mode, last_signal_date, last_signal_price, stop_loss_price,
-                       today_status, today_status_date, today_signal_count
+                       today_status, today_status_date, today_signal_count,
+                       last_breakout_date, last_breakout_price,
+                       pullback_recent_low, pullback_depth_pct
                 FROM watchlist
                 WHERE status = 'active' AND days_elapsed < total_days
                 ORDER BY composite_score DESC
@@ -302,7 +329,9 @@ def get_active_watchlist() -> list:
                 "entry_date", "total_days", "days_elapsed", "reselect_count", "source",
                 "ref_date", "prior_high_20d", "prior_low_20d", "avg_vol_20d",
                 "last_signal_mode", "last_signal_date", "last_signal_price", "stop_loss_price",
-                "today_status", "today_status_date", "today_signal_count"]
+                "today_status", "today_status_date", "today_signal_count",
+                "last_breakout_date", "last_breakout_price",
+                "pullback_recent_low", "pullback_depth_pct"]
         return [dict(zip(cols, r)) for r in rows]
     except Exception as e:
         log.error(f"读取监测队列失败: {e}")
@@ -322,6 +351,28 @@ def update_daily_reference(ticker: str, ref_date: str, prior_high_20d: float,
             conn.commit()
     except Exception as e:
         log.error(f"更新基准位失败 [{ticker}]: {e}")
+
+
+def update_pullback_reference(ticker: str, ref_date: str,
+                               pullback_recent_low: Optional[float],
+                               pullback_depth_pct: Optional[float]) -> None:
+    """
+    v2新增：模式4专用，跟update_daily_reference()在同一次日线下载里
+    一起调用，缓存"回调最低点/回撤深度"这两个数值，避免每15分钟
+    轮询都重新下载日线数据。传None表示当前不处于8%-25%回调区间
+    （比如数据不足，或者股票已经不在这个深度范围内），下游需要
+    据此判断模式4是否有参考位可用。
+    """
+    try:
+        with sqlite3.connect(WATCHLIST_DB_PATH) as conn:
+            conn.execute("""
+                UPDATE watchlist
+                SET pullback_recent_low = ?, pullback_depth_pct = ?
+                WHERE ticker = ?
+            """, (pullback_recent_low, pullback_depth_pct, ticker))
+            conn.commit()
+    except Exception as e:
+        log.error(f"更新回调参考位失败 [{ticker}]: {e}")
 
 
 def increment_day_elapsed(ticker: str) -> None:
@@ -353,7 +404,16 @@ def exit_watchlist(ticker: str, reason: str) -> None:
 
 
 def record_signal(ticker: str, mode: str, price: float, stop_loss: float) -> None:
-    """记录最近一次触发的信号（用于避免同一信号当天重复推送，以及次日止损监控）"""
+    """
+    记录最近一次触发的信号（用于避免同一信号当天重复推送，以及次日止损监控）。
+
+    v2新增：如果这次触发的是模式1突破，额外把突破日期/价位写进
+    last_breakout_date/last_breakout_price这两个独立字段。这两个
+    字段不会被后续模式2/3/4的信号覆盖（跟last_signal_*不同），
+    专门供intraday_monitor.py的模式2做跨天回踩检测时查询
+    "最近N个交易日内是否发生过突破"。
+    """
+    today = date.today().isoformat()
     try:
         with sqlite3.connect(WATCHLIST_DB_PATH) as conn:
             conn.execute("""
@@ -361,7 +421,13 @@ def record_signal(ticker: str, mode: str, price: float, stop_loss: float) -> Non
                 SET last_signal_mode = ?, last_signal_date = ?,
                     last_signal_price = ?, stop_loss_price = ?
                 WHERE ticker = ?
-            """, (mode, date.today().isoformat(), price, stop_loss, ticker))
+            """, (mode, today, price, stop_loss, ticker))
+            if mode == "模式1-突破瞬间买":
+                conn.execute("""
+                    UPDATE watchlist
+                    SET last_breakout_date = ?, last_breakout_price = ?
+                    WHERE ticker = ?
+                """, (today, price, ticker))
             conn.commit()
     except Exception as e:
         log.error(f"记录信号失败 [{ticker}]: {e}")
