@@ -84,12 +84,12 @@ GEMINI_CFG_SEO_ARTICLE = {
     "max_output_tokens": 65535,
 }
 
-RETRY_MAX       = 20
+RETRY_MAX       = 30
 RETRY_WAIT      = 30
 TIMEOUT         = 15
 TOP_N           = 3
 
-NET_RETRY_MAX  = 3
+NET_RETRY_MAX  = 10
 NET_RETRY_WAIT = 2.0
 
 ASXBOX_REPO  = os.path.expanduser("~/asxbox")
