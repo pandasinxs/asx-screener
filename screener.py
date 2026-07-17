@@ -2273,7 +2273,7 @@ D. Do not explain your process—output only the final version of the copy.
 
     instruction = instructions.get(platform, instructions["twitter"])
 
-    return f"""请仔细阅读全部输入内容，深度消化，再直接给出最终回复。如果有疑问，请自己解决，我不会再给出更多解释。以下是具体prompt。
+    return f"""请先仔细阅读我现在发的全部输入内容，深度消化，再直接给出最终回复。如果有疑问，请自己解决，我不会再给出更多解释。以下是具体prompt。
     
     Prompt — {platform.upper()} — {market_snap.get('date','')}
 
