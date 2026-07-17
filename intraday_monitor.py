@@ -1,19 +1,56 @@
 # ============================================================
-# ASX SYSTEM — intraday_monitor.py  v1
+# ASX SYSTEM — intraday_monitor.py  v2
 #
 # 长期盘中监测：监测 screener.py (EOD) 筛选出的股票，
 # 在监测期内（按筛选等级T1-T4分配天数，可累加）每15分钟扫描一次，
-# 判断三种入场模式是否触发，仅在有信号时推送Telegram。
+# 判断四种入场模式是否触发，仅在有信号时推送Telegram。
 #
-# 三种模式（均为15分钟K线级别的"代理判断"，非逐笔tick级）：
+# v2改动（相对v1，配合daily_analysis.py新增的pullback_healthy/
+# pullback_bottoming跨日状态）：
+#   1. 【bug修复】跨日状态门禁此前只认ready/watch/caution/
+#      accumulating，pullback_healthy/pullback_bottoming会被
+#      误判成"分析层不可用"，Telegram文案也会错误地显示
+#      "跨日因子分析不可用"。现在按状态分两条轨道路由。
+#   2. 【新增】模式4-回调确认买：配合pullback_bottoming状态，
+#      不重新判断多日形态（那是daily_analysis.py的工作），只做
+#      "今天有没有跌破回调低点、有没有企稳迹象"的当日确认。
+#      回调参考位（回调最低点/回撤深度）由本文件独立计算并缓存，
+#      不读取daily_analysis.py写入的任何字段，阈值常量数值需要
+#      手动跟daily_analysis.py的同名常量保持一致（见MODE4_*注释）。
+#   3. 【修复】模式2-回踩确认买此前只能检测"同一天内突破又回踩"，
+#      因为download_intraday()每次只返回当天K线，搜索"是否发生
+#      过突破"也只在当天bars里找——捕捉不到更常见的"前几天突破，
+#      今天缩量回踩"。改成读取watchlist_db.py新增的
+#      last_breakout_date/last_breakout_price（模式1专属记录，
+#      不会被模式2/3/4的信号覆盖），判断"最近N个交易日内是否
+#      发生过突破"，回踩深度仍用当天重新锁定的prior_high_20d计算
+#      （因为如果突破后继续创新高，这个值会跟着抬高）。
+#      "确认反转"这一步的判断标准维持v1原样（cur.close>prev.close），
+#      不跟模式4统一，避免影响已经在跑的实盘信号。
+#   4. 【修复】模式3-尾盘确认买的判断逻辑不变，但消息文案改成
+#      明确的T+1语气（买近收盘、次日开盘附近了结），去掉了原本
+#      跟swing持仓混用的2-3倍风险目标价，不加自动平仓提醒
+#      （用户明确要求平仓靠自己记）。
+#
+# 四种模式（均为15分钟K线级别的"代理判断"，非逐笔tick级）：
 #   模式1 突破瞬间买：15分钟K线收盘突破prior_high_20d + 放量 + 未被砸回
-#   模式2 回踩确认买：突破后回踩缩量企稳，重新拉升的那一根K线
-#   模式3 尾盘确认买：15:30-15:45时段维持强势，无明显抛压
+#   模式2 回踩确认买：突破后（可跨天）回踩缩量企稳，重新拉升的那一根K线
+#   模式3 尾盘确认买（T+1）：15:30-15:45时段维持强势，次日开盘附近了结
+#   模式4 回调确认买（新）：健康回调触底反弹后，当日延续确认
+#
+# 状态路由（与daily_analysis.py的今日跨日状态一一对应）：
+#   ready              → 模式1/2/3（突破轨道）
+#   pullback_bottoming → 模式4（回调轨道）
+#   pullback_healthy / watch / caution / accumulating → 跳过，只积累快照
+#   unknown / stale    → 降级只跑突破轨道（模式4依赖当天确认的
+#                        pullback_bottoming状态才有意义，分析层
+#                        不可用时没有这个前提，不运行）
 #
 # 设计基线（与screener.py保持一致的风控/数据规范）：
 #   - 跳过开盘集合竞价噪音（09:30前）和收盘集合竞价（16:00后）
 #   - 流动性门槛与screener.py一致（避免低基数下的"虚假放量"）
-#   - 所有基准位（前高/量能均值）在每个交易日开盘后锁定一次，全天不变，防未来函数
+#   - 所有基准位（前高/量能均值/回调参考位）在每个交易日开盘后
+#     锁定一次，全天不变，防未来函数
 #   - 健康度检查：监测期内若股票转弱，提前清出队列，不死板跑满天数
 #   - 每次轮询写入intraday_snapshots，供历史比对和回测
 #
@@ -70,13 +107,39 @@ BREAKOUT_LOOKBACK_DAYS   = 20
 VOL_SPIKE_RATIO_M1       = 1.8
 VOL_SPIKE_RATIO_HIST     = 1.5
 BREAKOUT_FAILURE_PCT     = -0.3
-PULLBACK_MAX_DEPTH_PCT   = 4.0
-PULLBACK_VOL_SHRINK_RATIO = 0.7
+
+# 模式2专属（此前叫PULLBACK_MAX_DEPTH_PCT/PULLBACK_VOL_SHRINK_RATIO，
+# v2改名加MODE2_前缀——因为模式4也要用"回调深度/缩量比"这类概念，
+# 但数值含义完全不同（模式2是浅回踩4%以内，模式4是深回调8%-25%），
+# 同名不同义容易混淆甚至误改，改名区分）
+MODE2_PULLBACK_MAX_DEPTH_PCT    = 4.0
+MODE2_PULLBACK_VOL_SHRINK_RATIO = 0.7
+# v2新增：模式2允许"最近突破"回溯的天数上限。超过这个天数，
+# 即使item里还留着last_breakout_date，也不再当作有效的模式2前提
+# ——时间太久，prior_high_20d大概率已经跟着行情滚动了很多，
+# 用一个过旧的"突破事件"去触发回踩确认意义不大。
+# 用日历天数近似（非严格交易日计数），周末/假期会有小幅出入，可接受。
+MODE2_BREAKOUT_LOOKBACK_DAYS    = 5
+
 LATE_SESSION_NEAR_HIGH_PCT = 1.5
 LATE_SESSION_MIN_VOL_RATIO = 0.8
 
 HEALTH_MIN_RS_VS_XJO = 0.97
 HEALTH_BELOW_MA50_GRACE_DAYS = 2
+
+# 模式4专属（回调确认买，配合daily_analysis.py的pullback_bottoming状态）
+# ⚠️ 以下三个深度/窗口相关常量，数值必须手动跟daily_analysis.py里
+# 同名常量（PULLBACK_MIN_DEPTH_PCT/PULLBACK_MAX_DEPTH_PCT/
+# PULLBACK_LOOKBACK_DAYS）保持一致——两边是独立实现，不共享代码，
+# 改一处记得改另一处，否则两个文件对"什么算健康回调"的定义会
+# 逐渐不同步。
+MODE4_PULLBACK_MIN_DEPTH_PCT = 8.0
+MODE4_PULLBACK_MAX_DEPTH_PCT = 25.0
+MODE4_PULLBACK_LOOKBACK_DAYS = 20
+# 触底确认标准，同样需要跟daily_analysis.py的
+# BOTTOM_CLOSE_POS_MIN/BOTTOM_VOL_UPTICK_MIN保持数值一致
+MODE4_BOTTOM_CLOSE_POS_MIN  = 0.60
+MODE4_BOTTOM_VOL_UPTICK_MIN = 1.0
 
 _health_fail_streak: dict = {}
 
@@ -211,11 +274,70 @@ def download_daily_reference(ticker: str, retries: int = 3) -> Optional[pd.DataF
 # 4. 每日基准位锁定
 # ════════════════════════════════════════════════════════════
 
+def compute_pullback_reference(high: pd.Series, low: pd.Series,
+                                close: pd.Series) -> Optional[dict]:
+    """
+    模式4专用：独立计算回调参考位（回调最低点/回撤深度）。
+
+    只做数值计算，不重新判断"是否健康/是否触底"——那些判断已经
+    由daily_analysis.py在盘前完成（today_status=pullback_bottoming
+    这个状态本身就是判断结果）。这里只是为了拿到模式4需要的
+    止损参考位和回撤幅度。
+
+    计算方式对齐daily_analysis.py的calc_pullback_health()：
+    用最近MODE4_PULLBACK_LOOKBACK_DAYS天的最高价定位"回调起点"，
+    回调最低点 = 从那个高点往后（不含今天）的最低价。
+
+    数据源差异（预期内，非bug）：daily_analysis.py用
+    intraday_snapshots聚合出的日内快照日高/日低（仅10:00-16:00
+    交易时段），这里用yfinance的日线OHLC（覆盖全交易时段，
+    含开盘/收盘集合竞价）。两边算出的数字可能有细微差异，
+    属于两种数据源的正常誤差，不代表逻辑不一致。
+
+    返回None：数据不足，或当前回撤幅度已经不在8%-25%区间内
+    （比如今天数据传入前已经用了收盘价，跟daily_analysis.py
+    盘前判断的那一刻有细微出入）——此时模式4没有有效参考位，
+    调用方应该跳过模式4的信号判断。
+    """
+    if high is None or low is None or close is None:
+        return None
+    if len(close) < MODE4_PULLBACK_LOOKBACK_DAYS:
+        return None
+
+    recent_high = float(high.iloc[-MODE4_PULLBACK_LOOKBACK_DAYS:].max())
+    if recent_high <= 0:
+        return None
+
+    current_close = float(close.iloc[-1])
+    depth_pct = round((recent_high - current_close) / recent_high * 100, 2)
+    if not (MODE4_PULLBACK_MIN_DEPTH_PCT <= depth_pct <= MODE4_PULLBACK_MAX_DEPTH_PCT):
+        return None
+
+    high_idx_pos = high.iloc[-MODE4_PULLBACK_LOOKBACK_DAYS:].values.argmax()
+    pullback_start_idx = len(close) - MODE4_PULLBACK_LOOKBACK_DAYS + high_idx_pos
+    if pullback_start_idx >= len(close) - 1:
+        return None
+
+    recent_low = float(low.iloc[pullback_start_idx:].min())
+    return {"recent_high": recent_high, "recent_low": recent_low, "depth_pct": depth_pct}
+
+
 def lock_daily_reference(item: dict) -> Optional[dict]:
+    """
+    锁定当日基准位：突破轨道用的prior_high_20d/prior_low_20d/
+    avg_vol_20d，以及v2新增的回调轨道用的pullback_recent_low/
+    pullback_depth_pct。两组基准位共用同一次daily_df下载，
+    每个交易日只算一次，全天不变（防未来函数），后续15分钟轮询
+    直接复用缓存（不再重新下载）。
+    """
     ticker = item["ticker"]
     today  = date.today().isoformat()
 
     if item.get("ref_date") == today and item.get("prior_high_20d"):
+        item["_pullback_ref"] = (
+            {"recent_low": item["pullback_recent_low"], "depth_pct": item["pullback_depth_pct"]}
+            if item.get("pullback_recent_low") is not None else None
+        )
         return item
 
     daily_df = download_daily_reference(ticker)
@@ -236,12 +358,27 @@ def lock_daily_reference(item: dict) -> Optional[dict]:
         prior_low  = float(low.iloc[-BREAKOUT_LOOKBACK_DAYS:].min())
         avg_vol    = float(volume.iloc[-BREAKOUT_LOOKBACK_DAYS:].mean())
 
+        pullback_ref = compute_pullback_reference(high, low, close)
+
         wdb.update_daily_reference(ticker, today, prior_high, prior_low, avg_vol)
+        wdb.update_pullback_reference(
+            ticker, today,
+            pullback_ref["recent_low"] if pullback_ref else None,
+            pullback_ref["depth_pct"] if pullback_ref else None,
+        )
         item.update({
             "ref_date": today, "prior_high_20d": prior_high,
             "prior_low_20d": prior_low, "avg_vol_20d": avg_vol,
+            "pullback_recent_low": pullback_ref["recent_low"] if pullback_ref else None,
+            "pullback_depth_pct": pullback_ref["depth_pct"] if pullback_ref else None,
+            "_pullback_ref": pullback_ref,
         })
-        log.info(f"基准锁定 [{ticker}]：前高{prior_high:.3f} 前低{prior_low:.3f} 均量{avg_vol:,.0f}")
+        log.info(
+            f"基准锁定 [{ticker}]：前高{prior_high:.3f} 前低{prior_low:.3f} 均量{avg_vol:,.0f}"
+            + (f" | 回调参考：低点{pullback_ref['recent_low']:.3f}"
+               f"（回撤{pullback_ref['depth_pct']}%）"
+               if pullback_ref else " | 回调参考：不适用")
+        )
         return item
     except Exception as e:
         log.error(f"基准位计算失败 [{ticker}]: {e}")
@@ -363,41 +500,120 @@ def detect_breakout_confirmation(bars: list, prior_high: float) -> Optional[str]
     return None
 
 
-def detect_mode2_pullback(bars: list, prior_high: float) -> Optional[dict]:
-    if len(bars) < 4 or not prior_high:
+def detect_mode2_pullback_crossday(item: dict, bars: list,
+                                    prior_high: float) -> Optional[dict]:
+    """
+    模式2-回踩确认买（v2：跨天版）。
+
+    v1的问题：download_intraday()每次只返回"今天"的K线，v1在这份
+    today-only的bars里搜索"是否发生过突破"，导致只能捕捉"同一天内
+    突破又回踩"这种同日快速往返，捕捉不到更常见、更健康的
+    "前几天突破，今天缩量回踩"这种跨天走势。
+
+    v2改法：不再从bars里搜索突破点，改成读取
+    item['last_breakout_date']/['last_breakout_price']——由
+    record_signal()在模式1触发时专门写入watchlist_db.py的独立字段
+    （last_breakout_date/last_breakout_price，不会被模式2/3/4自己
+    的信号覆盖，见watchlist_db.py注释）。
+
+    回踩深度用"今天"重新锁定的prior_high计算，而不是历史突破那一刻
+    的价格——如果突破后继续创新高，prior_high会跟着抬高，用当天
+    最新值才是真正在测试的支撑位。
+
+    量能判断退化为日线代理：因为拿不到历史突破那天的15分钟K线
+    量能数据（只有当天bars），用avg_vol_20d/26这个"单bar历史基准量"
+    做代理，跟模式3已经在用的代理方式保持一致。
+
+    "确认反转"这一步的判断标准维持v1原样：当前bar收盘 > 上一bar
+    收盘——按用户明确要求，这次不跟模式4的"收盘位置+放量"标准
+    统一，避免影响已经在跑的实盘信号。
+    """
+    if len(bars) < 2 or not prior_high:
         return None
 
-    breakout_idx = None
-    for i, b in enumerate(bars):
-        if b["close"] >= prior_high:
-            breakout_idx = i
-            break
-    if breakout_idx is None or breakout_idx >= len(bars) - 2:
+    last_breakout_date  = item.get("last_breakout_date")
+    last_breakout_price = item.get("last_breakout_price")
+    if not last_breakout_date or not last_breakout_price:
         return None
 
-    post_breakout = bars[breakout_idx:]
-    breakout_vol_avg = sum(b["volume"] for b in post_breakout[:2]) / min(2, len(post_breakout))
+    try:
+        days_since_breakout = (date.today() - date.fromisoformat(last_breakout_date)).days
+    except (TypeError, ValueError):
+        return None
+
+    if days_since_breakout <= 0 or days_since_breakout > MODE2_BREAKOUT_LOOKBACK_DAYS:
+        # <=0：今天刚突破，属于模式1的地盘，不重复用模式2判断
+        # >上限：突破太久以前了，prior_high大概率已经滚动很多，
+        #        用这个过旧的"突破事件"触发模式2意义不大
+        return None
 
     cur, prev = bars[-1], bars[-2]
     pullback_depth_pct = (prior_high - prev["low"]) / prior_high * 100
 
     if prev["close"] >= prior_high:
         return None
-    if pullback_depth_pct > PULLBACK_MAX_DEPTH_PCT:
+    if pullback_depth_pct > MODE2_PULLBACK_MAX_DEPTH_PCT:
+        return None
+    if cur["close"] < prior_high * (1 - MODE2_PULLBACK_MAX_DEPTH_PCT / 100):
         return None
 
-    if cur["volume"] > breakout_vol_avg * PULLBACK_VOL_SHRINK_RATIO * 1.5:
+    avg_vol_20d = item.get("avg_vol_20d") or 0
+    bar_avg_vol_baseline = avg_vol_20d / 26 if avg_vol_20d else 0
+    if (bar_avg_vol_baseline > 0
+            and cur["volume"] > bar_avg_vol_baseline * MODE2_PULLBACK_VOL_SHRINK_RATIO * 1.5):
         return None
 
     if cur["close"] <= prev["close"]:
-        return None
-    if cur["close"] < prior_high * (1 - PULLBACK_MAX_DEPTH_PCT / 100):
         return None
 
     return {
         "mode": "模式2-回踩确认买", "state": "confirmed",
         "price": cur["close"], "pullback_depth_pct": round(pullback_depth_pct, 2),
-        "breakout_level": prior_high,
+        "breakout_level": prior_high, "days_since_breakout": days_since_breakout,
+        "time": cur["time"],
+    }
+
+
+def detect_mode4_pullback_confirm(bars: list,
+                                   pullback_ref: Optional[dict]) -> Optional[dict]:
+    """
+    模式4-回调确认买（新）。
+
+    前提：daily_analysis.py已经在盘前把该股票判定为pullback_bottoming
+    （截至昨日收盘，已经出现"健康回调+触底反弹"信号）。这里不重新
+    判断"是否处于健康回调"或"是否触底"这些多日形态判断——那是
+    daily_analysis.py的工作。这里只做两件事：
+
+    1. 硬性止损位检查：今天有没有跌破回调最低点
+       （pullback_ref['recent_low']）——这个价位本身就是这笔交易的
+       止损参考位，一旦盘中跌破，说明daily_analysis.py昨天的判断
+       已经被证伪，不应该再生成买入信号追这只股票。
+    2. 当日confirm：今天是否延续强势（收盘位置强 + 温和放量），
+       延续daily_analysis.py的is_bottoming判断标准（收盘位置≥60%，
+       量比≥1.0），只是从"日线"换算成"15分钟bar"的当日代理版本。
+    """
+    if len(bars) < 2 or pullback_ref is None:
+        return None
+
+    cur, prev = bars[-1], bars[-2]
+
+    if cur["close"] <= pullback_ref["recent_low"]:
+        return None
+
+    day_range = cur["high"] - cur["low"]
+    close_pos = (cur["close"] - cur["low"]) / day_range if day_range > 0 else 0.5
+    if close_pos < MODE4_BOTTOM_CLOSE_POS_MIN:
+        return None
+
+    vol_uptick = (cur["volume"] / prev["volume"]) if prev["volume"] > 0 else 1.0
+    if vol_uptick < MODE4_BOTTOM_VOL_UPTICK_MIN:
+        return None
+
+    return {
+        "mode": "模式4-回调确认买", "state": "confirmed",
+        "price": cur["close"], "pullback_depth_pct": pullback_ref["depth_pct"],
+        "pullback_recent_low": pullback_ref["recent_low"],
+        "close_pos": round(close_pos, 2), "vol_uptick": round(vol_uptick, 2),
         "time": cur["time"],
     }
 
@@ -489,66 +705,90 @@ def monitor_one_ticker(item: dict) -> None:
         log.debug(f"[{ticker}] 本bar成交额{dollar_vol:,.0f}不达标，跳过信号判断")
         return
 
-    # ── 跨日状态前置过滤 ─────────────────────────────────────
-    # 只对daily_analysis.py盘前判定为"ready"（跨日因子达标）的股票
-    # 运行三种日内模式判断，避免对整理不充分/量能未达标的股票
-    # 产生大量低质量信号。
+    # ── 跨日状态前置过滤（v2：按状态分两条轨道路由）──────────
+    # 突破轨道（模式1/2/3）配合daily_analysis.py的"ready"状态；
+    # 回调轨道（模式4）配合"pullback_bottoming"状态。这两个状态
+    # 在daily_analysis.py里是elif互斥关系，同一天同一只股票只会
+    # 是其中一个，两条轨道不会同时对同一只股票触发。
     #
-    # 设计为"软性过滤"而非硬性阻断：
-    # 如果today_status是unknown（daily_analysis.py从未跑过这只股票，
-    # 比如刚通过/watch手动加入还没到下次盘前分析）或stale
-    # （daily_analysis.py当天因故障未运行，比如VM重启错过crontab），
-    # 不会直接跳过信号判断，而是记录警告日志后继续按原逻辑运行。
-    # 这是为了避免"分析层单点故障导致监测层完全失效"——
-    # 跨日过滤是质量优化，不应该成为系统可用性的单点风险。
+    # v1的bug：状态门禁只认ready/watch/caution/accumulating，
+    # pullback_healthy/pullback_bottoming不在任何一个分支里，
+    # 会掉进"unknown/stale"分支，被错误地当成"分析层不可用"处理，
+    # Telegram文案也会显示"跨日因子分析不可用（pullback_bottoming）"
+    # 这种自相矛盾的措辞。v2显式处理这两个新状态。
+    #
+    # 设计仍然是"软性过滤"而非硬性阻断（对unknown/stale）：
+    # 如果today_status是unknown（daily_analysis.py从未跑过这只股票）
+    # 或stale（当天因故障未运行），不会直接跳过信号判断，而是
+    # 降级只跑突破轨道（模式1/2/3）——这是为了避免"分析层单点故障
+    # 导致监测层完全失效"。降级时不跑模式4，因为模式4依赖当天
+    # 确认的pullback_bottoming状态才有意义，分析层不可用时没有
+    # 这个前提。
     #
     # 若要改成硬性阻断（unknown/stale时也跳过），
     # 将 STRICT_STATUS_GATE 改为 True。
     STRICT_STATUS_GATE = False
 
     status_info = wdb.get_today_status(ticker)
-    if status_info["status"] == "ready":
-        pass  # 正常进入信号判断
-    elif status_info["status"] in ("watch", "caution", "accumulating"):
-        log.debug(f"[{ticker}] 跨日状态={status_info['status']}（非ready），"
+    status = status_info["status"]
+
+    run_breakout_modes = False   # 模式1/2/3
+    run_pullback_mode  = False   # 模式4
+
+    if status == "ready":
+        run_breakout_modes = True
+    elif status == "pullback_bottoming":
+        run_pullback_mode = True
+    elif status in ("watch", "caution", "accumulating", "pullback_healthy"):
+        log.debug(f"[{ticker}] 跨日状态={status}（非ready/pullback_bottoming），"
                  f"跳过信号判断，继续积累数据")
         return
     else:
         # unknown / stale
-        msg = (f"[{ticker}] 跨日状态不可用（{status_info['status']}，"
-              f"原始值:{status_info.get('raw_status')}）")
+        msg = f"[{ticker}] 跨日状态不可用（{status}，原始值:{status_info.get('raw_status')}）"
         if STRICT_STATUS_GATE:
             log.warning(f"{msg}，严格模式下跳过信号判断")
             return
         else:
-            log.warning(f"{msg}，降级为不做跨日过滤，仍运行信号判断")
+            log.warning(f"{msg}，降级为不做跨日过滤，仍运行突破轨道判断")
+            run_breakout_modes = True
 
     already_signaled_today = (item.get("last_signal_date") == today)
 
     signal = None
 
-    m1 = detect_mode1_breakout(bars, prior_high, avg_vol_20d, MIN_DOLLAR_VOLUME_INTRADAY)
-    if m1 and not already_signaled_today:
-        signal = m1
-        signal["execution_window"] = "当前/今日内尽快（突破刚发生，确认窗口很短）"
+    if run_breakout_modes:
+        m1 = detect_mode1_breakout(bars, prior_high, avg_vol_20d, MIN_DOLLAR_VOLUME_INTRADAY)
+        if m1 and not already_signaled_today:
+            signal = m1
+            signal["execution_window"] = "当前/今日内尽快（突破刚发生，确认窗口很短）"
 
-    if signal is None:
-        m2 = detect_mode2_pullback(bars, prior_high)
-        if m2 and item.get("last_signal_mode") != "模式2-回踩确认买":
-            signal = m2
-            signal["execution_window"] = "当前/今日内（回踩企稳确认）"
+        if signal is None:
+            m2 = detect_mode2_pullback_crossday(item, bars, prior_high)
+            if m2 and item.get("last_signal_mode") != "模式2-回踩确认买":
+                signal = m2
+                signal["execution_window"] = "当前/今日内（回踩企稳确认）"
 
-    if signal is None and is_late_session_window():
-        if item.get("last_signal_mode") != "模式3-尾盘确认买" or item.get("last_signal_date") != today:
-            m3 = detect_mode3_late_session(bars, day_high, avg_vol_20d)
-            if m3:
-                signal = m3
-                signal["execution_window"] = "次日开盘附近（尾盘锁仓确认，今日已收盘）"
+        if signal is None and is_late_session_window():
+            if item.get("last_signal_mode") != "模式3-尾盘确认买" or item.get("last_signal_date") != today:
+                m3 = detect_mode3_late_session(bars, day_high, avg_vol_20d)
+                if m3:
+                    signal = m3
+                    signal["execution_window"] = "今日收盘前后买入，次日开盘附近了结（T+1，非多日持仓）"
+
+    elif run_pullback_mode:
+        m4 = detect_mode4_pullback_confirm(bars, item.get("_pullback_ref"))
+        if m4 and not (item.get("last_signal_mode") == "模式4-回调确认买"
+                       and item.get("last_signal_date") == today):
+            signal = m4
+            signal["execution_window"] = "今日/次日择机分批入场（回调确认，非追高，可分批建仓）"
 
     if signal is None:
         return
 
     price = signal["price"]
+    is_t1_trade = (signal["mode"] == "模式3-尾盘确认买")
+
     if signal["mode"] == "模式1-突破瞬间买":
         stop_loss = round(prior_high * 0.995, 3)
         stop_logic = f"跌破突破位 ${prior_high:.3f} 立即离场"
@@ -556,9 +796,15 @@ def monitor_one_ticker(item: dict) -> None:
         recent_low = min(b["low"] for b in bars[-6:])
         stop_loss = round(recent_low * 0.995, 3)
         stop_logic = f"跌破回踩低点 ${recent_low:.3f} 立即离场"
+    elif signal["mode"] == "模式4-回调确认买":
+        stop_loss = round(signal["pullback_recent_low"], 3)
+        stop_logic = f"跌破回调最低点 ${stop_loss:.3f}（判断证伪）立即离场"
     else:
-        stop_loss = round(prior_high * 0.99, 3)
-        stop_logic = f"次日跌破今日突破位 ${prior_high:.3f} 视为信号失败"
+        # 模式3-尾盘确认买：T+1单日持仓，不是swing多日持仓，
+        # 止损逻辑改成"次日不及预期就直接离场"，不再用突破位
+        # 立即离场这套（本来就不追求突破位站稳，追求的是隔夜动能延续）
+        stop_loss = round(price * 0.99, 3)
+        stop_logic = "次日开盘若明显低开/走弱，不追、直接在开盘附近离场"
 
     # 风险收益比目标价：用prior_high与prior_low_20d的差值 / 20
     # 作为"日均波幅"的粗略代理，不是真实ATR14。
@@ -572,10 +818,23 @@ def monitor_one_ticker(item: dict) -> None:
     # 用二者差值/20作为波幅代理，量级上是合理的近似，
     # 但明确不等于ATR14（ATR是基于真实波幅TR的滚动均值，
     # 这里只是用价格区间宽度做了简化）。
+    #
+    # 模式3是T+1单日持仓，2-3倍风险的swing目标价框架跟"次日开盘
+    # 附近了结"这个持仓周期对不上——之前v1版本两者混用是个措辞
+    # 层面的问题，v2改成不显示R倍数目标价，直接给T+1语境下的说法。
     stop_distance = abs(price - stop_loss)
-    target_1r = round(price + stop_distance * 2, 3)
-    target_2r = round(price + stop_distance * 3, 3)
-    risk_reward_note = "（止损距离×2/×3，非真实ATR，仅供参考）"
+    if is_t1_trade:
+        target_line = (
+            "🎯 无固定目标价——T+1单日持仓，计划在次日开盘附近了结，"
+            "不是多日swing"
+        )
+    else:
+        target_1r = round(price + stop_distance * 2, 3)
+        target_2r = round(price + stop_distance * 3, 3)
+        target_line = (
+            f"🎯 目标价：${target_1r}（2倍风险）/ ${target_2r}（3倍风险）"
+            f"（止损距离×2/×3，非真实ATR，仅供参考）"
+        )
 
     # 当日累积VWAP，作为限价单入场参考
     cum_vwap = calc_cumulative_vwap(bars)
@@ -597,9 +856,16 @@ def monitor_one_ticker(item: dict) -> None:
     if "vol_ratio" in signal:
         extra_lines.append(f"量比：{signal['vol_ratio']}x（vs当日均量）")
     if "pullback_depth_pct" in signal:
-        extra_lines.append(f"回踩深度：{signal['pullback_depth_pct']}%")
+        depth_label = "回调深度" if signal["mode"] == "模式4-回调确认买" else "回踩深度"
+        extra_lines.append(f"{depth_label}：{signal['pullback_depth_pct']}%")
     if "dist_from_high_pct" in signal:
         extra_lines.append(f"距今日高点：{signal['dist_from_high_pct']}%")
+    if "close_pos" in signal:
+        extra_lines.append(f"收盘位置：{signal['close_pos']*100:.0f}%（当根K线高低区间内）")
+    if "vol_uptick" in signal:
+        extra_lines.append(f"量比：{signal['vol_uptick']}x（vs上一根K线）")
+    if "days_since_breakout" in signal:
+        extra_lines.append(f"距突破：{signal['days_since_breakout']}个交易日")
     extra_text = "\n".join(extra_lines)
 
     if item.get("source") == "manual":
@@ -616,11 +882,14 @@ def monitor_one_ticker(item: dict) -> None:
         )
 
     # 跨日状态说明：让用户能区分信号可信度——
-    # "ready"是经过daily_analysis.py盘前跨日因子确认的高质量信号，
-    # "unknown/stale"是跨日分析层不可用时降级运行、未经跨日过滤的信号，
-    # 两者可信度不同，必须让用户知道差异，不能用同样的措辞混在一起
+    # "ready"/"pullback_bottoming"都是经过daily_analysis.py盘前跨日
+    # 因子确认的高质量信号（只是分属突破/回调两条轨道），
+    # "unknown/stale"是跨日分析层不可用时降级运行、未经跨日过滤的
+    # 信号，可信度不同，必须让用户知道差异，不能用同样的措辞混在一起。
     if status_info["status"] == "ready":
-        status_line = "✅ 中线判断：已通过跨日因子分析确认（今日ready，值得建仓）"
+        status_line = "✅ 中线判断：已通过跨日因子分析确认（今日ready，突破轨道，值得建仓）"
+    elif status_info["status"] == "pullback_bottoming":
+        status_line = "✅ 中线判断：健康回调+触底反弹已通过跨日因子分析确认（今日pullback_bottoming，回调轨道）"
     else:
         status_line = (
             f"⚠️ 中线判断：跨日因子分析不可用（{status_info['status']}），"
@@ -632,8 +901,10 @@ def monitor_one_ticker(item: dict) -> None:
         if cum_vwap is not None else f"📊 {vwap_note}"
     )
 
+    header = "🚨 <b>T+1入场信号触发</b>" if is_t1_trade else "🚨 <b>入场信号触发</b>"
+
     msg = (
-        f"🚨 <b>入场信号触发</b>\n\n"
+        f"{header}\n\n"
         f"<b>{item.get('company_name', ticker)}</b> ({ticker})\n"
         f"{status_line}\n"
         f"📍 短线择时：<b>{signal['mode']}</b>\n"
@@ -641,8 +912,7 @@ def monitor_one_ticker(item: dict) -> None:
         f"💰 触发价：${price:.3f}\n"
         f"{vwap_line}\n"
         f"{extra_text}\n\n"
-        f"🎯 目标价：${target_1r}（2倍风险）/ ${target_2r}（3倍风险）"
-        f"{risk_reward_note}\n"
+        f"{target_line}\n"
         f"🛑 止损逻辑：{stop_logic}（止损价参考 ${stop_loss:.3f}）\n\n"
         f"📌 建议执行窗口：{signal['execution_window']}\n\n"
         f"{source_line}\n"
