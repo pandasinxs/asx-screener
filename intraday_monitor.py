@@ -1,42 +1,32 @@
 # ============================================================
-# ASX SYSTEM — intraday_monitor.py  v2
+# ASX SYSTEM — intraday_monitor.py  v3
 #
 # 长期盘中监测：监测 screener.py (EOD) 筛选出的股票，
 # 在监测期内（按筛选等级T1-T4分配天数，可累加）每15分钟扫描一次，
 # 判断四种入场模式是否触发，仅在有信号时推送Telegram。
 #
-# v2改动（相对v1，配合daily_analysis.py新增的pullback_healthy/
-# pullback_bottoming跨日状态）：
-#   1. 【bug修复】跨日状态门禁此前只认ready/watch/caution/
-#      accumulating，pullback_healthy/pullback_bottoming会被
-#      误判成"分析层不可用"，Telegram文案也会错误地显示
-#      "跨日因子分析不可用"。现在按状态分两条轨道路由。
-#   2. 【新增】模式4-回调确认买：配合pullback_bottoming状态，
-#      不重新判断多日形态（那是daily_analysis.py的工作），只做
-#      "今天有没有跌破回调低点、有没有企稳迹象"的当日确认。
-#      回调参考位（回调最低点/回撤深度）由本文件独立计算并缓存，
-#      不读取daily_analysis.py写入的任何字段，阈值常量数值需要
-#      手动跟daily_analysis.py的同名常量保持一致（见MODE4_*注释）。
-#   3. 【修复】模式2-回踩确认买此前只能检测"同一天内突破又回踩"，
-#      因为download_intraday()每次只返回当天K线，搜索"是否发生
-#      过突破"也只在当天bars里找——捕捉不到更常见的"前几天突破，
-#      今天缩量回踩"。改成读取watchlist_db.py新增的
-#      last_breakout_date/last_breakout_price（模式1专属记录，
-#      不会被模式2/3/4的信号覆盖），判断"最近N个交易日内是否
-#      发生过突破"，回踩深度仍用当天重新锁定的prior_high_20d计算
-#      （因为如果突破后继续创新高，这个值会跟着抬高）。
-#      "确认反转"这一步的判断标准维持v1原样（cur.close>prev.close），
-#      不跟模式4统一，避免影响已经在跑的实盘信号。
-#   4. 【修复】模式3-尾盘确认买的判断逻辑不变，但消息文案改成
-#      明确的T+1语气（买近收盘、次日开盘附近了结），去掉了原本
-#      跟swing持仓混用的2-3倍风险目标价，不加自动平仓提醒
-#      （用户明确要求平仓靠自己记）。
+# v3改动（相对v2，解决"止损用固定比例、跟仓位计算脱节"的问题）：
+#   1. 新增真实ATR14计算，复用lock_daily_reference()已下载的
+#      日线数据（不多花yfinance请求），跟prior_high_20d/
+#      pullback_recent_low一样缓存到watchlist_db，每天算一次。
+#   2. 模式1/2的止损从"固定×0.995"改成"结构性参考位 − ATR×1.5"
+#      （ATR_STOP_MULTIPLIER跟daily_analysis.py保持同一数值/
+#      同一风控哲学）。模式4维持不变——它的止损是回调最低点本身，
+#      daily_analysis.py原本设计就没加缓冲，不该在这里另搞一套。
+#      ATR算不出来时（数据不足），自动退回v2的固定比例逻辑，
+#      不阻断信号。
+#   3. 新增仓位计算：之前v1/v2版本触发信号时只给止损价和目标价，
+#      从没算过"这笔该买多少股"——实际执行时只能翻回daily_analysis.py
+#      盘前用ATR算出来的仓位，但那个仓位对应的止损距离，跟
+#      intraday这边实际触发的止损可能对不上（同一份资金风险预算，
+#      被两个不同的止损距离各自套用了一遍）。v3在触发信号的当下，
+#      用这个模式实际的止损距离重新算一次仓位，跟止损保持一致。
 #
 # 四种模式（均为15分钟K线级别的"代理判断"，非逐笔tick级）：
 #   模式1 突破瞬间买：15分钟K线收盘突破prior_high_20d + 放量 + 未被砸回
 #   模式2 回踩确认买：突破后（可跨天）回踩缩量企稳，重新拉升的那一根K线
 #   模式3 尾盘确认买（T+1）：15:30-15:45时段维持强势，次日开盘附近了结
-#   模式4 回调确认买（新）：健康回调触底反弹后，当日延续确认
+#   模式4 回调确认买：健康回调触底反弹后，当日延续确认
 #
 # 状态路由（与daily_analysis.py的今日跨日状态一一对应）：
 #   ready              → 模式1/2/3（突破轨道）
@@ -49,8 +39,8 @@
 # 设计基线（与screener.py保持一致的风控/数据规范）：
 #   - 跳过开盘集合竞价噪音（09:30前）和收盘集合竞价（16:00后）
 #   - 流动性门槛与screener.py一致（避免低基数下的"虚假放量"）
-#   - 所有基准位（前高/量能均值/回调参考位）在每个交易日开盘后
-#     锁定一次，全天不变，防未来函数
+#   - 所有基准位（前高/量能均值/回调参考位/ATR14）在每个交易日
+#     开盘后锁定一次，全天不变，防未来函数
 #   - 健康度检查：监测期内若股票转弱，提前清出队列，不死板跑满天数
 #   - 每次轮询写入intraday_snapshots，供历史比对和回测
 #
@@ -140,6 +130,22 @@ MODE4_PULLBACK_LOOKBACK_DAYS = 20
 # BOTTOM_CLOSE_POS_MIN/BOTTOM_VOL_UPTICK_MIN保持数值一致
 MODE4_BOTTOM_CLOSE_POS_MIN  = 0.60
 MODE4_BOTTOM_VOL_UPTICK_MIN = 1.0
+
+# v3新增：真实ATR止损倍数 + 仓位计算参数。
+# ⚠️ 以下数值必须手动跟daily_analysis.py里的同名常量保持一致
+# （TOTAL_CAPITAL/RISK_PER_TRADE/ATR_STOP_MULTIPLIER/MAX_POSITION_PCT/
+# MIN_POSITION_VALUE/CMC_RATE/CMC_MIN_FEE）——两边是独立实现，
+# 不共享代码，改一处记得改另一处。这是本次改动里第二个"需要
+# 手动同步"的常量组（第一个是MODE4_*），如果以后要消除这类
+# 手动同步风险，可以考虑抽一个两边都import的共享配置文件。
+TOTAL_CAPITAL        = 50_000
+RISK_PER_TRADE       = 0.008     # 0.8% = $400
+ATR_STOP_MULTIPLIER  = 1.5
+MAX_POSITION_PCT     = 0.20
+MIN_POSITION_VALUE   = 6_500
+CMC_RATE             = 0.0011
+CMC_MIN_FEE          = 7.0
+ATR_PERIOD           = 14
 
 _health_fail_streak: dict = {}
 
@@ -322,6 +328,70 @@ def compute_pullback_reference(high: pd.Series, low: pd.Series,
     return {"recent_high": recent_high, "recent_low": recent_low, "depth_pct": depth_pct}
 
 
+def calc_atr14(high: pd.Series, low: pd.Series, close: pd.Series,
+                period: int = ATR_PERIOD) -> Optional[float]:
+    """
+    真实ATR计算，公式跟daily_analysis.py的load_atr()一致：
+    TR = max(高-低, |高-昨收|, |低-昨收|)，ATR = TR的period日滚动均值。
+
+    v2版本止损用的是"20日高低价差/20"这个粗略代理（注释里自己
+    也承认"非真实ATR，仅供参考"）。v3改成用同一份已下载的日线
+    数据算真实ATR，不需要额外的yfinance请求。
+    """
+    if high is None or low is None or close is None or len(close) < period + 1:
+        return None
+    try:
+        prev = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev).abs(),
+            (low - prev).abs(),
+        ], axis=1).max(axis=1)
+        atr = float(tr.rolling(period).mean().iloc[-1])
+        return round(atr, 4) if atr > 0 else None
+    except Exception:
+        return None
+
+
+def calculate_position_intraday(entry_price: float, stop_distance: float) -> Optional[dict]:
+    """
+    v3新增：intraday_monitor.py自己的仓位计算，公式跟
+    daily_analysis.py的calculate_position()完全一致（Fixed
+    Fractional），只是止损距离用的是"这个模式实际触发的止损距离"，
+    而不是daily_analysis.py盘前用ATR算出来的那个距离——这两个
+    距离在v2版本里可能对不上（同一份0.8%风险预算，被两套不同的
+    止损距离各自套用了一遍），v3让触发信号时的仓位跟触发信号时
+    的止损保持严格一致。
+
+    stop_distance<=0时返回None（数据异常，不应该据此下单）。
+    """
+    if stop_distance is None or stop_distance <= 0 or entry_price <= 0:
+        return None
+
+    max_loss = TOTAL_CAPITAL * RISK_PER_TRADE
+    shares_by_risk = int(max_loss / stop_distance)
+    max_by_capital = int(TOTAL_CAPITAL * MAX_POSITION_PCT / entry_price)
+    min_by_value   = int(MIN_POSITION_VALUE / entry_price)
+
+    final_shares = min(shares_by_risk, max_by_capital)
+    final_shares = max(final_shares, min_by_value)
+    if final_shares <= 0:
+        return None
+
+    final_value = final_shares * entry_price
+    commission  = max(final_value * CMC_RATE, CMC_MIN_FEE) * 2
+    actual_risk = final_shares * stop_distance + commission
+
+    return {
+        "shares": final_shares,
+        "position_value": round(final_value, 2),
+        "position_pct": round(final_value / TOTAL_CAPITAL * 100, 1),
+        "commission_est": round(commission, 2),
+        "actual_risk": round(actual_risk, 2),
+        "actual_risk_pct": round(actual_risk / TOTAL_CAPITAL * 100, 2),
+    }
+
+
 def lock_daily_reference(item: dict) -> Optional[dict]:
     """
     锁定当日基准位：突破轨道用的prior_high_20d/prior_low_20d/
@@ -359,6 +429,7 @@ def lock_daily_reference(item: dict) -> Optional[dict]:
         avg_vol    = float(volume.iloc[-BREAKOUT_LOOKBACK_DAYS:].mean())
 
         pullback_ref = compute_pullback_reference(high, low, close)
+        atr14 = calc_atr14(high, low, close)
 
         wdb.update_daily_reference(ticker, today, prior_high, prior_low, avg_vol)
         wdb.update_pullback_reference(
@@ -366,15 +437,18 @@ def lock_daily_reference(item: dict) -> Optional[dict]:
             pullback_ref["recent_low"] if pullback_ref else None,
             pullback_ref["depth_pct"] if pullback_ref else None,
         )
+        wdb.update_atr_reference(ticker, today, atr14)
         item.update({
             "ref_date": today, "prior_high_20d": prior_high,
             "prior_low_20d": prior_low, "avg_vol_20d": avg_vol,
             "pullback_recent_low": pullback_ref["recent_low"] if pullback_ref else None,
             "pullback_depth_pct": pullback_ref["depth_pct"] if pullback_ref else None,
             "_pullback_ref": pullback_ref,
+            "atr14": atr14,
         })
         log.info(
             f"基准锁定 [{ticker}]：前高{prior_high:.3f} 前低{prior_low:.3f} 均量{avg_vol:,.0f}"
+            f" | ATR14={atr14 if atr14 else 'N/A'}"
             + (f" | 回调参考：低点{pullback_ref['recent_low']:.3f}"
                f"（回撤{pullback_ref['depth_pct']}%）"
                if pullback_ref else " | 回调参考：不适用")
@@ -788,15 +862,29 @@ def monitor_one_ticker(item: dict) -> None:
 
     price = signal["price"]
     is_t1_trade = (signal["mode"] == "模式3-尾盘确认买")
+    atr14 = item.get("atr14")
+    used_atr_stop = False
 
     if signal["mode"] == "模式1-突破瞬间买":
-        stop_loss = round(prior_high * 0.995, 3)
-        stop_logic = f"跌破突破位 ${prior_high:.3f} 立即离场"
+        if atr14:
+            stop_loss = round(prior_high - ATR_STOP_MULTIPLIER * atr14, 3)
+            stop_logic = f"跌破突破位ATR止损 ${stop_loss:.3f}（突破位${prior_high:.3f} − {ATR_STOP_MULTIPLIER}×ATR14）立即离场"
+            used_atr_stop = True
+        else:
+            stop_loss = round(prior_high * 0.995, 3)
+            stop_logic = f"跌破突破位 ${prior_high:.3f} 立即离场（ATR数据不足，退回固定比例止损）"
     elif signal["mode"] == "模式2-回踩确认买":
         recent_low = min(b["low"] for b in bars[-6:])
-        stop_loss = round(recent_low * 0.995, 3)
-        stop_logic = f"跌破回踩低点 ${recent_low:.3f} 立即离场"
+        if atr14:
+            stop_loss = round(recent_low - ATR_STOP_MULTIPLIER * atr14, 3)
+            stop_logic = f"跌破回踩低点ATR止损 ${stop_loss:.3f}（回踩低点${recent_low:.3f} − {ATR_STOP_MULTIPLIER}×ATR14）立即离场"
+            used_atr_stop = True
+        else:
+            stop_loss = round(recent_low * 0.995, 3)
+            stop_logic = f"跌破回踩低点 ${recent_low:.3f} 立即离场（ATR数据不足，退回固定比例止损）"
     elif signal["mode"] == "模式4-回调确认买":
+        # 维持不变：止损就是回调最低点本身，daily_analysis.py原本
+        # 设计就没加缓冲（跌破即视为判断证伪），不在这里另加ATR缓冲
         stop_loss = round(signal["pullback_recent_low"], 3)
         stop_logic = f"跌破回调最低点 ${stop_loss:.3f}（判断证伪）立即离场"
     else:
@@ -831,10 +919,30 @@ def monitor_one_ticker(item: dict) -> None:
     else:
         target_1r = round(price + stop_distance * 2, 3)
         target_2r = round(price + stop_distance * 3, 3)
-        target_line = (
-            f"🎯 目标价：${target_1r}（2倍风险）/ ${target_2r}（3倍风险）"
-            f"（止损距离×2/×3，非真实ATR，仅供参考）"
+        if used_atr_stop:
+            target_note = "（止损距离×2/×3，止损距离基于真实ATR14）"
+        elif signal["mode"] == "模式4-回调确认买":
+            target_note = "（止损距离×2/×3，止损为回调实际低点，非ATR）"
+        else:
+            target_note = "（止损距离×2/×3，ATR数据不足退回固定比例，仅供参考）"
+        target_line = f"🎯 目标价：${target_1r}（2倍风险）/ ${target_2r}（3倍风险）{target_note}"
+
+    # v3新增：用这个模式实际的止损距离重新算仓位，跟daily_analysis.py
+    # 盘前用ATR算出来的position_advice保持"止损距离和仓位大小对得上"
+    # 这个一致性（同一份0.8%风险预算，不能被两个不同的止损距离
+    # 各自套用一遍）。T+1（模式3）不显示仓位建议——它止损逻辑本身
+    # 是"次日不及预期就离场"而非固定价位止损，用stop_distance硬算
+    # 仓位意义不大。
+    position_advice = None if is_t1_trade else calculate_position_intraday(price, stop_distance)
+    if position_advice:
+        position_line = (
+            f"💼 仓位建议：{position_advice['shares']}股 | "
+            f"${position_advice['position_value']}（总资金{position_advice['position_pct']}%）| "
+            f"预估手续费${position_advice['commission_est']} | "
+            f"总风险${position_advice['actual_risk']}（{position_advice['actual_risk_pct']}%）"
         )
+    else:
+        position_line = None
 
     # 当日累积VWAP，作为限价单入场参考
     cum_vwap = calc_cumulative_vwap(bars)
@@ -903,6 +1011,8 @@ def monitor_one_ticker(item: dict) -> None:
 
     header = "🚨 <b>T+1入场信号触发</b>" if is_t1_trade else "🚨 <b>入场信号触发</b>"
 
+    position_block = f"{position_line}\n" if position_line else ""
+
     msg = (
         f"{header}\n\n"
         f"<b>{item.get('company_name', ticker)}</b> ({ticker})\n"
@@ -913,7 +1023,8 @@ def monitor_one_ticker(item: dict) -> None:
         f"{vwap_line}\n"
         f"{extra_text}\n\n"
         f"{target_line}\n"
-        f"🛑 止损逻辑：{stop_logic}（止损价参考 ${stop_loss:.3f}）\n\n"
+        f"🛑 止损逻辑：{stop_logic}（止损价参考 ${stop_loss:.3f}）\n"
+        f"{position_block}\n"
         f"📌 建议执行窗口：{signal['execution_window']}\n\n"
         f"{source_line}\n"
         f"⚠️ 15分钟K线级别确认，非逐笔实时信号，请结合实时盘口核实再操作"
