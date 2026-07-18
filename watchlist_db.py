@@ -88,6 +88,10 @@ def init_watchlist_db() -> None:
                     -- 实现（阈值数值需手动保持同步，不做跨文件读取）。
                     pullback_recent_low REAL,
                     pullback_depth_pct  REAL,
+                    -- v3新增：真实ATR14缓存（intraday_monitor.py用），
+                    -- 跟prior_high_20d/pullback_recent_low共用同一次
+                    -- 日线下载算出，避免多打一次yfinance请求
+                    atr14 REAL,
                     -- daily_analysis.py盘前分析写入的当日跨日状态，
                     -- 供intraday_monitor.py读取，决定是否对该股票
                     -- 运行三种日内模式判断（只对today_status='ready'的股票判断）
@@ -115,6 +119,8 @@ def init_watchlist_db() -> None:
                 conn.execute("ALTER TABLE watchlist ADD COLUMN pullback_recent_low REAL")
             if "pullback_depth_pct" not in cols:
                 conn.execute("ALTER TABLE watchlist ADD COLUMN pullback_depth_pct REAL")
+            if "atr14" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN atr14 REAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS intraday_snapshots (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -320,7 +326,7 @@ def get_active_watchlist() -> list:
                        last_signal_mode, last_signal_date, last_signal_price, stop_loss_price,
                        today_status, today_status_date, today_signal_count,
                        last_breakout_date, last_breakout_price,
-                       pullback_recent_low, pullback_depth_pct
+                       pullback_recent_low, pullback_depth_pct, atr14
                 FROM watchlist
                 WHERE status = 'active' AND days_elapsed < total_days
                 ORDER BY composite_score DESC
@@ -331,7 +337,7 @@ def get_active_watchlist() -> list:
                 "last_signal_mode", "last_signal_date", "last_signal_price", "stop_loss_price",
                 "today_status", "today_status_date", "today_signal_count",
                 "last_breakout_date", "last_breakout_price",
-                "pullback_recent_low", "pullback_depth_pct"]
+                "pullback_recent_low", "pullback_depth_pct", "atr14"]
         return [dict(zip(cols, r)) for r in rows]
     except Exception as e:
         log.error(f"读取监测队列失败: {e}")
@@ -373,6 +379,23 @@ def update_pullback_reference(ticker: str, ref_date: str,
             conn.commit()
     except Exception as e:
         log.error(f"更新回调参考位失败 [{ticker}]: {e}")
+
+
+def update_atr_reference(ticker: str, ref_date: str, atr14: Optional[float]) -> None:
+    """
+    v3新增：缓存真实ATR14（intraday_monitor.py用），跟update_daily_reference()
+    在同一次日线下载里一起算，避免每15分钟轮询都重新下载。传None表示
+    数据不足算不出来，下游需要据此判断是否要回退到旧的固定比例止损。
+    """
+    try:
+        with sqlite3.connect(WATCHLIST_DB_PATH) as conn:
+            conn.execute(
+                "UPDATE watchlist SET atr14 = ? WHERE ticker = ?",
+                (atr14, ticker)
+            )
+            conn.commit()
+    except Exception as e:
+        log.error(f"更新ATR14失败 [{ticker}]: {e}")
 
 
 def increment_day_elapsed(ticker: str) -> None:
