@@ -959,6 +959,14 @@ def monitor_one_ticker(item: dict) -> None:
         vwap_note = "今日成交量过低，VWAP参考意义有限"
 
     wdb.record_signal(ticker, signal["mode"], price, stop_loss)
+    # v4新增：追加式历史记录，供周报等场景查询"过去N天内的信号"
+    # （record_signal()只维护"最新一条"，会被后续信号覆盖）
+    wdb.append_signal_log(
+        ticker, item.get("company_name", ticker), signal["mode"],
+        price, stop_loss,
+        None if is_t1_trade else target_1r,
+        status_info["status"],
+    )
 
     extra_lines = []
     if "vol_ratio" in signal:
