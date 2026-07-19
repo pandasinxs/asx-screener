@@ -11,7 +11,7 @@
 import os
 import sqlite3
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -141,6 +141,28 @@ def init_watchlist_db() -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_snap_ticker_date "
                 "ON intraday_snapshots(ticker, trading_date)"
+            )
+            # v4新增：追加式信号历史记录（跟last_signal_*不同——那组字段
+            # 每次触发都会被覆盖，只保留"最新一条"；这张表每次触发都
+            # 新增一行，供周报等需要"过去一段时间内触发过哪些信号"的
+            # 场景查询使用）
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS intraday_signals_log (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker           TEXT NOT NULL,
+                    company_name     TEXT,
+                    mode             TEXT NOT NULL,
+                    signal_date      TEXT NOT NULL,
+                    signal_time      TEXT NOT NULL,
+                    price            REAL,
+                    stop_loss        REAL,
+                    target_1r        REAL,
+                    status_at_signal TEXT
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sig_log_date "
+                "ON intraday_signals_log(signal_date)"
             )
             conn.commit()
         log.info(f"监测队列数据库就绪：{WATCHLIST_DB_PATH}")
@@ -396,6 +418,72 @@ def update_atr_reference(ticker: str, ref_date: str, atr14: Optional[float]) -> 
             conn.commit()
     except Exception as e:
         log.error(f"更新ATR14失败 [{ticker}]: {e}")
+
+
+def append_signal_log(ticker: str, company_name: str, mode: str,
+                       price: float, stop_loss: float,
+                       target_1r: Optional[float], status_at_signal: str) -> None:
+    """
+    v4新增：追加式记录一次intraday_monitor.py的信号触发，不覆盖历史。
+    跟record_signal()配合使用——record_signal()维护"最新一条"（用于
+    同一模式当天去重判断），这个函数额外维护完整历史（用于周报等
+    需要"过去N天内所有信号"的场景）。
+    """
+    now = datetime.now()
+    try:
+        with sqlite3.connect(WATCHLIST_DB_PATH) as conn:
+            conn.execute("""
+                INSERT INTO intraday_signals_log
+                    (ticker, company_name, mode, signal_date, signal_time,
+                     price, stop_loss, target_1r, status_at_signal)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (ticker, company_name, mode, now.date().isoformat(), now.isoformat(),
+                  price, stop_loss, target_1r, status_at_signal))
+            conn.commit()
+    except Exception as e:
+        log.error(f"追加信号历史失败 [{ticker}]: {e}")
+
+
+def get_company_name(ticker: str) -> Optional[str]:
+    """
+    v4新增：给定ticker查watchlist表里的company_name。
+    用途：signals_history（screener.py维护，在announcements.db里）
+    本身没存company_name字段，weekly_review.py要展示EOD候选池时
+    借这个函数从watchlist表（同一只股票screener.py也会upsert进来）
+    查一下公司名，查不到就返回None，调用方自行回退成显示ticker。
+    """
+    try:
+        with sqlite3.connect(WATCHLIST_DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT company_name FROM watchlist WHERE ticker = ?", (ticker,)
+            ).fetchone()
+        return row[0] if row and row[0] else None
+    except Exception as e:
+        log.error(f"查询公司名失败 [{ticker}]: {e}")
+        return None
+
+
+def get_recent_signal_log(days: int = 7) -> list:
+    """
+    v4新增：查询过去N天内的全部intraday_monitor.py信号记录，
+    按触发时间倒序，供周报等场景使用。
+    """
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    try:
+        with sqlite3.connect(WATCHLIST_DB_PATH) as conn:
+            rows = conn.execute("""
+                SELECT ticker, company_name, mode, signal_date, signal_time,
+                       price, stop_loss, target_1r, status_at_signal
+                FROM intraday_signals_log
+                WHERE signal_date >= ?
+                ORDER BY signal_time DESC
+            """, (cutoff,)).fetchall()
+        cols = ["ticker", "company_name", "mode", "signal_date", "signal_time",
+                "price", "stop_loss", "target_1r", "status_at_signal"]
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception as e:
+        log.error(f"读取信号历史失败: {e}")
+        return []
 
 
 def increment_day_elapsed(ticker: str) -> None:
