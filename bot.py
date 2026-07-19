@@ -388,6 +388,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
            📌 命令：
               /morning   — 立刻运行早盘扫描
               /eod       — 立刻运行EOD扫描
+              /weekly    — 立刻运行周报（EOD选股+盘中信号过去7天回顾，
+                           另外每周六也会自动推送一次）
               /news BHP  — 查看公告、新闻和AI分析
               /status    — 查看系统状态
               /logs      — 查看最近日志
@@ -428,6 +430,15 @@ async def cmd_morning(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_eod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
     await run_script(update, "screener.py", "EOD扫描")
+
+async def cmd_weekly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /weekly：手动触发一次周报（跟crontab周六自动跑的是同一个脚本
+    weekly_review.py，命令本身不处理结果，脚本自己往Telegram推送——
+    跟/eod、/morning的模式完全一致）。
+    """
+    if not auth(update): return
+    await run_script(update, "weekly_review.py", "周报")
 
 async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
@@ -631,6 +642,7 @@ def main():
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("morning",   cmd_morning))
     app.add_handler(CommandHandler("eod",       cmd_eod))
+    app.add_handler(CommandHandler("weekly",    cmd_weekly))
     app.add_handler(CommandHandler("news",      cmd_news))
     app.add_handler(CommandHandler("status",    cmd_status))
     app.add_handler(CommandHandler("logs",      cmd_logs))
