@@ -50,6 +50,8 @@ ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2：复用screen
 """
 
 import argparse
+import hashlib
+import json
 import logging
 import os
 import sqlite3
@@ -105,10 +107,31 @@ class BacktestConfig:
     min_market_cap: float = 50_000_000.0   # 与select_top3()里的硬编码门槛一致
     min_history_days: int = 60             # 与download_ohlcv()的有效性门槛一致
 
+    # 技术指标热身缓冲：MA200/52周高点这些指标需要至少约252个交易日的
+    # 滚动窗口。如果直接从start_date开始下载数据，回测最早约1年的信号会
+    # 因为MA200还没"攒够"数据而系统性失真（ma200=None、w52_hi用不完整窗口）。
+    # 实际下载区间会往前多拉400个日历日（覆盖约260+个交易日），
+    # 但只对>=start_date的交易日生成信号，热身期本身不产出信号。
+    # 拉长到5-10年回测时，这个缓冲期占比很小，但对回测最早一段的
+    # 信号质量影响很大，必须加。
+    warmup_calendar_days: int = 400
+
     db_path: str = os.path.join(ASX_DIR, "backtest_results.db")
     log_path: str = os.path.join(ASX_DIR, "backtest.log")
 
     benchmark_ticker: str = "^AXJO"
+
+    param_set: str = "baseline"  # 本次实验的参数集标签，用于多轮参数对比
+
+    # ── daily_analysis.py 跨日健康度层的近似参数（默认值与真实daily_analysis.py
+    # 逐个对应，全部可通过--params-file的DAILY_HEALTH字段覆盖）──────────────
+    health_vol_spike_threshold: float = 1.8      # VOL_SPIKE_THRESHOLD
+    health_vol_shrink_slope_max: float = -0.02   # VOL_SHRINK_SLOPE_MAX
+    health_amplitude_shrink_slope: float = -0.001  # AMPLITUDE_SHRINK_SLOPE
+    health_close_pos_min: float = 0.65           # CLOSE_POS_MIN
+    health_min_days_analysis: int = 5            # MIN_DAYS_FOR_ANALYSIS
+    health_min_days_exhaustion: int = 10         # MIN_DAYS_FOR_EXHAUSTION
+    health_lookback_days: int = 70               # load_daily_summaries的lookback_days
 
     # 供"补充性、非可比"的真实成本估算层使用（不影响与signals_history可比的核心统计）
     commission_pct: float = 0.0011
@@ -251,20 +274,37 @@ class SignalGenerator:
     def __init__(self, cfg: BacktestConfig, logger: logging.Logger):
         self.cfg = cfg
         self.logger = logger
-        self._market_cap_cache: dict[str, float] = {}
+        self._shares_cache: dict[str, float] = {}
 
-    def _get_market_cap(self, ticker: str) -> float:
-        """当前市值，作为历史各交易日的静态代理（yfinance无历史市值）。"""
-        if ticker in self._market_cap_cache:
-            return self._market_cap_cache[ticker]
+    def _get_shares_outstanding(self, ticker: str) -> float:
+        """
+        当前流通股数（缓存，整个回测期间只查一次）。
+
+        市值历史代理的改进：不用"当前总市值"直接套用到历史每一天
+        （那样会把股价上涨/下跌的全部影响错误地摊到历史市值上），
+        改用"当前股数 × 那一天的历史收盘价"。
+
+        这样只剩一个残余误差来源——公司在历史区间内做过配股/回购导致
+        股数变化（比如10年前股数只有现在的60%），这个误差通常比
+        "直接用现在的总市值"小得多，尤其是对没有大幅稀释历史的公司。
+        不是完美的point-in-time市值，但比之前的版本诚实很多。
+        """
+        if ticker in self._shares_cache:
+            return self._shares_cache[ticker]
         try:
             info = yf.Ticker(ticker).info
-            cap = float(info.get("marketCap", 0) or 0)
+            shares = float(info.get("sharesOutstanding", 0) or 0)
         except Exception as e:
-            self.logger.debug(f"市值获取失败 [{ticker}]: {e}")
-            cap = 0.0
-        self._market_cap_cache[ticker] = cap
-        return cap
+            self.logger.debug(f"股数获取失败 [{ticker}]: {e}")
+            shares = 0.0
+        self._shares_cache[ticker] = shares
+        return shares
+
+    def _market_cap_proxy(self, ticker: str, price_at_date: float) -> float:
+        shares = self._get_shares_outstanding(ticker)
+        if shares <= 0:
+            return 0.0
+        return shares * price_at_date
 
     def scan_day(
         self,
@@ -324,7 +364,7 @@ class SignalGenerator:
 
         filtered_pool = []
         for s in raw_top10:
-            cap = self._get_market_cap(s["ticker"])
+            cap = self._market_cap_proxy(s["ticker"], s["price"])
             if cap < self.cfg.min_market_cap:
                 continue
             s["market_cap_m"] = round(cap / 1e6, 1)
@@ -337,6 +377,184 @@ class SignalGenerator:
     @staticmethod
     def _slice(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
         return df[df.index <= as_of]
+
+
+# ════════════════════════════════════════════════════════════
+# 跨日健康度层 —— 近似复刻 daily_analysis.py 的 ready/watch/caution/accumulating 判断
+# ════════════════════════════════════════════════════════════
+
+class DailyHealthEvaluator:
+    """
+    近似复刻 daily_analysis.py 的跨日健康度判断，改用纯日线OHLCV实现
+    （真实系统读的是intraday_snapshots表，那是15分钟数据聚合出来的，
+    只能回溯60天，没法做多年历史回测——这是绕开这个限制的近似方案）。
+
+    没有直接 `import daily_analysis` 复用：该模块在导入时会执行
+    `logging.basicConfig(handlers=[FileHandler("/home/ubuntu/logs/daily_analysis.log")])`，
+    路径写死了，你VM上如果这个目录不存在或用户不是ubuntu，import会直接
+    FileNotFoundError把整个回测进程带崩。所以这里是把四个核心因子函数
+    （它们本身是纯计算，不做I/O）逐行照抄，而不是运行时依赖那个文件。
+    如果你之后把daily_analysis.py的日志路径改成可配置，可以换成真正
+    import复用，避免两份代码以后走岔。
+
+    与真实版本的核心差异（只有一处，其余字段定义/阈值/组合逻辑逐行一致）：
+      close_vol_ratio —— 真实定义是"当天最后一个15分钟时段的成交量，
+      相对这个具体时段历史均值的比值"，本质是"尾盘有没有放量"。
+      这里用"当天总成交量 / 20日平均总成交量"代替，丢失了"是不是尾盘
+      放量"这个时间维度，只保留"这天有没有放量"这个更粗的信号。
+      如果某天放量发生在开盘但尾盘已萎缩，这个代理会误判为recent_spike，
+      真实系统不会——这是唯一的系统性偏差来源。
+    """
+
+    def __init__(self, cfg: BacktestConfig, logger: logging.Logger):
+        self.cfg = cfg
+        self.logger = logger
+
+    @staticmethod
+    def _linreg_slope(series: pd.Series) -> float:
+        """与daily_analysis.py的_linreg_slope()逐行一致。"""
+        if len(series) < 3:
+            return 0.0
+        try:
+            x = np.arange(len(series), dtype=float)
+            y = series.values.astype(float)
+            mask = ~np.isnan(y)
+            if mask.sum() < 3:
+                return 0.0
+            slope = np.polyfit(x[mask], y[mask], 1)[0]
+            mean = np.nanmean(y)
+            return float(slope / mean) if abs(mean) > 1e-10 else 0.0
+        except Exception:
+            return 0.0
+
+    def evaluate(self, pit_df: pd.DataFrame, as_of: pd.Timestamp) -> dict:
+        """
+        pit_df: 已经point-in-time截止到as_of的完整日线历史（用于rolling(20)
+                有足够的热身数据，不是只传最近70天）
+        返回health_status(ready/watch/caution/accumulating)及诊断字段。
+        """
+        cfg = self.cfg
+        cutoff = as_of - pd.Timedelta(days=cfg.health_lookback_days)
+        window = pit_df[(pit_df.index > cutoff) & (pit_df.index <= as_of)].copy()
+        n_days = len(window)
+
+        empty_result = {
+            "health_status": "accumulating", "health_data_days": n_days,
+            "health_signal_count": 0, "health_warn_count": 0,
+        }
+        if n_days < cfg.health_min_days_analysis:
+            return empty_result
+
+        try:
+            day_high = window["High"].astype(float)
+            day_low = window["Low"].astype(float)
+            day_volume = window["Volume"].astype(float)
+            close_proxy = window["Close"].astype(float)
+
+            vol_ma20_full = pit_df["Volume"].astype(float).rolling(20).mean()
+            vol_ratio_proxy = (window["Volume"].astype(float)
+                                / vol_ma20_full.reindex(window.index)).fillna(0)
+
+            signals: list[str] = []
+            warnings: list[str] = []
+
+            # ── 量能因子 ──
+            vol_slope = round(self._linreg_slope(day_volume), 4)
+            vols = day_volume.values
+            shrink = 0
+            for i in range(len(vols) - 1, 0, -1):
+                if vols[i] < vols[i - 1]:
+                    shrink += 1
+                else:
+                    break
+
+            if vol_slope < cfg.health_vol_shrink_slope_max or shrink >= 3:
+                signals.append("量能缩量整理")
+            else:
+                warnings.append("量能未见有效缩量")
+
+            recent_ratio = vol_ratio_proxy.tail(3)
+            spike_idx = recent_ratio[recent_ratio >= cfg.health_vol_spike_threshold].index
+            if len(spike_idx) > 0:
+                spike_date = spike_idx[-1]
+                h, l, c = float(day_high.loc[spike_date]), float(day_low.loc[spike_date]), \
+                          float(close_proxy.loc[spike_date])
+                rng = h - l
+                spike_direction = "none"
+                if rng > 0:
+                    pos = (c - l) / rng
+                    spike_direction = "up" if pos >= 0.6 else "down"
+                if spike_direction == "up":
+                    signals.append("近期向上放量")
+                elif spike_direction == "down":
+                    warnings.append("近期向下放量(可能出货信号)")
+
+            # ── 振幅因子 ──
+            amplitude = ((day_high - day_low) / close_proxy).dropna()
+            amp_slope = round(self._linreg_slope(amplitude), 4)
+            if amp_slope < cfg.health_amplitude_shrink_slope:
+                signals.append("振幅收窄整理")
+            else:
+                warnings.append("振幅未见收窄")
+
+            # ── 价格结构因子 ──
+            price_slope = round(self._linreg_slope(close_proxy), 4)
+            if price_slope > 0:
+                signals.append("价格重心上移")
+            else:
+                warnings.append("价格重心未见上移")
+
+            day_range = day_high - day_low
+            valid = day_range > 0
+            if valid.any():
+                cp = ((close_proxy - day_low) / day_range)[valid]
+                above_pct = float((cp >= cfg.health_close_pos_min).sum() / len(cp))
+                if above_pct >= 0.6:
+                    signals.append("收盘持续偏强")
+
+            if n_days >= cfg.health_min_days_exhaustion:
+                recent_high = float(day_high.max())
+                threshold = recent_high * 0.98
+                tests = int(sum(
+                    1 for h, c in zip(day_high.values, close_proxy.values)
+                    if h >= threshold and c < threshold
+                ))
+                if 2 <= tests <= 8:
+                    signals.append(f"压力位测试{tests}次")
+                elif tests > 8:
+                    warnings.append(f"压力位测试次数过多({tests}次)")
+
+            # ── 动能因子 ──
+            if n_days >= 5:
+                base_vol = float(np.mean(vols[:-1])) if len(vols) > 1 else 0.0
+                if (base_vol > 0 and all(v <= base_vol * 1.2 for v in vols[:-1])
+                        and vols[-1] > base_vol * cfg.health_vol_spike_threshold):
+                    signals.append("第一次放量")
+                closes_arr = close_proxy.dropna().values
+                if len(closes_arr) >= 4:
+                    d2 = np.diff(np.diff(closes_arr))
+                    if len(d2) >= 2 and d2[-1] > 0 and d2[-2] > 0:
+                        signals.append("价格加速上涨")
+
+            sig_count = len(signals)
+            warn_count = len(warnings)
+
+            if sig_count >= 4 and warn_count == 0:
+                status = "ready"
+            elif sig_count >= 3 and warn_count <= 1:
+                status = "watch"
+            elif any("向下放量" in w for w in warnings):
+                status = "caution"
+            else:
+                status = "accumulating"
+
+            return {
+                "health_status": status, "health_data_days": n_days,
+                "health_signal_count": sig_count, "health_warn_count": warn_count,
+            }
+        except Exception as e:
+            self.logger.debug(f"健康度评估异常 as_of={as_of.date()}: {e}")
+            return empty_result
 
 
 # ════════════════════════════════════════════════════════════
@@ -441,8 +659,34 @@ CREATE TABLE IF NOT EXISTS signals_history_backtest (
     holding_days    INTEGER,
     max_gain_pct    REAL,
     max_loss_pct    REAL,
+    health_status       TEXT,
+    health_data_days    INTEGER,
+    health_signal_count INTEGER,
+    health_warn_count   INTEGER,
+    param_set       TEXT    DEFAULT 'baseline',
     run_timestamp   TEXT,
-    UNIQUE(ticker, signal_date)
+    UNIQUE(ticker, signal_date, param_set)
+)
+"""
+
+# 用于判断现有表是不是"跟得上最新schema"的必需列集合。任何一次给
+# signals_history_backtest加新字段（比如这次的health_*），都应该把
+# 新列名加进这个集合——_init_db()靠这个集合决定要不要把旧表重命名备份。
+REQUIRED_COLUMNS = {
+    "param_set", "health_status", "health_data_days",
+    "health_signal_count", "health_warn_count",
+}
+
+# 断点续跑进度表：记录"这一天已经完整跑过"，与signals_history_backtest
+# 分开存储的原因——某一天完全没有候选信号是合法结果（T1-T4全部为空），
+# 这种情况signals_history_backtest不会写入任何行，如果只靠这张表判断
+# "这天有没有跑过"，会把"跑过但无信号"和"还没跑"搞混，导致断点续跑
+# 时把已经跑过的空信号日重新跑一遍。
+PROGRESS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS backtest_progress (
+    run_key     TEXT NOT NULL,
+    signal_date TEXT NOT NULL,
+    PRIMARY KEY (run_key, signal_date)
 )
 """
 
@@ -454,18 +698,54 @@ class BacktestEngine:
         self.data_layer = DataLayer(self.logger)
         self.sig_gen = SignalGenerator(cfg, self.logger)
         self.sim = OutcomeSimulator(cfg, self.logger)
+        self.health_eval = DailyHealthEvaluator(cfg, self.logger)
 
     def _init_db(self, conn: sqlite3.Connection):
+        """
+        建表前先检查现有表是否跟得上最新schema（REQUIRED_COLUMNS）——如果
+        你在这些字段上线前已经跑过回测，旧表会被重命名备份而不是删除，
+        绝不会丢数据，只是旧数据不会自动出现在新的统计口径里
+        （想合并的话可以手动用sqlite3把备份表数据INSERT进新表）。
+        """
+        cur = conn.execute("PRAGMA table_info(signals_history_backtest)")
+        existing_cols = {row[1] for row in cur.fetchall()}
+        if existing_cols and not REQUIRED_COLUMNS.issubset(existing_cols):
+            backup_name = f"signals_history_backtest_legacy_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            self.logger.warning(
+                f"检测到旧版表结构（缺少字段: {REQUIRED_COLUMNS - existing_cols}），"
+                f"已重命名备份为 {backup_name}，"
+                f"数据不会丢失，如需合并请手动处理"
+            )
+            conn.execute(f"ALTER TABLE signals_history_backtest RENAME TO {backup_name}")
         conn.execute(SCHEMA_SQL)
+        conn.execute(PROGRESS_SCHEMA_SQL)
         conn.commit()
 
-    def run(self, tickers: list[str]):
-        self.logger.info(f"=== 回测启动 {self.cfg.start_date} ~ {self.cfg.end_date} "
-                          f"universe={self.cfg.universe_source}({len(tickers)}只) ===")
+    def _run_key(self) -> str:
+        """
+        断点续跑的识别key。加入param_set后，不同参数集下即使日期范围/universe
+        完全一样，也会被当成互相独立的"另一次实验"，各自独立续跑、互不覆盖，
+        这样才能支持"改参数重跑很多次、每次都能看到独立结果"的工作流。
+        """
+        raw = f"{self.cfg.start_date}|{self.cfg.end_date}|{self.cfg.universe_source}|" \
+              f"{self.cfg.universe_file}|{self.cfg.min_market_cap}|{self.cfg.param_set}"
+        return raw
+
+    def run(self, tickers: list[str], max_minutes: Optional[float] = None):
+        self.logger.info(f"=== 回测启动 [{self.cfg.param_set}] {self.cfg.start_date} ~ "
+                          f"{self.cfg.end_date} universe={self.cfg.universe_source}"
+                          f"({len(tickers)}只) ===")
+
+        # 下载起点往前多拉warmup_calendar_days天，保证信号生成的第一天
+        # MA200/52周高点等长窗口指标已经"热身"完毕，不是从零开始累积
+        download_start = str((pd.Timestamp(self.cfg.start_date)
+                               - pd.Timedelta(days=self.cfg.warmup_calendar_days)).date())
+        self.logger.info(f"数据下载起点(含热身缓冲): {download_start}（正式信号仍从"
+                          f"{self.cfg.start_date}开始，缓冲期本身不产出信号）")
 
         history: dict[str, pd.DataFrame] = {}
         for t in tickers:
-            df = self.data_layer.fetch(t, self.cfg.start_date, self.cfg.end_date)
+            df = self.data_layer.fetch(t, download_start, self.cfg.end_date)
             if df is not None and len(df) >= self.cfg.min_history_days:
                 history[t] = df
 
@@ -475,31 +755,77 @@ class BacktestEngine:
             return
 
         xjo_full = self.data_layer.fetch(self.cfg.benchmark_ticker,
-                                          self.cfg.start_date, self.cfg.end_date)
+                                          download_start, self.cfg.end_date)
         xjo_series = xjo_full["Close"].squeeze() if xjo_full is not None else None
 
         trading_days = sorted(set().union(*[df.index for df in history.values()]))
         trading_days = [d for d in trading_days if d >= pd.Timestamp(self.cfg.start_date)]
-        self.logger.info(f"回测交易日数：{len(trading_days)}")
+        self.logger.info(f"回测交易日数（总计，已扣除热身期）：{len(trading_days)}")
 
         conn = sqlite3.connect(self.cfg.db_path)
         self._init_db(conn)
         run_ts = datetime.now().isoformat()
+        run_key = self._run_key()
+
+        # ── 断点续跑：跳过本次run_key下已经完整处理过的交易日 ──────────
+        done_rows = conn.execute(
+            "SELECT signal_date FROM backtest_progress WHERE run_key = ?", (run_key,)
+        ).fetchall()
+        done_days = {r[0] for r in done_rows}
+        remaining_days = [d for d in trading_days if str(d.date()) not in done_days]
+
+        if done_days:
+            self.logger.info(f"检测到断点：已完成 {len(done_days)} 天，"
+                              f"本次继续剩余 {len(remaining_days)} 天")
+        if not remaining_days:
+            self.logger.info("全部交易日已在此前的运行中完成，无需再跑，直接看统计报告即可")
+            conn.close()
+            return
 
         total_written, total_selected = 0, 0
+        processed_count = 0  # 本次运行里真正跑完的天数，独立于循环变量i，
+                              # 避免break/continue路径下的off-by-one混淆
+        start_time = time.time()
 
-        for i, day in enumerate(trading_days):
-            if i % 20 == 0:
-                self.logger.info(f"进度 {i}/{len(trading_days)} ({day.date()}) "
-                                  f"累计写入{total_written}条 已选出{total_selected}笔Top3信号")
+        for i, day in enumerate(remaining_days):
+            if max_minutes is not None:
+                elapsed_min = (time.time() - start_time) / 60
+                if elapsed_min >= max_minutes:
+                    left = len(remaining_days) - processed_count
+                    self.logger.info(
+                        f"达到时间预算({max_minutes}分钟)，本次运行提前结束。"
+                        f"已处理{processed_count}/{len(remaining_days)}天，剩余{left}天，"
+                        f"下次用相同参数重新运行会自动从这里继续（断点续跑）。"
+                    )
+                    break
+
+            if processed_count % 10 == 0 and processed_count > 0:
+                elapsed = time.time() - start_time
+                rate = elapsed / processed_count
+                eta_min = rate * (len(remaining_days) - processed_count) / 60
+                self.logger.info(
+                    f"进度 {processed_count}/{len(remaining_days)} ({day.date()}) "
+                    f"已用{elapsed/60:.1f}分钟 预计还需{eta_min:.1f}分钟 "
+                    f"累计写入{total_written}条 已选出{total_selected}笔Top3信号"
+                )
 
             try:
                 raw_top10, selected = self.sig_gen.scan_day(day, history, xjo_series)
             except Exception as e:
                 self.logger.error(f"scan_day异常 {day.date()}: {e}")
+                # 即使这天异常失败，也标记为已处理，避免死循环卡在同一天，
+                # 但会在日志里留下明确记录，方便你事后针对这天单独排查
+                conn.execute("INSERT OR IGNORE INTO backtest_progress VALUES (?, ?)",
+                             (run_key, str(day.date())))
+                conn.commit()
+                processed_count += 1
                 continue
 
             if not raw_top10:
+                conn.execute("INSERT OR IGNORE INTO backtest_progress VALUES (?, ?)",
+                             (run_key, str(day.date())))
+                conn.commit()
+                processed_count += 1
                 continue
 
             selected_tickers = {s["ticker"] for s in selected}
@@ -508,6 +834,14 @@ class BacktestEngine:
                 ticker = s["ticker"]
                 entry_price = float(s["price"])
                 atr14_pct = float(s.get("atr14_pct", 2.0))
+
+                try:
+                    pit_for_health = history[ticker][history[ticker].index <= day]
+                    health = self.health_eval.evaluate(pit_for_health, day)
+                except Exception as e:
+                    self.logger.debug(f"健康度评估异常 [{ticker}] {day.date()}: {e}")
+                    health = {"health_status": None, "health_data_days": None,
+                              "health_signal_count": None, "health_warn_count": None}
 
                 outcome_result = None
                 try:
@@ -529,7 +863,9 @@ class BacktestEngine:
                         entry_price, None, None,
                         1 if ticker in selected_tickers else 0,
                         "PENDING", None, None, None, None, None, None,
-                        run_ts,
+                        health.get("health_status"), health.get("health_data_days"),
+                        health.get("health_signal_count"), health.get("health_warn_count"),
+                        self.cfg.param_set, run_ts,
                     )
                 else:
                     row = (
@@ -543,7 +879,10 @@ class BacktestEngine:
                         outcome_result["outcome"], outcome_result["outcome_date"],
                         outcome_result["outcome_price"], outcome_result["outcome_pct"],
                         outcome_result["holding_days"], outcome_result["max_gain_pct"],
-                        outcome_result["max_loss_pct"], run_ts,
+                        outcome_result["max_loss_pct"],
+                        health.get("health_status"), health.get("health_data_days"),
+                        health.get("health_signal_count"), health.get("health_warn_count"),
+                        self.cfg.param_set, run_ts,
                     )
                 rows.append(row)
 
@@ -555,16 +894,154 @@ class BacktestEngine:
                         persistence_score, confidence, market_cap_m,
                         entry_price, stop_loss_atr, take_profit_atr, is_selected,
                         outcome, outcome_date, outcome_price, outcome_pct,
-                        holding_days, max_gain_pct, max_loss_pct, run_timestamp
-                    ) VALUES ({",".join(["?"] * 25)})
+                        holding_days, max_gain_pct, max_loss_pct,
+                        health_status, health_data_days, health_signal_count, health_warn_count,
+                        param_set, run_timestamp
+                    ) VALUES ({",".join(["?"] * 30)})
                 """, rows)
-                conn.commit()
                 total_written += len(rows)
                 total_selected += len(selected)
 
+            # 标记这一天已完整处理（无论有没有信号），供下次断点续跑判断
+            conn.execute("INSERT OR IGNORE INTO backtest_progress VALUES (?, ?)",
+                         (run_key, str(day.date())))
+            conn.commit()
+            processed_count += 1
+
+        total_done = len(done_days) + processed_count
+        left = len(trading_days) - total_done
         conn.close()
-        self.logger.info(f"=== 回测完成：共写入 {total_written} 条候选记录 "
-                          f"（其中 {total_selected} 笔为Top3精选信号）===")
+        self.logger.info(f"=== 本次运行结束：本次新处理 {processed_count} 天，"
+                          f"写入 {total_written} 条候选记录（其中 {total_selected} 笔为Top3精选信号）"
+                          f"｜累计总进度 {total_done}/{len(trading_days)} 天"
+                          f"{f'，剩余{left}天，下次用相同参数重跑会自动续上' if left > 0 else '，全部完成，可以看统计报告了'} ===")
+
+
+# ════════════════════════════════════════════════════════════
+# 参数覆盖系统 —— 让"改参数重跑"不需要碰screener.py这个生产文件
+# ════════════════════════════════════════════════════════════
+#
+# 设计动机：SCORE_WEIGHTS/TIERS/TREND_SCORE_THRESHOLD这些参数硬编码在
+# screener.py里，你要测试新参数组合，理论上得去改这个正在生产环境跑的
+# 文件——风险高（改错一个逗号线上就崩），也没法保留每次实验的记录做对比。
+#
+# 这里用"猴子补丁"（运行时给screener模块的属性重新赋值）解决：
+#   - 完全不碰screener.py这个文件本身，磁盘上的文件一个字节都不会变
+#   - 只在backtest_engine.py这个独立进程的内存里生效，不影响任何正在
+#     跑的screener.py / daily_analysis.py / intraday_monitor.py 生产进程
+#   - screener.py里所有函数（_passes_tier / calc_composite_score等）
+#     引用这些常量时都是"调用时从模块里现查"，不是"定义时就写死"，
+#     所以运行时改了之后，后续调用会自动用上新值——这是Python的正常
+#     行为，不是什么特殊技巧
+#
+# 使用方式（对应你说的"改参数→重跑→出结果→再改"这个循环）：
+#   1. 先导出一份当前默认参数模板：
+#        python3 backtest_engine.py --export-params baseline_params.json
+#   2. 复制一份改名（比如 exp1_higher_adx.json），只改你想测的字段
+#   3. 跑：
+#        python3 backtest_engine.py --start ... --end ... \
+#            --params-file exp1_higher_adx.json --param-set-name exp1_higher_adx
+#   4. 反复第2-3步，每次换个--param-set-name，结果都存在同一个
+#      backtest_results.db里，互不覆盖
+#   5. 跑完多轮后：
+#        python3 backtest_engine.py --stats-only --leaderboard
+#      一次性看到所有实验的胜率/盈亏对比排行榜
+
+def export_default_params(path: str, cfg: BacktestConfig, logger: logging.Logger) -> None:
+    """导出screener.py当前的默认参数 + 健康度层默认参数，作为JSON模板供你复制修改。"""
+    payload = {
+        "SCORE_WEIGHTS": dict(screener.SCORE_WEIGHTS),
+        "TIER_BONUS": dict(screener.TIER_BONUS),
+        "TREND_SCORE_THRESHOLD": dict(screener.TREND_SCORE_THRESHOLD),
+        "TIERS": {
+            t["level"]: {k: v for k, v in t.items() if k not in ("level", "label", "note")}
+            for t in screener.TIERS
+        },
+        "BT_STOP_ATR_MULT": screener.BT_STOP_ATR_MULT,
+        "BT_TARGET_ATR_MULT": screener.BT_TARGET_ATR_MULT,
+        "BT_TIMEOUT_DAYS": screener.BT_TIMEOUT_DAYS,
+        "DAILY_HEALTH": {
+            "VOL_SPIKE_THRESHOLD": cfg.health_vol_spike_threshold,
+            "VOL_SHRINK_SLOPE_MAX": cfg.health_vol_shrink_slope_max,
+            "AMPLITUDE_SHRINK_SLOPE": cfg.health_amplitude_shrink_slope,
+            "CLOSE_POS_MIN": cfg.health_close_pos_min,
+            "MIN_DAYS_FOR_ANALYSIS": cfg.health_min_days_analysis,
+            "MIN_DAYS_FOR_EXHAUSTION": cfg.health_min_days_exhaustion,
+            "LOOKBACK_DAYS": cfg.health_lookback_days,
+        },
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    logger.info(f"默认参数模板已导出: {path}")
+    print(f"默认参数模板已导出到 {path}，复制一份改名后编辑你想测试的字段即可")
+
+
+def apply_param_overrides(overrides: dict, cfg: BacktestConfig, logger: logging.Logger) -> None:
+    """
+    把JSON里出现的字段，以"部分覆盖"（不是整体替换）的方式打到screener模块
+    和cfg对象上。没在JSON里出现的字段保持原始默认值不变。
+
+    必须在构建BacktestEngine/SignalGenerator/OutcomeSimulator/
+    DailyHealthEvaluator之前调用——OutcomeSimulator.__init__会把
+    BT_STOP_ATR_MULT等缓存成实例属性，构建完之后再改screener模块的值
+    不会生效。main()里已经保证了调用顺序。
+    """
+    if "SCORE_WEIGHTS" in overrides:
+        screener.SCORE_WEIGHTS = {**screener.SCORE_WEIGHTS, **overrides["SCORE_WEIGHTS"]}
+        logger.info(f"覆盖 SCORE_WEIGHTS -> {screener.SCORE_WEIGHTS}")
+
+    if "TIER_BONUS" in overrides:
+        screener.TIER_BONUS = {**screener.TIER_BONUS, **overrides["TIER_BONUS"]}
+        logger.info(f"覆盖 TIER_BONUS -> {screener.TIER_BONUS}")
+
+    if "TREND_SCORE_THRESHOLD" in overrides:
+        screener.TREND_SCORE_THRESHOLD = {**screener.TREND_SCORE_THRESHOLD,
+                                          **overrides["TREND_SCORE_THRESHOLD"]}
+        logger.info(f"覆盖 TREND_SCORE_THRESHOLD -> {screener.TREND_SCORE_THRESHOLD}")
+
+    if "TIERS" in overrides:
+        new_tiers = []
+        for tier in screener.TIERS:
+            patch = overrides["TIERS"].get(tier["level"], {})
+            new_tiers.append({**tier, **patch})
+        screener.TIERS = new_tiers
+        logger.info(f"覆盖 TIERS -> " +
+                    "; ".join(f"{t['level']}:{overrides['TIERS'].get(t['level'], {})}"
+                             for t in new_tiers if t["level"] in overrides["TIERS"]))
+
+    for scalar_key in ("BT_STOP_ATR_MULT", "BT_TARGET_ATR_MULT", "BT_TIMEOUT_DAYS"):
+        if scalar_key in overrides:
+            setattr(screener, scalar_key, overrides[scalar_key])
+            logger.info(f"覆盖 {scalar_key} -> {overrides[scalar_key]}")
+
+    if "DAILY_HEALTH" in overrides:
+        health_field_map = {
+            "VOL_SPIKE_THRESHOLD": "health_vol_spike_threshold",
+            "VOL_SHRINK_SLOPE_MAX": "health_vol_shrink_slope_max",
+            "AMPLITUDE_SHRINK_SLOPE": "health_amplitude_shrink_slope",
+            "CLOSE_POS_MIN": "health_close_pos_min",
+            "MIN_DAYS_FOR_ANALYSIS": "health_min_days_analysis",
+            "MIN_DAYS_FOR_EXHAUSTION": "health_min_days_exhaustion",
+            "LOOKBACK_DAYS": "health_lookback_days",
+        }
+        for k, v in overrides["DAILY_HEALTH"].items():
+            field = health_field_map.get(k)
+            if field is None:
+                logger.warning(f"DAILY_HEALTH里的未知字段 {k}，忽略")
+                continue
+            setattr(cfg, field, v)
+            logger.info(f"覆盖 DAILY_HEALTH.{k} -> {v}")
+
+
+def resolve_param_set_name(params_file: str, explicit_name: str) -> str:
+    if explicit_name:
+        return explicit_name
+    if params_file and os.path.exists(params_file):
+        with open(params_file, encoding="utf-8") as f:
+            content = f.read()
+        h = hashlib.md5(content.encode("utf-8")).hexdigest()[:8]
+        return f"auto-{h}"
+    return "baseline"
 
 
 # ════════════════════════════════════════════════════════════
@@ -576,6 +1053,50 @@ class StatsReporter:
         self.cfg = cfg
         self.logger = logger
 
+    def leaderboard(self):
+        """
+        一次性列出db里所有跑过的参数集实验，按胜率排序——
+        这是支撑"反复改参数、每次都想知道谁更好"这个工作流的核心视图。
+        """
+        if not os.path.exists(self.cfg.db_path):
+            print("回测数据库还不存在，先跑一次backtest_engine.py")
+            return
+        conn = sqlite3.connect(self.cfg.db_path)
+        try:
+            df = pd.read_sql_query("""
+                SELECT param_set,
+                       COUNT(*) AS n,
+                       SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) AS wins,
+                       AVG(outcome_pct) AS avg_pct,
+                       MIN(signal_date) AS date_from,
+                       MAX(signal_date) AS date_to
+                FROM signals_history_backtest
+                WHERE outcome != 'PENDING' AND is_selected = 1
+                GROUP BY param_set
+                ORDER BY (wins * 1.0 / n) DESC
+            """, conn)
+        except Exception as e:
+            print(f"排行榜查询失败（可能是旧表结构还没跑过新参数系统）: {e}")
+            conn.close()
+            return
+        conn.close()
+
+        if df.empty:
+            print("暂无已完成的实验记录（outcome全是PENDING，或者还没跑过任何数据）")
+            return
+
+        print("\n" + "=" * 70)
+        print("参数实验排行榜（按Top3精选信号胜率排序，只统计有结果的交易）")
+        print("=" * 70)
+        for _, row in df.iterrows():
+            wr = row["wins"] / row["n"] if row["n"] else 0
+            print(f"  {row['param_set']:<24s} 样本{int(row['n']):>4d}笔  "
+                  f"胜率{wr:>6.1%}  平均单笔{row['avg_pct']:>+6.2f}%  "
+                  f"覆盖{row['date_from']}~{row['date_to']}")
+        print("=" * 70)
+        print("样本量差距较大的实验之间直接比胜率会有误导性，"
+              "建议同时看样本数，样本差太多的先别下结论")
+
     def _bootstrap_ci(self, wins: np.ndarray, n_iter: int = 2000) -> tuple[float, float]:
         if len(wins) == 0:
             return (0.0, 0.0)
@@ -584,13 +1105,22 @@ class StatsReporter:
         return float(np.percentile(rates, 5)), float(np.percentile(rates, 95))
 
     def _load_backtest_df(self, only_selected: bool, tier: Optional[str]) -> pd.DataFrame:
+        if not os.path.exists(self.cfg.db_path):
+            return pd.DataFrame()
         conn = sqlite3.connect(self.cfg.db_path)
-        query = "SELECT *, 'backtest' AS source FROM signals_history_backtest WHERE outcome != 'PENDING'"
+        query = ("SELECT *, 'backtest' AS source FROM signals_history_backtest "
+                 "WHERE outcome != 'PENDING' AND param_set = ?")
+        params = [self.cfg.param_set]
         if only_selected:
             query += " AND is_selected = 1"
         if tier:
-            query += f" AND tier_level = '{tier}'"
-        df = pd.read_sql_query(query, conn)
+            query += " AND tier_level = ?"
+            params.append(tier)
+        try:
+            df = pd.read_sql_query(query, conn, params=params)
+        except Exception as e:
+            self.logger.warning(f"读取回测结果失败: {e}")
+            df = pd.DataFrame()
         conn.close()
         return df
 
@@ -605,12 +1135,14 @@ class StatsReporter:
                   "outcome, outcome_date, outcome_price, outcome_pct, holding_days, "
                   "max_gain_pct, max_loss_pct, 'live' AS source "
                   "FROM signals_history WHERE outcome != 'PENDING'")
+        params: list = []
         if only_selected:
             query += " AND is_selected = 1"
         if tier:
-            query += f" AND tier_level = '{tier}'"
+            query += " AND tier_level = ?"
+            params.append(tier)
         try:
-            df = pd.read_sql_query(query, conn)
+            df = pd.read_sql_query(query, conn, params=params)
         finally:
             conn.close()
         return df
@@ -628,18 +1160,29 @@ class StatsReporter:
             return None
 
     def report(self, only_selected: bool = True, tier: Optional[str] = None,
-               merge_live: bool = False, live_db: str = ""):
+               merge_live: bool = False, live_db: str = "",
+               health_status: Optional[str] = None):
         bt_df = self._load_backtest_df(only_selected, tier)
         frames = [bt_df]
         if merge_live:
             live_df = self._load_live_df(live_db or os.path.join(ASX_DIR, "announcements.db"),
                                           only_selected, tier)
+            if health_status and not live_df.empty:
+                self.logger.warning(
+                    "注意：线上signals_history表没有health_status字段（真实系统里"
+                    "健康度状态存在watchlist_db，不在announcements.db），"
+                    "--merge-live + --health-status同时使用时，线上数据会被health_status"
+                    "过滤条件排除（NaN不匹配任何具体状态），只剩本地回测数据参与统计"
+                )
             frames.append(live_df)
 
         combined = pd.concat(frames, ignore_index=True) if any(len(f) for f in frames) else pd.DataFrame()
 
+        if health_status:
+            combined = combined[combined["health_status"] == health_status]
+
         if combined.empty:
-            print("无可用交易记录（outcome全部为PENDING，或数据库为空）")
+            print("无可用交易记录（outcome全部为PENDING，或数据库为空，或health_status过滤后为空）")
             return
 
         source_counts = combined["source"].value_counts().to_dict() if "source" in combined else {}
@@ -660,12 +1203,13 @@ class StatsReporter:
 
         bench = self._benchmark_return()
 
+        health_note = f"（仅健康度={health_status}）" if health_status else ""
         tier_note = f"（仅{tier}层级）" if tier else "（全部T1-T4层级）"
         scope_note = "仅Top3精选信号" if only_selected else "T1-T4全部候选（含未入选）"
 
         lines = [
             "\n" + "=" * 58,
-            f"回测统计报告 {tier_note} — {scope_note}",
+            f"回测统计报告 [参数集: {self.cfg.param_set}] {tier_note}{health_note} — {scope_note}",
             "=" * 58,
             f"样本来源       : {source_counts}",
             f"交易笔数       : {len(combined)}",
@@ -678,10 +1222,13 @@ class StatsReporter:
             f"{f'{bench:+.1%}' if bench is not None else '获取失败'}",
             "-" * 58,
             "⚠️ 局限提醒（务必结合解读）:",
-            "  - 市值门槛用当前市值做历史代理，可能高估早期小盘股的入选概率",
+            "  - 市值用「当前股数×历史当日股价」做代理，仍非完美point-in-time市值",
+            "    （公司历史上若做过大额配股/回购，会有残余误差）",
             "  - catalyst固定为0，本结果只反映趋势/技术面逻辑，不含公告驱动信号",
             "  - 止盈止损假设完美成交，不含跳空穿仓风险，实际胜率可能更保守",
             "  - TREND_SCORE_THRESHOLD由近期数据校准，套用早期历史存在轻微前视偏差",
+            "  - health_status是daily_analysis.py的近似复刻（日线数据版），"
+            "唯一的系统性偏差在于用「当日总量比」代替「尾盘时段量比」",
             "=" * 58,
         ]
         report_text = "\n".join(lines)
@@ -692,7 +1239,90 @@ class StatsReporter:
             print("\n【分层级胜率对比（合并样本）】")
             for lv, g in combined.groupby("tier_level"):
                 w = (g["outcome"] == "WIN").mean()
-                print(f"  {lv}: 样本{len(g)}笔  胜率{w:.1%}")
+                avg_pct = g["outcome_pct"].astype(float).mean()
+                print(f"  {lv}: 样本{len(g)}笔  胜率{w:.1%}  平均单笔收益{avg_pct:+.2f}%")
+
+        if "health_status" in combined.columns and combined["health_status"].notna().any():
+            print("\n【跨日健康度分层胜率对比】—— 直接回答"
+                  "「daily_analysis.py这层过滤到底有没有用」")
+            for hs, g in combined.dropna(subset=["health_status"]).groupby("health_status"):
+                w = (g["outcome"] == "WIN").mean()
+                avg_pct = g["outcome_pct"].astype(float).mean()
+                print(f"  {hs:<12s}: 样本{len(g)}笔  胜率{w:.1%}  平均单笔收益{avg_pct:+.2f}%")
+            print("  → 如果ready组明显比其他组胜率高，说明健康度过滤确实有增量价值，"
+                  "值得在intraday_monitor.py里继续坚持这道门槛；如果差不多甚至更低，"
+                  "说明这层过滤没有实际筛选力，可以考虑简化掉")
+
+        self._analyze_score_predictiveness(combined)
+
+    def _analyze_score_predictiveness(self, combined: pd.DataFrame, n_buckets: int = 4):
+        """
+        回答"评分排得高是不是真的赢面更大"——这是判断调参方向的核心依据。
+
+        做法：按composite_score把全部交易分成n_buckets组（默认4等分），
+        分别看每组的胜率和平均单笔收益。
+
+        怎么解读：
+          - 如果分数越高的组，胜率/平均收益确实越高 → 说明composite_score
+            本身有效，可以考虑抬高入选门槛（牺牲信号数量换胜率），
+            或者干脆把Top3改成Top1/Top2，只吃最高分那一档
+          - 如果各组胜率几乎没差别，甚至和分数排序倒挂 → 说明当前的
+            SCORE_WEIGHTS权重分配（trend_strength/persistence/catalyst/
+            price_pct_1y）不是真正驱动胜负的因素，硬拉高门槛不会提升
+            胜率，需要回头看看权重设计或者_passes_tier()里的硬性条件
+            是不是筛掉了错误的股票
+
+        样本量不足20笔时不做分组（分组后每组可能只有个位数样本，
+        结论没有意义，容易把噪音当规律）。
+        """
+        if len(combined) < 20 or "composite_score" not in combined.columns:
+            print("\n【评分预测力分析】样本不足20笔或缺少composite_score字段，暂不分组分析")
+            return
+
+        df = combined.dropna(subset=["composite_score", "outcome_pct"]).copy()
+        if len(df) < 20:
+            return
+
+        try:
+            df["score_bucket"] = pd.qcut(df["composite_score"], n_buckets, duplicates="drop")
+        except Exception as e:
+            self.logger.warning(f"评分分桶失败（可能分数分布过于集中）: {e}")
+            return
+
+        if df["score_bucket"].isna().all():
+            print("\n【评分预测力分析】composite_score分桶后全部为空值（可能取值种类过少），暂不分组分析")
+            return
+
+        rows = []
+        for bucket, g in df.groupby("score_bucket", observed=True):
+            if len(g) == 0:
+                continue
+            win_rate = (g["outcome"] == "WIN").mean()
+            avg_pct = g["outcome_pct"].astype(float).mean()
+            rows.append((str(bucket), len(g), win_rate, avg_pct))
+
+        if len(rows) < 2:
+            print(f"\n【评分预测力分析】composite_score的取值种类太少（分桶后只有{len(rows)}组），"
+                  f"没法看出分数和胜负的关系。这通常是因为当前样本里入选股票的层级过于单一"
+                  f"（比如全部来自同一个tier），先积累更多样本或换更宽的universe再看")
+            return
+
+        print(f"\n【评分预测力分析】composite_score从低到高分{len(rows)}组，"
+              f"看分数是否真的和胜负相关：")
+        for bucket_label, n, wr, avg_pct in rows:
+            print(f"  分数区间 {bucket_label}: 样本{n}笔  胜率{wr:.1%}  平均单笔收益{avg_pct:+.2f}%")
+
+        win_rates = [r[2] for r in rows]
+        monotonic_up = all(win_rates[i] <= win_rates[i + 1] for i in range(len(win_rates) - 1))
+        if monotonic_up and win_rates[-1] > win_rates[0]:
+            print("  → 分数越高胜率越高，呈现单调递增，composite_score有实际预测力，"
+                  "可以考虑抬高入选门槛换胜率")
+        elif win_rates[-1] <= win_rates[0]:
+            print("  → 最高分组胜率并不比最低分组好（甚至更差），composite_score当前的"
+                  "权重设计可能没有真正抓住驱动胜负的因素，建议先查权重/硬性条件，"
+                  "而不是简单抬高分数门槛")
+        else:
+            print("  → 关系不完全单调，可能是样本量还不够大，建议积累更多样本后再下结论")
 
 
 # ════════════════════════════════════════════════════════════
@@ -711,6 +1341,21 @@ def main():
     parser.add_argument("--tier", default="", help="只看某个tier，如 T1")
     parser.add_argument("--all-candidates", action="store_true",
                         help="统计T1-T4全部候选（不只是Top3），能更快积累样本量")
+    parser.add_argument("--max-minutes", type=float, default=None,
+                        help="本次运行的时间预算（分钟）。到点自动优雅停止并记录断点，"
+                             "下次用相同参数重跑会自动续上，适合crontab每晚跑固定时长")
+    parser.add_argument("--params-file", default="",
+                        help="参数覆盖JSON文件路径，不传则使用screener.py当前默认值（baseline）")
+    parser.add_argument("--param-set-name", default="",
+                        help="本次实验的标签名，用于结果对比。不传则按params-file内容自动生成，"
+                             "都不传则叫baseline")
+    parser.add_argument("--export-params", default="",
+                        help="导出当前screener.py默认参数为JSON模板到指定路径，导出后直接退出，不跑回测")
+    parser.add_argument("--leaderboard", action="store_true",
+                        help="列出db里所有参数集实验的胜率对比排行榜，不跑新回测")
+    parser.add_argument("--health-status", default="",
+                        help="只看某个跨日健康度状态的交易，如 ready/watch/caution/accumulating，"
+                             "用来验证daily_analysis.py这层健康度过滤到底有没有增量价值")
     args = parser.parse_args()
 
     cfg = BacktestConfig(
@@ -719,13 +1364,36 @@ def main():
     )
     logger = setup_logging(cfg.log_path)
 
+    if args.export_params:
+        export_default_params(args.export_params, cfg, logger)
+        return
+
+    if args.leaderboard:
+        StatsReporter(cfg, logger).leaderboard()
+        return
+
+    # 参数覆盖必须在任何BacktestEngine/SignalGenerator/OutcomeSimulator/
+    # DailyHealthEvaluator构建之前完成——OutcomeSimulator会在__init__时
+    # 缓存BT_STOP_ATR_MULT等值，晚了就不生效，main()这里的顺序就是保证这一点。
+    overrides = {}
+    if args.params_file:
+        if not os.path.exists(args.params_file):
+            logger.error(f"参数文件不存在: {args.params_file}")
+            return
+        with open(args.params_file, encoding="utf-8") as f:
+            overrides = json.load(f)
+        apply_param_overrides(overrides, cfg, logger)
+
+    cfg.param_set = resolve_param_set_name(args.params_file, args.param_set_name)
+    logger.info(f"本次实验标签: {cfg.param_set}")
+
     if not args.stats_only:
         tickers = resolve_universe(cfg, logger)
         if not tickers:
             logger.error("universe为空，终止")
             return
         engine = BacktestEngine(cfg)
-        engine.run(tickers)
+        engine.run(tickers, max_minutes=args.max_minutes)
 
     reporter = StatsReporter(cfg, logger)
     reporter.report(
@@ -733,6 +1401,7 @@ def main():
         tier=args.tier or None,
         merge_live=args.merge_live,
         live_db=args.live_db,
+        health_status=args.health_status or None,
     )
 
 
