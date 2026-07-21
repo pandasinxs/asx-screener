@@ -1235,6 +1235,17 @@ class StatsReporter:
         print(report_text)
         self.logger.info(report_text)
 
+        if "outcome" in combined.columns:
+            print("\n【按出场原因拆解】WIN=触发止盈 / LOSS=触发止损 / TIMEOUT=到期强平（都没触发）")
+            for oc in ["WIN", "LOSS", "TIMEOUT"]:
+                g = combined[combined["outcome"] == oc]
+                if len(g) == 0:
+                    continue
+                avg_pct = g["outcome_pct"].astype(float).mean()
+                print(f"  {oc:<8s}: 样本{len(g)}笔  占比{len(g)/len(combined):.1%}  平均单笔收益{avg_pct:+.2f}%")
+            print("  → 「胜率」只统计WIN这一类；TIMEOUT里如果正收益占多数，"
+                  "会拉高盈亏比但不会拉高胜率数字，两个指标不矛盾，只是统计口径不同")
+
         if "tier_level" in combined.columns and combined["tier_level"].nunique() > 1:
             print("\n【分层级胜率对比（合并样本）】")
             for lv, g in combined.groupby("tier_level"):
