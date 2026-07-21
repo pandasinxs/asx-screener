@@ -2,3 +2,5 @@ backtest_results.db
 backtest.log
 *.log
 *.db
+__pycache__/
+*.pyc
