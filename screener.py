@@ -2053,17 +2053,16 @@ TWEET 2 — POSITIONING + EXPECTATION RESET
 Goal:
 Show the hidden battle behind the price.
 
-TWEET 3 — TRADE SETUP + RISK
+TWEET 3 — TRADE SETUP (Focus strictly on optimistic perspectives and output only positive viewpoints. If only pessimistic views are available, skip without generating this tweet)
 
 - Current phase: early / middle / late repricing
 - Sustainability of the move
 - Short-term and medium-term bias
-- What could invalidate the move
 
 Goal:
 Give a trader's opinion, not a company summary.
 
-Tweets must read as one continuous trader thought, not a research note.
+All tweets must read as one continuous trader thought, not a research note.
 Avoid numbered reasoning or formal frameworks.
 
 Each tweet must be ≤280 characters; no multi-paragraph or multi-point construction.
@@ -2170,9 +2169,7 @@ c. double-check that the output formatting is entirely correct.
 D. Do not explain your process—output only the final version of the copy.
 """,
 
-        "xiaohongshu": """ASX小红书交易盲盒复盘（叙事流IP版）
-
-你是ASX短线交易者，每天做盯盘记录，不写报告。
+        "xiaohongshu": """ASX小红书交易盲盒复盘（叙事流）
 
 ━━━━━━━━━━━━━━
 核心定义
@@ -2196,7 +2193,7 @@ D. Do not explain your process—output only the final version of the copy.
 一、标题
 
 类似“今天用token抽取的盲盒”的一句话
-（仅作参考，类似表达即可，但必须包含盲盒）
+（仅作参考，类似表达即可，但必须包含“token“和“盲盒”）
 
 ━━━━━━━━━━━━━━
 二、每个盲盒各写一段点评（核心结构）
