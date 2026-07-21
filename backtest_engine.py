@@ -1780,7 +1780,19 @@ def run_queue(queue_path: str, max_minutes: Optional[float], logger: logging.Log
                                   f"参数文件不存在 {entry['params_file']}", logger)
                 continue
             with open(entry["params_file"], encoding="utf-8") as f:
-                overrides = json.load(f)
+                content = f.read()
+            if not content.strip():
+                logger.error(f"实验[{entry['param_set_name']}]的参数文件是空文件，跳过这个实验")
+                if TELEGRAM_TOKEN:
+                    send_telegram(f"⚠️ 队列实验[{entry['param_set_name']}]跳过：参数文件是空文件", logger)
+                continue
+            try:
+                overrides = json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.error(f"实验[{entry['param_set_name']}]的参数文件不是合法JSON: {e}，跳过这个实验")
+                if TELEGRAM_TOKEN:
+                    send_telegram(f"⚠️ 队列实验[{entry['param_set_name']}]跳过：JSON格式错误 {e}", logger)
+                continue
             apply_param_overrides(overrides, cfg, logger)
 
         cfg.param_set = entry["param_set_name"]
@@ -1885,7 +1897,27 @@ def main():
                 logger.error(f"参数文件不存在: {args.params_file}")
                 return
             with open(args.params_file, encoding="utf-8") as f:
-                overrides = json.load(f)
+                content = f.read()
+            if not content.strip():
+                msg = (f"参数文件是空文件: {args.params_file}\n"
+                       f"空文件不是合法JSON，解析会报错。用下面命令生成一份"
+                       f"带默认值的模板再编辑：\n"
+                       f"  python3 backtest_engine.py --export-params {args.params_file}")
+                logger.error(msg)
+                if cfg.push_telegram:
+                    send_telegram(f"🔴 {msg}", logger)
+                return
+            try:
+                overrides = json.loads(content)
+            except json.JSONDecodeError as e:
+                msg = (f"参数文件不是合法JSON: {args.params_file}\n"
+                       f"解析错误: {e}\n"
+                       f"检查有没有多打/少打逗号、引号，或者干脆用"
+                       f"--export-params重新生成一份模板对照修改")
+                logger.error(msg)
+                if cfg.push_telegram:
+                    send_telegram(f"🔴 {msg}", logger)
+                return
             apply_param_overrides(overrides, cfg, logger)
 
         cfg.param_set = resolve_param_set_name(args.params_file, args.param_set_name)
