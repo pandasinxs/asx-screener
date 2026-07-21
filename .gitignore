@@ -1,0 +1,4 @@
+backtest_results.db
+backtest.log
+*.log
+*.db
