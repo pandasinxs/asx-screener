@@ -35,6 +35,15 @@ ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2：复用screen
     5. 全市场(~2000只)×多年逐日回测计算量很大，建议先用watchlist或小样本
        跑通逻辑，再决定是否扩大到全市场（那种规模建议nohup挂后台跑）。
 
+稳定性设计:
+    - yfinance请求带重试（默认5次，指数退避，最长等待60秒）
+    - 连续多天信号计算失败会触发熔断（默认连续5天），自动停止并报警，
+      避免系统性bug时整晚空跑
+    - 失败的交易日不会被标记为"已完成"，下次用同样参数重跑会自动重新处理
+      （不是简单重跑全部——只有真正失败的那些天会被重试）
+    - 配置了TELEGRAM_TOKEN/TELEGRAM_CHAT_ID环境变量后，启动/完成/报错
+      都会推送Telegram（复用screener.py同一个bot，同一个chat）
+
 用法:
     # 先用watchlist里的股票跑通（几分钟级别，Oracle Free Tier能扛住）
     python3 backtest_engine.py --start 2025-07-01 --end 2026-07-01 --universe watchlist
@@ -47,6 +56,9 @@ ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2：复用screen
 
     # 跑完后，把历史回测结果和线上signals_history合并统计
     python3 backtest_engine.py --stats-only --merge-live
+
+    # 从GitHub拉下来的参数队列文件里，跑所有还没跑过的实验
+    python3 backtest_engine.py --run-queue ~/asx-backtest-configs/queue.txt --max-minutes 700
 """
 
 import argparse
@@ -55,14 +67,17 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+import requests
 
 try:
     import yfinance as yf
@@ -90,6 +105,78 @@ try:
     import watchlist_db as wdb  # noqa: E402  用于 --universe watchlist
 except ImportError:
     wdb = None  # 只有选择 --universe watchlist 时才会真正需要，这里不强制退出
+
+# ────────────────────────────────────────────────────────────
+# 拍一份screener.py原始默认参数的快照，供--run-queue模式在同一进程里
+# 连续跑多个实验之间"重置回默认值再套新覆盖"用。如果没有这份快照，
+# 队列里第2个实验会不小心继承第1个实验残留的参数覆盖——因为
+# apply_param_overrides()是在"当前值"上做局部覆盖，不是每次都从
+# 干净的默认值出发。单次运行（不用--run-queue）不受影响，因为
+# 每次调用都是全新的Python进程，screener模块本来就是干净的。
+# ────────────────────────────────────────────────────────────
+_SCREENER_PRISTINE_DEFAULTS = {
+    "SCORE_WEIGHTS": dict(screener.SCORE_WEIGHTS),
+    "TIER_BONUS": dict(screener.TIER_BONUS),
+    "TREND_SCORE_THRESHOLD": dict(screener.TREND_SCORE_THRESHOLD),
+    "TIERS": [dict(t) for t in screener.TIERS],
+    "BT_STOP_ATR_MULT": screener.BT_STOP_ATR_MULT,
+    "BT_TARGET_ATR_MULT": screener.BT_TARGET_ATR_MULT,
+    "BT_TIMEOUT_DAYS": screener.BT_TIMEOUT_DAYS,
+}
+
+
+def reset_screener_to_defaults() -> None:
+    """把screener模块的可调参数恢复到进程启动时的原始默认值。"""
+    d = _SCREENER_PRISTINE_DEFAULTS
+    screener.SCORE_WEIGHTS = dict(d["SCORE_WEIGHTS"])
+    screener.TIER_BONUS = dict(d["TIER_BONUS"])
+    screener.TREND_SCORE_THRESHOLD = dict(d["TREND_SCORE_THRESHOLD"])
+    screener.TIERS = [dict(t) for t in d["TIERS"]]
+    screener.BT_STOP_ATR_MULT = d["BT_STOP_ATR_MULT"]
+    screener.BT_TARGET_ATR_MULT = d["BT_TARGET_ATR_MULT"]
+    screener.BT_TIMEOUT_DAYS = d["BT_TIMEOUT_DAYS"]
+
+
+# ════════════════════════════════════════════════════════════
+# Telegram 推送 —— 复用screener.py同一个bot/chat（同样从环境变量读取）
+# ════════════════════════════════════════════════════════════
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_MAX_RETRIES = 3
+TELEGRAM_CHUNK_SIZE = 3500  # 留出余量，Telegram单条消息上限约4096字符
+
+
+def send_telegram(text: str, logger: Optional[logging.Logger] = None) -> None:
+    """
+    推送到Telegram。没配置TELEGRAM_TOKEN/TELEGRAM_CHAT_ID时静默跳过
+    （只记一条warning日志，不影响回测本身运行），配置了但网络失败时重试，
+    重试完还失败也只记日志，绝不能因为Telegram推送失败而让整个回测崩溃——
+    推送是锦上添花，不是回测能不能跑的前提条件。
+    """
+    log = logger or logging.getLogger("backtest")
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram未配置（TELEGRAM_TOKEN/TELEGRAM_CHAT_ID），跳过推送")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    chunks = [text[i:i + TELEGRAM_CHUNK_SIZE] for i in range(0, len(text), TELEGRAM_CHUNK_SIZE)] or [text]
+
+    for chunk in chunks:
+        for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
+            try:
+                r = requests.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID, "text": chunk,
+                    "parse_mode": "HTML", "disable_web_page_preview": True,
+                }, timeout=10)
+                r.raise_for_status()
+                break
+            except Exception as e:
+                if attempt < TELEGRAM_MAX_RETRIES:
+                    time.sleep(2 * attempt)
+                else:
+                    log.error(f"Telegram推送失败（已重试{TELEGRAM_MAX_RETRIES}次）: {e}")
+        time.sleep(0.4)
 
 
 # ════════════════════════════════════════════════════════════
@@ -138,6 +225,10 @@ class BacktestConfig:
     commission_min_aud: float = 7.0
     slippage_bps: float = 5.0
 
+    # 稳定性：连续多少个交易日算信号失败就熔断停止（避免系统性bug时空跑一整晚）
+    max_consecutive_errors: int = 5
+    push_telegram: bool = True  # 配置了TELEGRAM_TOKEN/CHAT_ID时是否推送通知
+
 
 def setup_logging(log_path: str) -> logging.Logger:
     logger = logging.getLogger("backtest")
@@ -162,10 +253,16 @@ def setup_logging(log_path: str) -> logging.Logger:
 class DataLayer:
     """历史OHLCV拉取 + 清洗 + point-in-time切片。所有网络调用带重试。"""
 
-    def __init__(self, logger: logging.Logger, max_retries: int = 3):
+    def __init__(self, logger: logging.Logger, max_retries: int = 5):
         self.logger = logger
         self.max_retries = max_retries
         self._cache: dict[str, pd.DataFrame] = {}
+
+    @staticmethod
+    def _backoff_seconds(attempt: int) -> float:
+        """指数退避，封顶60秒。整晚运行更需要能扛住偶发的限流/网络抖动，
+        而不是像交互式场景那样追求快速失败。"""
+        return min(60.0, 3.0 * (2 ** (attempt - 1)))
 
     def fetch(self, ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
         key = f"{ticker}|{start}|{end}"
@@ -179,8 +276,8 @@ class DataLayer:
                     auto_adjust=True, progress=False, threads=False,
                 )
                 if df is None or df.empty:
-                    self.logger.warning(f"{ticker}: 返回空数据 attempt={attempt}")
-                    time.sleep(1.5 * attempt)
+                    self.logger.warning(f"{ticker}: 返回空数据 attempt={attempt}/{self.max_retries}")
+                    time.sleep(self._backoff_seconds(attempt))
                     continue
 
                 if isinstance(df.columns, pd.MultiIndex):
@@ -201,10 +298,10 @@ class DataLayer:
                 return df
 
             except Exception as e:
-                self.logger.warning(f"{ticker}: 拉取失败 attempt={attempt} error={e}")
-                time.sleep(1.5 * attempt)
+                self.logger.warning(f"{ticker}: 拉取失败 attempt={attempt}/{self.max_retries} error={e}")
+                time.sleep(self._backoff_seconds(attempt))
 
-        self.logger.error(f"{ticker}: 三次重试后仍失败，跳过")
+        self.logger.error(f"{ticker}: {self.max_retries}次重试后仍失败，跳过")
         return None
 
     @staticmethod
@@ -291,12 +388,22 @@ class SignalGenerator:
         """
         if ticker in self._shares_cache:
             return self._shares_cache[ticker]
-        try:
-            info = yf.Ticker(ticker).info
-            shares = float(info.get("sharesOutstanding", 0) or 0)
-        except Exception as e:
-            self.logger.debug(f"股数获取失败 [{ticker}]: {e}")
-            shares = 0.0
+
+        shares = 0.0
+        for attempt in range(1, 4):
+            try:
+                info = yf.Ticker(ticker).info
+                shares = float(info.get("sharesOutstanding", 0) or 0)
+                if shares > 0:
+                    break
+                self.logger.debug(f"股数获取为0 [{ticker}] attempt={attempt}/3，重试")
+            except Exception as e:
+                self.logger.debug(f"股数获取失败 [{ticker}] attempt={attempt}/3: {e}")
+            time.sleep(2 * attempt)
+
+        if shares <= 0:
+            self.logger.warning(f"{ticker}: 3次重试后股数仍为0/获取失败，"
+                                 f"该股票本次运行将无法通过市值门槛")
         self._shares_cache[ticker] = shares
         return shares
 
@@ -311,12 +418,24 @@ class SignalGenerator:
         as_of: pd.Timestamp,
         history: dict[str, pd.DataFrame],
         xjo_full: Optional[pd.Series],
-    ) -> tuple[list[dict], list[dict]]:
+    ) -> tuple[list[dict], list[dict], int, int]:
         """
-        返回 (raw_top10, selected_top3)，与screener.select_top3()返回结构对应。
+        返回 (raw_top10, selected_top3, error_count, attempted_count)。
+
+        error_count/attempted_count是为了让外层熔断机制能识别"系统性故障"：
+        单只股票的build_tech_summary/_passes_tier异常在这里就地捕获+跳过
+        （一只股票数据有问题不该拖累整天的其他股票），但如果这一天
+        attempted_count>0且error_count==attempted_count（也就是"今天
+        尝试评估的股票全部出错"），说明大概率不是个别股票的数据问题，
+        而是参数/代码层面的系统性bug——这种情况下"没有信号"和"筛选逻辑
+        本身在跑但今天恰好没股票达标"是完全不同的两件事，必须让外层
+        区分开，否则系统性bug会被伪装成"今天正常，只是没信号"，
+        安安静静地跑完整个回测却一条有效数据都没产出。
         """
         xjo_slice = xjo_full[xjo_full.index <= as_of] if xjo_full is not None else None
         seen: dict[str, dict] = {}
+        error_count = 0
+        attempted_count = 0
 
         for tier in screener.TIERS:
             for ticker, df in history.items():
@@ -325,15 +444,19 @@ class SignalGenerator:
                 pit_df = self.__class__._slice(df, as_of)
                 if len(pit_df) < self.cfg.min_history_days:
                     continue
+
+                attempted_count += 1
                 try:
                     tech = screener.build_tech_summary(pit_df, xjo_slice)
                 except Exception as e:
+                    error_count += 1
                     self.logger.debug(f"build_tech_summary异常 [{ticker}] {as_of.date()}: {e}")
                     continue
 
                 try:
                     passed = screener._passes_tier(tech, tier)
                 except Exception as e:
+                    error_count += 1
                     self.logger.debug(f"_passes_tier异常 [{ticker}] {as_of.date()}: {e}")
                     continue
 
@@ -354,7 +477,7 @@ class SignalGenerator:
                 seen[ticker] = tech
 
         if not seen:
-            return [], []
+            return [], [], error_count, attempted_count
 
         raw_signals = list(seen.values())
         for s in raw_signals:
@@ -372,7 +495,7 @@ class SignalGenerator:
             filtered_pool.append(s)
 
         selected_top3 = filtered_pool[:3]
-        return raw_top10, selected_top3
+        return raw_top10, selected_top3, error_count, attempted_count
 
     @staticmethod
     def _slice(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
@@ -732,6 +855,39 @@ class BacktestEngine:
         return raw
 
     def run(self, tickers: list[str], max_minutes: Optional[float] = None):
+        """
+        对外入口：包一层Telegram通知 + 顶层崩溃兜底。真正的回测逻辑在
+        _run_inner()里，这样任何未预料到的异常（不只是scan_day那种已知
+        会失败的点）都能被这里的except捕获，推送报警而不是让nohup进程
+        无声无息地死掉、你隔天才发现日志停在半夜某个时间点。
+        """
+        cfg = self.cfg
+        start_msg = (f"🚀 回测启动\n参数集: {cfg.param_set}\n"
+                     f"区间: {cfg.start_date} ~ {cfg.end_date}\n"
+                     f"universe: {cfg.universe_source}({len(tickers)}只)\n"
+                     f"时间预算: {max_minutes if max_minutes else '不限'}分钟")
+        self.logger.info(start_msg.replace("\n", " | "))
+        if cfg.push_telegram:
+            send_telegram(start_msg, self.logger)
+
+        try:
+            summary = self._run_inner(tickers, max_minutes)
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.logger.critical(f"回测进程崩溃: {e}\n{tb}")
+            if cfg.push_telegram:
+                send_telegram(
+                    f"🔴 回测崩溃 [{cfg.param_set}]\n"
+                    f"错误: {e}\n\n"
+                    f"traceback(截断):\n{tb[-1500:]}",
+                    self.logger,
+                )
+            raise
+
+        if cfg.push_telegram:
+            send_telegram(summary, self.logger)
+
+    def _run_inner(self, tickers: list[str], max_minutes: Optional[float]) -> str:
         self.logger.info(f"=== 回测启动 [{self.cfg.param_set}] {self.cfg.start_date} ~ "
                           f"{self.cfg.end_date} universe={self.cfg.universe_source}"
                           f"({len(tickers)}只) ===")
@@ -751,8 +907,9 @@ class BacktestEngine:
 
         self.logger.info(f"有效历史数据：{len(history)}/{len(tickers)} 只")
         if not history:
-            self.logger.error("无有效数据，终止")
-            return
+            msg = f"🔴 回测终止 [{self.cfg.param_set}]：universe拉不到任何有效历史数据"
+            self.logger.error(msg)
+            return msg
 
         xjo_full = self.data_layer.fetch(self.cfg.benchmark_ticker,
                                           download_start, self.cfg.end_date)
@@ -778,13 +935,17 @@ class BacktestEngine:
             self.logger.info(f"检测到断点：已完成 {len(done_days)} 天，"
                               f"本次继续剩余 {len(remaining_days)} 天")
         if not remaining_days:
-            self.logger.info("全部交易日已在此前的运行中完成，无需再跑，直接看统计报告即可")
+            msg = f"✅ 回测 [{self.cfg.param_set}] 全部交易日已在此前运行中完成，无需再跑"
+            self.logger.info(msg)
             conn.close()
-            return
+            return msg
 
         total_written, total_selected = 0, 0
         processed_count = 0  # 本次运行里真正跑完的天数，独立于循环变量i，
                               # 避免break/continue路径下的off-by-one混淆
+        consecutive_errors = 0  # 熔断计数器：连续失败达到阈值就停止，
+                                 # 避免系统性bug时把整晚算力浪费在无效重复报错上
+        circuit_broken = False
         start_time = time.time()
 
         for i, day in enumerate(remaining_days):
@@ -810,16 +971,57 @@ class BacktestEngine:
                 )
 
             try:
-                raw_top10, selected = self.sig_gen.scan_day(day, history, xjo_series)
+                raw_top10, selected, error_count, attempted_count = self.sig_gen.scan_day(
+                    day, history, xjo_series
+                )
             except Exception as e:
-                self.logger.error(f"scan_day异常 {day.date()}: {e}")
-                # 即使这天异常失败，也标记为已处理，避免死循环卡在同一天，
-                # 但会在日志里留下明确记录，方便你事后针对这天单独排查
-                conn.execute("INSERT OR IGNORE INTO backtest_progress VALUES (?, ?)",
-                             (run_key, str(day.date())))
-                conn.commit()
-                processed_count += 1
+                consecutive_errors += 1
+                self.logger.error(
+                    f"scan_day整体异常 {day.date()}（连续失败{consecutive_errors}/"
+                    f"{self.cfg.max_consecutive_errors}）: {e}"
+                )
+                if consecutive_errors >= self.cfg.max_consecutive_errors:
+                    alert = (
+                        f"🔴 回测熔断 [{self.cfg.param_set}]\n"
+                        f"连续{consecutive_errors}天scan_day整体异常，最新错误: {e}\n"
+                        f"大概率是系统性问题（参数错误/代码bug），已提前停止，"
+                        f"没有标记为完成的交易日下次会自动重试，请先检查backtest.log"
+                    )
+                    self.logger.critical(alert)
+                    if self.cfg.push_telegram:
+                        send_telegram(alert, self.logger)
+                    circuit_broken = True
+                    break
                 continue
+
+            # 关键：单只股票的build_tech_summary/_passes_tier异常已经在scan_day
+            # 内部被吞掉（避免一只股票拖累整天），但如果"今天尝试评估的股票
+            # 全部出错"（attempted_count>0且error_count==attempted_count），
+            # 这不是"今天正常但没有信号"，而是系统性故障的强烈信号——必须在这里
+            # 单独识别出来，否则会被"if not raw_top10"那条路径误判为
+            # 合法的"今天没有信号"，悄悄标记完成，让熔断机制形同虚设。
+            if attempted_count > 0 and error_count == attempted_count:
+                consecutive_errors += 1
+                self.logger.error(
+                    f"scan_day当天全部{attempted_count}次评估均失败 {day.date()}"
+                    f"（连续失败{consecutive_errors}/{self.cfg.max_consecutive_errors}），"
+                    f"这天不标记为完成，等修复后重试"
+                )
+                if consecutive_errors >= self.cfg.max_consecutive_errors:
+                    alert = (
+                        f"🔴 回测熔断 [{self.cfg.param_set}]\n"
+                        f"连续{consecutive_errors}天所有股票的信号计算全部失败\n"
+                        f"大概率是系统性问题（参数错误/代码bug），已提前停止，"
+                        f"没有标记为完成的交易日下次会自动重试，请先检查backtest.log"
+                    )
+                    self.logger.critical(alert)
+                    if self.cfg.push_telegram:
+                        send_telegram(alert, self.logger)
+                    circuit_broken = True
+                    break
+                continue
+
+            consecutive_errors = 0  # 这天有实质性进展（哪怕没有信号，只要不是全员出错），清零熔断计数器
 
             if not raw_top10:
                 conn.execute("INSERT OR IGNORE INTO backtest_progress VALUES (?, ?)",
@@ -911,10 +1113,19 @@ class BacktestEngine:
         total_done = len(done_days) + processed_count
         left = len(trading_days) - total_done
         conn.close()
-        self.logger.info(f"=== 本次运行结束：本次新处理 {processed_count} 天，"
-                          f"写入 {total_written} 条候选记录（其中 {total_selected} 笔为Top3精选信号）"
-                          f"｜累计总进度 {total_done}/{len(trading_days)} 天"
-                          f"{f'，剩余{left}天，下次用相同参数重跑会自动续上' if left > 0 else '，全部完成，可以看统计报告了'} ===")
+
+        status_line = "🛑 因熔断提前停止" if circuit_broken else (
+            "✅ 全部完成，可以看统计报告了" if left <= 0 else "⏸ 已按时间预算暂停"
+        )
+        summary = (
+            f"{status_line} [参数集: {self.cfg.param_set}]\n"
+            f"本次新处理: {processed_count}天\n"
+            f"写入候选记录: {total_written}条（其中Top3精选信号{total_selected}笔）\n"
+            f"累计总进度: {total_done}/{len(trading_days)}天"
+            + (f"，剩余{left}天，下次用相同参数重跑会自动续上" if left > 0 else "")
+        )
+        self.logger.info("=== " + summary.replace("\n", " | ") + " ===")
+        return summary
 
 
 # ════════════════════════════════════════════════════════════
@@ -1045,6 +1256,109 @@ def resolve_param_set_name(params_file: str, explicit_name: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════
+# 实验档案 —— 把每次实际用的参数内容+对应git commit存下来，
+# 不用靠记忆或者翻git log去追溯"这个param_set当时到底测的什么"
+# ════════════════════════════════════════════════════════════
+
+EXPERIMENT_METADATA_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS experiment_metadata (
+    param_set     TEXT PRIMARY KEY,
+    params_json   TEXT,
+    params_file   TEXT,
+    git_commit    TEXT,
+    first_seen_at TEXT
+)
+"""
+
+
+def _get_git_commit(file_path: str) -> Optional[str]:
+    """
+    尽力而为获取参数文件所在git仓库的当前commit短hash。
+    拿不到（不是git仓库/没装git/其他任何原因）就返回None，
+    绝不能因为这个附加功能失败就影响回测主流程。
+    """
+    if not file_path or not os.path.exists(file_path):
+        return None
+    try:
+        repo_dir = os.path.dirname(os.path.abspath(file_path))
+        result = subprocess.run(
+            ["git", "-C", repo_dir, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            commit = result.stdout.strip()
+            # 顺便看一下有没有未commit的本地改动，这种情况下commit hash
+            # 不能完全代表实际用的内容，需要提醒
+            dirty = subprocess.run(
+                ["git", "-C", repo_dir, "status", "--porcelain"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if dirty.returncode == 0 and dirty.stdout.strip():
+                return f"{commit}(有未提交的本地改动，commit不完全代表实际内容)"
+            return commit
+    except Exception:
+        pass
+    return None
+
+
+def record_experiment_metadata(db_path: str, param_set: str, params_file: str,
+                               overrides: dict, logger: logging.Logger) -> None:
+    """
+    把这次实验实际用的参数内容 + 对应git commit记录到db里（同一个param_set
+    只记第一次，后面重跑同样的param_set不会覆盖——因为按定义，
+    同样的param_set名字理应对应同样的参数内容）。
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute(EXPERIMENT_METADATA_SCHEMA_SQL)
+        git_commit = _get_git_commit(params_file) if params_file else None
+        params_json = (json.dumps(overrides, ensure_ascii=False, indent=2)
+                       if overrides else "(baseline，未传--params-file)")
+        conn.execute(
+            "INSERT OR IGNORE INTO experiment_metadata "
+            "(param_set, params_json, params_file, git_commit, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (param_set, params_json, params_file or "", git_commit or "",
+             datetime.now().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+        logger.info(f"实验档案已记录: param_set={param_set} git_commit={git_commit or 'N/A'}")
+    except Exception as e:
+        logger.warning(f"记录实验档案失败（不影响回测本身继续运行）: {e}")
+
+
+def show_param_set(db_path: str, param_set: str) -> None:
+    """查询某个param_set当时实际用的参数内容，供追溯用。"""
+    if not os.path.exists(db_path):
+        print(f"数据库不存在: {db_path}")
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT params_json, params_file, git_commit, first_seen_at "
+            "FROM experiment_metadata WHERE param_set = ?",
+            (param_set,),
+        ).fetchone()
+    except Exception as e:
+        print(f"查询失败（可能还没有实验档案表）: {e}")
+        conn.close()
+        return
+    conn.close()
+
+    if not row:
+        print(f"没有找到 param_set={param_set} 的实验档案记录")
+        return
+
+    params_json, params_file, git_commit, first_seen_at = row
+    print(f"参数集      : {param_set}")
+    print(f"首次运行时间: {first_seen_at}")
+    print(f"参数文件路径: {params_file or '(baseline，未使用参数文件)'}")
+    print(f"git commit  : {git_commit or '(未知/当时不在git仓库里)'}")
+    print(f"实际参数内容:\n{params_json}")
+
+
+# ════════════════════════════════════════════════════════════
 # 统计报告层
 # ════════════════════════════════════════════════════════════
 
@@ -1053,49 +1367,69 @@ class StatsReporter:
         self.cfg = cfg
         self.logger = logger
 
-    def leaderboard(self):
+    def leaderboard(self, push_telegram: bool = False):
         """
         一次性列出db里所有跑过的参数集实验，按胜率排序——
         这是支撑"反复改参数、每次都想知道谁更好"这个工作流的核心视图。
         """
+        buffer: list[str] = []
+
+        def emit(text: str) -> None:
+            print(text)
+            buffer.append(text)
+
         if not os.path.exists(self.cfg.db_path):
-            print("回测数据库还不存在，先跑一次backtest_engine.py")
+            emit("回测数据库还不存在，先跑一次backtest_engine.py")
+            if push_telegram:
+                send_telegram("\n".join(buffer), self.logger)
             return
         conn = sqlite3.connect(self.cfg.db_path)
+        conn.execute(EXPERIMENT_METADATA_SCHEMA_SQL)  # 确保表存在，旧db也不会查询报错
         try:
             df = pd.read_sql_query("""
-                SELECT param_set,
+                SELECT t.param_set,
                        COUNT(*) AS n,
-                       SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) AS wins,
-                       AVG(outcome_pct) AS avg_pct,
-                       MIN(signal_date) AS date_from,
-                       MAX(signal_date) AS date_to
-                FROM signals_history_backtest
-                WHERE outcome != 'PENDING' AND is_selected = 1
-                GROUP BY param_set
+                       SUM(CASE WHEN t.outcome='WIN' THEN 1 ELSE 0 END) AS wins,
+                       AVG(t.outcome_pct) AS avg_pct,
+                       MIN(t.signal_date) AS date_from,
+                       MAX(t.signal_date) AS date_to,
+                       MAX(m.git_commit) AS git_commit
+                FROM signals_history_backtest t
+                LEFT JOIN experiment_metadata m ON t.param_set = m.param_set
+                WHERE t.outcome != 'PENDING' AND t.is_selected = 1
+                GROUP BY t.param_set
                 ORDER BY (wins * 1.0 / n) DESC
             """, conn)
         except Exception as e:
-            print(f"排行榜查询失败（可能是旧表结构还没跑过新参数系统）: {e}")
+            emit(f"排行榜查询失败（可能是旧表结构还没跑过新参数系统）: {e}")
             conn.close()
+            if push_telegram:
+                send_telegram("\n".join(buffer), self.logger)
             return
         conn.close()
 
         if df.empty:
-            print("暂无已完成的实验记录（outcome全是PENDING，或者还没跑过任何数据）")
+            emit("暂无已完成的实验记录（outcome全是PENDING，或者还没跑过任何数据）")
+            if push_telegram:
+                send_telegram("\n".join(buffer), self.logger)
             return
 
-        print("\n" + "=" * 70)
-        print("参数实验排行榜（按Top3精选信号胜率排序，只统计有结果的交易）")
-        print("=" * 70)
+        emit("\n" + "=" * 70)
+        emit("参数实验排行榜（按Top3精选信号胜率排序，只统计有结果的交易）")
+        emit("=" * 70)
         for _, row in df.iterrows():
             wr = row["wins"] / row["n"] if row["n"] else 0
-            print(f"  {row['param_set']:<24s} 样本{int(row['n']):>4d}笔  "
-                  f"胜率{wr:>6.1%}  平均单笔{row['avg_pct']:>+6.2f}%  "
-                  f"覆盖{row['date_from']}~{row['date_to']}")
-        print("=" * 70)
-        print("样本量差距较大的实验之间直接比胜率会有误导性，"
-              "建议同时看样本数，样本差太多的先别下结论")
+            commit_note = f"  commit:{row['git_commit']}" if row.get("git_commit") else ""
+            emit(f"  {row['param_set']:<24s} 样本{int(row['n']):>4d}笔  "
+                 f"胜率{wr:>6.1%}  平均单笔{row['avg_pct']:>+6.2f}%  "
+                 f"覆盖{row['date_from']}~{row['date_to']}{commit_note}")
+        emit("=" * 70)
+        emit("样本量差距较大的实验之间直接比胜率会有误导性，"
+             "建议同时看样本数，样本差太多的先别下结论")
+        emit("用 --show-param-set <名字> 可以查看某个实验当时实际用的完整参数内容")
+
+        if push_telegram:
+            send_telegram("\n".join(buffer), self.logger)
 
     def _bootstrap_ci(self, wins: np.ndarray, n_iter: int = 2000) -> tuple[float, float]:
         if len(wins) == 0:
@@ -1159,9 +1493,16 @@ class StatsReporter:
             self.logger.warning(f"基准指数获取失败: {e}")
             return None
 
+    def _emit(self, text: str) -> None:
+        """print的同时收进buffer，供report()结束时整体推送Telegram用。"""
+        print(text)
+        self._buffer.append(text)
+
     def report(self, only_selected: bool = True, tier: Optional[str] = None,
                merge_live: bool = False, live_db: str = "",
-               health_status: Optional[str] = None):
+               health_status: Optional[str] = None, push_telegram: bool = False):
+        self._buffer: list[str] = []
+
         bt_df = self._load_backtest_df(only_selected, tier)
         frames = [bt_df]
         if merge_live:
@@ -1182,7 +1523,9 @@ class StatsReporter:
             combined = combined[combined["health_status"] == health_status]
 
         if combined.empty:
-            print("无可用交易记录（outcome全部为PENDING，或数据库为空，或health_status过滤后为空）")
+            self._emit("无可用交易记录（outcome全部为PENDING，或数据库为空，或health_status过滤后为空）")
+            if push_telegram:
+                send_telegram("\n".join(self._buffer), self.logger)
             return
 
         source_counts = combined["source"].value_counts().to_dict() if "source" in combined else {}
@@ -1232,39 +1575,42 @@ class StatsReporter:
             "=" * 58,
         ]
         report_text = "\n".join(lines)
-        print(report_text)
+        self._emit(report_text)
         self.logger.info(report_text)
 
         if "outcome" in combined.columns:
-            print("\n【按出场原因拆解】WIN=触发止盈 / LOSS=触发止损 / TIMEOUT=到期强平（都没触发）")
+            self._emit("\n【按出场原因拆解】WIN=触发止盈 / LOSS=触发止损 / TIMEOUT=到期强平（都没触发）")
             for oc in ["WIN", "LOSS", "TIMEOUT"]:
                 g = combined[combined["outcome"] == oc]
                 if len(g) == 0:
                     continue
                 avg_pct = g["outcome_pct"].astype(float).mean()
-                print(f"  {oc:<8s}: 样本{len(g)}笔  占比{len(g)/len(combined):.1%}  平均单笔收益{avg_pct:+.2f}%")
-            print("  → 「胜率」只统计WIN这一类；TIMEOUT里如果正收益占多数，"
-                  "会拉高盈亏比但不会拉高胜率数字，两个指标不矛盾，只是统计口径不同")
+                self._emit(f"  {oc:<8s}: 样本{len(g)}笔  占比{len(g)/len(combined):.1%}  平均单笔收益{avg_pct:+.2f}%")
+            self._emit("  → 「胜率」只统计WIN这一类；TIMEOUT里如果正收益占多数，"
+                       "会拉高盈亏比但不会拉高胜率数字，两个指标不矛盾，只是统计口径不同")
 
         if "tier_level" in combined.columns and combined["tier_level"].nunique() > 1:
-            print("\n【分层级胜率对比（合并样本）】")
+            self._emit("\n【分层级胜率对比（合并样本）】")
             for lv, g in combined.groupby("tier_level"):
                 w = (g["outcome"] == "WIN").mean()
                 avg_pct = g["outcome_pct"].astype(float).mean()
-                print(f"  {lv}: 样本{len(g)}笔  胜率{w:.1%}  平均单笔收益{avg_pct:+.2f}%")
+                self._emit(f"  {lv}: 样本{len(g)}笔  胜率{w:.1%}  平均单笔收益{avg_pct:+.2f}%")
 
         if "health_status" in combined.columns and combined["health_status"].notna().any():
-            print("\n【跨日健康度分层胜率对比】—— 直接回答"
-                  "「daily_analysis.py这层过滤到底有没有用」")
+            self._emit("\n【跨日健康度分层胜率对比】—— 直接回答"
+                       "「daily_analysis.py这层过滤到底有没有用」")
             for hs, g in combined.dropna(subset=["health_status"]).groupby("health_status"):
                 w = (g["outcome"] == "WIN").mean()
                 avg_pct = g["outcome_pct"].astype(float).mean()
-                print(f"  {hs:<12s}: 样本{len(g)}笔  胜率{w:.1%}  平均单笔收益{avg_pct:+.2f}%")
-            print("  → 如果ready组明显比其他组胜率高，说明健康度过滤确实有增量价值，"
-                  "值得在intraday_monitor.py里继续坚持这道门槛；如果差不多甚至更低，"
-                  "说明这层过滤没有实际筛选力，可以考虑简化掉")
+                self._emit(f"  {hs:<12s}: 样本{len(g)}笔  胜率{w:.1%}  平均单笔收益{avg_pct:+.2f}%")
+            self._emit("  → 如果ready组明显比其他组胜率高，说明健康度过滤确实有增量价值，"
+                       "值得在intraday_monitor.py里继续坚持这道门槛；如果差不多甚至更低，"
+                       "说明这层过滤没有实际筛选力，可以考虑简化掉")
 
         self._analyze_score_predictiveness(combined)
+
+        if push_telegram:
+            send_telegram("\n".join(self._buffer), self.logger)
 
     def _analyze_score_predictiveness(self, combined: pd.DataFrame, n_buckets: int = 4):
         """
@@ -1287,7 +1633,7 @@ class StatsReporter:
         结论没有意义，容易把噪音当规律）。
         """
         if len(combined) < 20 or "composite_score" not in combined.columns:
-            print("\n【评分预测力分析】样本不足20笔或缺少composite_score字段，暂不分组分析")
+            self._emit("\n【评分预测力分析】样本不足20笔或缺少composite_score字段，暂不分组分析")
             return
 
         df = combined.dropna(subset=["composite_score", "outcome_pct"]).copy()
@@ -1301,7 +1647,7 @@ class StatsReporter:
             return
 
         if df["score_bucket"].isna().all():
-            print("\n【评分预测力分析】composite_score分桶后全部为空值（可能取值种类过少），暂不分组分析")
+            self._emit("\n【评分预测力分析】composite_score分桶后全部为空值（可能取值种类过少），暂不分组分析")
             return
 
         rows = []
@@ -1313,32 +1659,157 @@ class StatsReporter:
             rows.append((str(bucket), len(g), win_rate, avg_pct))
 
         if len(rows) < 2:
-            print(f"\n【评分预测力分析】composite_score的取值种类太少（分桶后只有{len(rows)}组），"
-                  f"没法看出分数和胜负的关系。这通常是因为当前样本里入选股票的层级过于单一"
-                  f"（比如全部来自同一个tier），先积累更多样本或换更宽的universe再看")
+            self._emit(f"\n【评分预测力分析】composite_score的取值种类太少（分桶后只有{len(rows)}组），"
+                      f"没法看出分数和胜负的关系。这通常是因为当前样本里入选股票的层级过于单一"
+                      f"（比如全部来自同一个tier），先积累更多样本或换更宽的universe再看")
             return
 
-        print(f"\n【评分预测力分析】composite_score从低到高分{len(rows)}组，"
-              f"看分数是否真的和胜负相关：")
+        self._emit(f"\n【评分预测力分析】composite_score从低到高分{len(rows)}组，"
+                   f"看分数是否真的和胜负相关：")
         for bucket_label, n, wr, avg_pct in rows:
-            print(f"  分数区间 {bucket_label}: 样本{n}笔  胜率{wr:.1%}  平均单笔收益{avg_pct:+.2f}%")
+            self._emit(f"  分数区间 {bucket_label}: 样本{n}笔  胜率{wr:.1%}  平均单笔收益{avg_pct:+.2f}%")
 
         win_rates = [r[2] for r in rows]
         monotonic_up = all(win_rates[i] <= win_rates[i + 1] for i in range(len(win_rates) - 1))
         if monotonic_up and win_rates[-1] > win_rates[0]:
-            print("  → 分数越高胜率越高，呈现单调递增，composite_score有实际预测力，"
-                  "可以考虑抬高入选门槛换胜率")
+            self._emit("  → 分数越高胜率越高，呈现单调递增，composite_score有实际预测力，"
+                      "可以考虑抬高入选门槛换胜率")
         elif win_rates[-1] <= win_rates[0]:
-            print("  → 最高分组胜率并不比最低分组好（甚至更差），composite_score当前的"
-                  "权重设计可能没有真正抓住驱动胜负的因素，建议先查权重/硬性条件，"
-                  "而不是简单抬高分数门槛")
+            self._emit("  → 最高分组胜率并不比最低分组好（甚至更差），composite_score当前的"
+                      "权重设计可能没有真正抓住驱动胜负的因素，建议先查权重/硬性条件，"
+                      "而不是简单抬高分数门槛")
         else:
-            print("  → 关系不完全单调，可能是样本量还不够大，建议积累更多样本后再下结论")
+            self._emit("  → 关系不完全单调，可能是样本量还不够大，建议积累更多样本后再下结论")
 
 
 # ════════════════════════════════════════════════════════════
-# CLI
+# GitHub参数队列工作流 —— 你在本地改队列文件+push，VM这边pull+跑，
+# 结果推Telegram，全程不需要SSH进去手动敲命令
 # ════════════════════════════════════════════════════════════
+
+def run_queue(queue_path: str, max_minutes: Optional[float], logger: logging.Logger) -> None:
+    """
+    读一个纯文本队列文件，依次跑里面的实验。
+
+    队列文件格式（逗号分隔，#开头的行和空行忽略）：
+        param_set_name,params_file,start_date,end_date,universe[,universe_file]
+
+    params_file留空表示用screener.py当前默认值(baseline)。
+    params_file写相对路径时，相对的是队列文件所在目录（方便你把
+    队列文件和params/*.json放在同一个git仓库里，路径不用写死绝对路径）。
+
+    典型工作流：
+      1. 本地电脑：编辑 queue.txt 加一行新实验 + 编辑/新增对应的
+         params/xxx.json，git push
+      2. VM这边crontab定时跑：
+             cd ~/asx-backtest-configs && git pull
+             cd ~/asx && python3 backtest_engine.py \\
+                 --run-queue ~/asx-backtest-configs/queue.txt --max-minutes 700
+      3. 每个实验跑完（或者达到整体时间预算）都会推一条Telegram，
+         内容就是这个实验的完整统计报告
+      4. 全程不需要SSH进VM手动敲命令，只需要设置好这一条crontab
+
+    时间预算max_minutes是整个队列共享的，不是每个实验各自一份——
+    如果队列有5个实验但今晚时间只够跑2个半，跑得完的跑完，跑不完的
+    个实验会在下次处理队列时，靠断点续跑机制自动接着跑，不会重跑
+    已经完成的部分。
+    """
+    if not os.path.exists(queue_path):
+        logger.error(f"队列文件不存在: {queue_path}")
+        if TELEGRAM_TOKEN:
+            send_telegram(f"🔴 队列文件不存在: {queue_path}", logger)
+        return
+
+    queue_dir = os.path.dirname(os.path.abspath(queue_path))
+    entries = []
+    with open(queue_path, encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 5:
+                logger.warning(f"队列文件第{line_no}行格式不对（少于5个字段），跳过: {line}")
+                continue
+            param_set_name, params_file, start_date, end_date, universe = parts[:5]
+            universe_file = parts[5] if len(parts) > 5 else ""
+            if params_file and not os.path.isabs(params_file):
+                params_file = os.path.join(queue_dir, params_file)
+            if universe_file and not os.path.isabs(universe_file):
+                universe_file = os.path.join(queue_dir, universe_file)
+            entries.append({
+                "param_set_name": param_set_name, "params_file": params_file,
+                "start_date": start_date, "end_date": end_date,
+                "universe": universe, "universe_file": universe_file,
+            })
+
+    logger.info(f"队列共{len(entries)}个实验待处理")
+    overall_start = time.time()
+    processed_experiments = 0
+
+    for idx, entry in enumerate(entries, 1):
+        if max_minutes is not None:
+            elapsed_min = (time.time() - overall_start) / 60
+            remaining_min = max_minutes - elapsed_min
+            if remaining_min <= 1:
+                logger.info(f"队列整体时间预算用完，本次处理了{processed_experiments}/"
+                            f"{len(entries)}个实验，剩下的下次继续（各实验内部也有"
+                            f"断点续跑，不会丢进度）")
+                break
+        else:
+            remaining_min = None
+
+        logger.info(f"=== 队列 {idx}/{len(entries)}: {entry['param_set_name']} ===")
+
+        # 每个实验开始前先把screener模块参数重置回原始默认值，
+        # 避免上一个实验的覆盖残留污染这一个（同一进程内连续跑多个实验的坑）
+        reset_screener_to_defaults()
+
+        cfg = BacktestConfig(
+            start_date=entry["start_date"], end_date=entry["end_date"],
+            universe_source=entry["universe"], universe_file=entry["universe_file"],
+        )
+
+        overrides = {}
+        if entry["params_file"]:
+            if not os.path.exists(entry["params_file"]):
+                logger.error(f"实验[{entry['param_set_name']}]的参数文件不存在: "
+                             f"{entry['params_file']}，跳过这个实验")
+                if TELEGRAM_TOKEN:
+                    send_telegram(f"⚠️ 队列实验[{entry['param_set_name']}]跳过："
+                                  f"参数文件不存在 {entry['params_file']}", logger)
+                continue
+            with open(entry["params_file"], encoding="utf-8") as f:
+                overrides = json.load(f)
+            apply_param_overrides(overrides, cfg, logger)
+
+        cfg.param_set = entry["param_set_name"]
+        record_experiment_metadata(cfg.db_path, cfg.param_set, entry["params_file"], overrides, logger)
+
+        try:
+            tickers = resolve_universe(cfg, logger)
+            if not tickers:
+                logger.error(f"实验[{cfg.param_set}] universe为空，跳过")
+                continue
+
+            engine = BacktestEngine(cfg)
+            engine.run(tickers, max_minutes=remaining_min)
+
+            reporter = StatsReporter(cfg, logger)
+            reporter.report(only_selected=True, push_telegram=cfg.push_telegram)
+        except Exception as e:
+            tb = traceback.format_exc()
+            logger.critical(f"队列实验[{cfg.param_set}]异常: {e}\n{tb}")
+            if TELEGRAM_TOKEN:
+                send_telegram(f"🔴 队列实验[{cfg.param_set}]崩溃: {e}\n"
+                              f"traceback(截断):\n{tb[-1000:]}", logger)
+            # 单个实验崩溃不影响队列里其他实验继续跑
+            continue
+
+        processed_experiments += 1
+
+    logger.info(f"=== 队列处理完成：本次共处理{processed_experiments}/{len(entries)}个实验 ===")
+
 
 def main():
     parser = argparse.ArgumentParser(description="ASX Screener EOD历史回测引擎（复用screener.py真实逻辑）")
@@ -1367,53 +1838,91 @@ def main():
     parser.add_argument("--health-status", default="",
                         help="只看某个跨日健康度状态的交易，如 ready/watch/caution/accumulating，"
                              "用来验证daily_analysis.py这层健康度过滤到底有没有增量价值")
+    parser.add_argument("--run-queue", default="",
+                        help="GitHub工作流用：指定队列文件路径，依次跑里面所有实验，"
+                             "适合配合git pull + crontab实现全程不用SSH")
+    parser.add_argument("--no-telegram", action="store_true",
+                        help="本次运行不推送Telegram（即使配置了TOKEN/CHAT_ID）")
+    parser.add_argument("--show-param-set", default="",
+                        help="查询某个param_set当时实际用的参数内容+git commit，用于事后追溯")
     args = parser.parse_args()
 
     cfg = BacktestConfig(
         start_date=args.start, end_date=args.end,
         universe_source=args.universe, universe_file=args.universe_file,
+        push_telegram=not args.no_telegram,
     )
     logger = setup_logging(cfg.log_path)
 
-    if args.export_params:
-        export_default_params(args.export_params, cfg, logger)
-        return
-
-    if args.leaderboard:
-        StatsReporter(cfg, logger).leaderboard()
-        return
-
-    # 参数覆盖必须在任何BacktestEngine/SignalGenerator/OutcomeSimulator/
-    # DailyHealthEvaluator构建之前完成——OutcomeSimulator会在__init__时
-    # 缓存BT_STOP_ATR_MULT等值，晚了就不生效，main()这里的顺序就是保证这一点。
-    overrides = {}
-    if args.params_file:
-        if not os.path.exists(args.params_file):
-            logger.error(f"参数文件不存在: {args.params_file}")
+    # 顶层崩溃兜底：任何没被内层捕获的异常（比如resolve_universe本身出错、
+    # 队列文件解析出错等），都在这里兜住，推一条Telegram报警，
+    # 再用非0退出码结束进程，让nohup的日志和crontab的邮件/退出码
+    # 都能看出"这次跑失败了"，而不是安安静静地在某个时间点消失。
+    try:
+        if args.show_param_set:
+            show_param_set(cfg.db_path, args.show_param_set)
             return
-        with open(args.params_file, encoding="utf-8") as f:
-            overrides = json.load(f)
-        apply_param_overrides(overrides, cfg, logger)
 
-    cfg.param_set = resolve_param_set_name(args.params_file, args.param_set_name)
-    logger.info(f"本次实验标签: {cfg.param_set}")
-
-    if not args.stats_only:
-        tickers = resolve_universe(cfg, logger)
-        if not tickers:
-            logger.error("universe为空，终止")
+        if args.export_params:
+            export_default_params(args.export_params, cfg, logger)
             return
-        engine = BacktestEngine(cfg)
-        engine.run(tickers, max_minutes=args.max_minutes)
 
-    reporter = StatsReporter(cfg, logger)
-    reporter.report(
-        only_selected=not args.all_candidates,
-        tier=args.tier or None,
-        merge_live=args.merge_live,
-        live_db=args.live_db,
-        health_status=args.health_status or None,
-    )
+        if args.leaderboard:
+            StatsReporter(cfg, logger).leaderboard(push_telegram=cfg.push_telegram)
+            return
+
+        if args.run_queue:
+            run_queue(args.run_queue, args.max_minutes, logger)
+            return
+
+        # 参数覆盖必须在任何BacktestEngine/SignalGenerator/OutcomeSimulator/
+        # DailyHealthEvaluator构建之前完成——OutcomeSimulator会在__init__时
+        # 缓存BT_STOP_ATR_MULT等值，晚了就不生效，main()这里的顺序就是保证这一点。
+        reset_screener_to_defaults()
+        overrides = {}
+        if args.params_file:
+            if not os.path.exists(args.params_file):
+                logger.error(f"参数文件不存在: {args.params_file}")
+                return
+            with open(args.params_file, encoding="utf-8") as f:
+                overrides = json.load(f)
+            apply_param_overrides(overrides, cfg, logger)
+
+        cfg.param_set = resolve_param_set_name(args.params_file, args.param_set_name)
+        logger.info(f"本次实验标签: {cfg.param_set}")
+        record_experiment_metadata(cfg.db_path, cfg.param_set, args.params_file, overrides, logger)
+
+        if not args.stats_only:
+            tickers = resolve_universe(cfg, logger)
+            if not tickers:
+                msg = f"🔴 回测终止 [{cfg.param_set}]：universe为空"
+                logger.error(msg)
+                if cfg.push_telegram:
+                    send_telegram(msg, logger)
+                return
+            engine = BacktestEngine(cfg)
+            engine.run(tickers, max_minutes=args.max_minutes)
+
+        reporter = StatsReporter(cfg, logger)
+        reporter.report(
+            only_selected=not args.all_candidates,
+            tier=args.tier or None,
+            merge_live=args.merge_live,
+            live_db=args.live_db,
+            health_status=args.health_status or None,
+            push_telegram=cfg.push_telegram,
+        )
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.critical(f"main()顶层未捕获异常: {e}\n{tb}")
+        if cfg.push_telegram:
+            send_telegram(
+                f"🔴 backtest_engine.py 进程崩溃\n参数集: {cfg.param_set}\n"
+                f"错误: {e}\n\ntraceback(截断):\n{tb[-1500:]}",
+                logger,
+            )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
