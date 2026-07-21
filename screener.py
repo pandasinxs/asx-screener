@@ -2170,9 +2170,7 @@ c. double-check that the output formatting is entirely correct.
 D. Do not explain your process—output only the final version of the copy.
 """,
 
-        "xiaohongshu": """ASX小红书交易盲盒复盘（叙事流IP版）
-
-你是ASX短线交易者，每天做盯盘记录，不写报告。
+        "xiaohongshu": """ASX小红书交易盲盒复盘（叙事流）
 
 ━━━━━━━━━━━━━━
 核心定义
@@ -2196,7 +2194,7 @@ D. Do not explain your process—output only the final version of the copy.
 一、标题
 
 类似“今天用token抽取的盲盒”的一句话
-（仅作参考，类似表达即可，但必须包含盲盒）
+（仅作参考，类似表达即可，但必须包含“token“和“盲盒”）
 
 ━━━━━━━━━━━━━━
 二、每个盲盒各写一段点评（核心结构）
