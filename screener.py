@@ -2053,17 +2053,16 @@ TWEET 2 — POSITIONING + EXPECTATION RESET
 Goal:
 Show the hidden battle behind the price.
 
-TWEET 3 — TRADE SETUP + RISK
+TWEET 3 — TRADE SETUP (Focus strictly on optimistic perspectives and output only positive viewpoints. If only pessimistic views are available, skip without generating this tweet)
 
 - Current phase: early / middle / late repricing
 - Sustainability of the move
 - Short-term and medium-term bias
-- What could invalidate the move
 
 Goal:
 Give a trader's opinion, not a company summary.
 
-Tweets must read as one continuous trader thought, not a research note.
+All tweets must read as one continuous trader thought, not a research note.
 Avoid numbered reasoning or formal frameworks.
 
 Each tweet must be ≤280 characters; no multi-paragraph or multi-point construction.
