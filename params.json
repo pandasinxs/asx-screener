@@ -1,0 +1,86 @@
+{
+  "SCORE_WEIGHTS": {
+    "trend_strength": 0.5,
+    "persistence": 0.2,
+    "catalyst": 0.15,
+    "price_pct_1y": 0.15
+  },
+  "TIER_BONUS": {
+    "T1": 0.15,
+    "T2": 0.1,
+    "T3": 0.05,
+    "T4": 0.0
+  },
+  "TREND_SCORE_THRESHOLD": {
+    "T1": 0.45,
+    "T2": 0.4,
+    "T3": 0.35,
+    "T4": 0.3
+  },
+  "TIERS": {
+    "T1": {
+      "vol_mult": 2.0,
+      "close_pos": 0.88,
+      "consol": 0.12,
+      "rsi_lo": 45,
+      "rsi_hi": 65,
+      "adx_min": 28,
+      "di_cross": true,
+      "vwap_above": true,
+      "rs_min": 1.05,
+      "vol_decline": true,
+      "near_52w_hi": true
+    },
+    "T2": {
+      "vol_mult": 1.5,
+      "close_pos": 0.75,
+      "consol": 0.15,
+      "rsi_lo": 42,
+      "rsi_hi": 68,
+      "adx_min": 25,
+      "di_cross": true,
+      "vwap_above": true,
+      "rs_min": 1.02,
+      "vol_decline": true,
+      "near_52w_hi": true
+    },
+    "T3": {
+      "vol_mult": 1.2,
+      "close_pos": 0.6,
+      "consol": 0.2,
+      "rsi_lo": 38,
+      "rsi_hi": 72,
+      "adx_min": 20,
+      "di_cross": true,
+      "vwap_above": true,
+      "rs_min": 1.0,
+      "vol_decline": true,
+      "near_52w_hi": false
+    },
+    "T4": {
+      "vol_mult": 1.0,
+      "close_pos": 0.5,
+      "consol": 0.25,
+      "rsi_lo": 35,
+      "rsi_hi": 75,
+      "adx_min": 15,
+      "di_cross": false,
+      "vwap_above": true,
+      "rs_min": 0.98,
+      "vol_decline": false,
+      "near_52w_hi": false
+    }
+  },
+  "BT_STOP_ATR_MULT": 2,
+  "BT_TARGET_ATR_MULT": 4,
+  "BT_TIMEOUT_DAYS": 20,
+  "DAILY_HEALTH": {
+    "VOL_SPIKE_THRESHOLD": 1.8,
+    "VOL_SHRINK_SLOPE_MAX": -0.02,
+    "AMPLITUDE_SHRINK_SLOPE": -0.001,
+    "CLOSE_POS_MIN": 0.65,
+    "MIN_DAYS_FOR_ANALYSIS": 5,
+    "MIN_DAYS_FOR_EXHAUSTION": 10,
+    "LOOKBACK_DAYS": 70
+  }
+}
