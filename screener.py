@@ -76,12 +76,18 @@ gemini_client  = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 # 1. 常量 & 配置
 # ════════════════════════════════════════════════════════════
 
-GEMINI_MODEL    = "gemini-2.5-flash"
-GEMINI_CFG_DEEP = {"thinking_config": {"thinking_budget": 512}}
+GEMINI_MODEL = "gemini-3.1-flash-lite"
+
+GEMINI_CFG_DEEP = {
+    "thinking_config": {
+        "thinking_level": "low"  # 轻度推理，保障快速响应
+    }
+}
 
 GEMINI_CFG_SEO_ARTICLE = {
-    "thinking_config": {"thinking_budget": 1024},
-    "max_output_tokens": 65535,
+    "thinking_config": {
+        "thinking_level": "medium"  # 中度推理，最适合 800 字长文与多维归因
+    },
 }
 
 RETRY_MAX       = 30
@@ -1613,7 +1619,9 @@ def _build_screener_prompt(signal: dict, timeline: str, tier_label: str) -> str:
 {timeline}
 
 ===== 分析任务 =====
-请严格按以下4部分输出，每部分2-3句，语言精炼专业：
+请严格按以下5部分输出，每部分2-3句，语言精炼专业：
+
+【公司背景】概括其核心业务模式、主要优势及关键风险点
 
 【技术形态】结合趋势强度评分和量能连续性，评估当前突破质量和支撑压力位。
 
@@ -1631,7 +1639,7 @@ def _build_screener_prompt(signal: dict, timeline: str, tier_label: str) -> str:
 
 ===== 固定输出字段（必须在分析末尾严格按格式输出，不得省略）=====
 【JSON_TAG_EN】（英文信号标签，2-4 words，如：Bullish Momentum / Range Break Setup / Overbought Pressure）
-【JSON_TAG_ZH】（中文信号标签，2-4个字，如：强势突破 / 区间试探 / 超买压力）
+【JSON_TAG_ZH】（中文信号标签，2-5个字，如：强势突破 / 区间试探 / 超买压力）
 【JSON_ONE_LINER_ZH】（一句中文核心解释，≤25字，描述当前技术或事件驱动的关键状态）
 【JSON_ONE_LINER_EN】（One English sentence, ≤20 words, same meaning as ZH above）"""
 
