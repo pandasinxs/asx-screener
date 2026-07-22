@@ -3,12 +3,23 @@
 # 新API：asx.api.markitdigital.com
 # 修复：yfinance新闻字段 content.title
 # v3.1：新增 /backtest 命令，查询signals_history回测统计
+# v3.2：新增 /htbt 命令，查询backtest_engine.py的历史模拟回测结果
+#       ——注意区分：
+#         /backtest → announcements.db 的 signals_history 表
+#                     每天screener.py实际选出的信号，前向追踪的真实结果，
+#                     反映"实盘系统目前跑得怎么样"
+#         /htbt     → backtest_results.db 的 signals_history_backtest 表
+#                     backtest_engine.py离线跑出来的历史模拟结果，
+#                     跟真实交易完全无关，只用来判断"改这个参数会不会
+#                     让系统更好"这个调参问题。两个数据库、两张表、
+#                     两套统计逻辑，完全独立，互不影响。
 # ============================================================
 
-import os, subprocess, logging, re, time, sqlite3
+import os, subprocess, logging, re, time, sqlite3, html, csv
 import yfinance as yf
 import requests
 from datetime import datetime, date, timezone, timedelta
+from collections import defaultdict
 from telegram import Update
 from telegram.ext import (Application, CommandHandler,
                           MessageHandler, filters, ContextTypes)
@@ -33,8 +44,11 @@ GEMINI_KEY     = os.environ.get("GEMINI_API_KEY", "")
 gemini_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 AEST = timezone(timedelta(hours=10))
 
-# signals_history和announcements在同一个DB
+# signals_history和announcements在同一个DB（实盘前向追踪数据）
 ANN_DB_PATH = "/home/ubuntu/asx/announcements.db"
+
+# backtest_engine.py产出的历史模拟回测数据库（离线调参用，与实盘数据完全独立）
+HTBT_DB_PATH = "/home/ubuntu/asx/backtest_results.db"
 
 ASX_ANN_URL = "https://asx.api.markitdigital.com/asx-research/1.0/markets/announcements"
 ASX_HEADERS = {
@@ -167,13 +181,17 @@ def format_stock_info(code: str, anns: list, news: list, price: dict) -> str:
             lines.append(f"  • {today_flag}{n['title']}")
     return "\n".join(lines)
 
-# ── 回测查询函数 ──────────────────────────────────────────────
+# ── 回测查询函数（实盘前向追踪：announcements.db / signals_history）──────
 
 def _query_backtest(mode: str) -> str:
     """
     从signals_history查询回测统计。
     mode: "overall" | "tier" | "catalyst"
     返回格式化文本，供Telegram发送。
+
+    注意：这里查的是实盘信号的前向追踪结果（screener.py每天真实选出的
+    信号，记录到announcements.db后逐日更新outcome），不是历史模拟。
+    历史模拟调参请用 /htbt 命令（查backtest_results.db，完全独立的数据源）。
     """
     if not os.path.exists(ANN_DB_PATH):
         return "⚠️ 暂无回测数据，signals_history数据库尚未创建。\n请确认screener.py v15已运行至少一次。"
@@ -252,7 +270,7 @@ def _query_backtest(mode: str) -> str:
 
                 ev_str = f"{ev_all:+.2f}%" if ev_all is not None else "N/A"
                 lines  = [
-                    f"📊 <b>回测整体统计</b>",
+                    f"📊 <b>回测整体统计（实盘前向追踪）</b>",
                     f"总记录：{total_all} 条（含{total_pending}个PENDING）",
                     f"已结算：{total_done} 条",
                     f"",
@@ -297,12 +315,11 @@ def _query_backtest(mode: str) -> str:
                     return "📊 暂无已结算记录，等待积累数据。"
 
                 # 按层级分组
-                from collections import defaultdict
                 tier_rows = defaultdict(list)
                 for r in rows_by_tier:
                     tier_rows[r[0]].append((r[1], r[2]))
 
-                lines = [f"📊 <b>回测按层级分组</b>（已结算{total_done}条）\n"]
+                lines = [f"📊 <b>回测按层级分组（实盘前向追踪）</b>（已结算{total_done}条）\n"]
                 for tier in ["T1", "T2", "T3", "T4"]:
                     if tier not in tier_rows:
                         continue
@@ -334,12 +351,11 @@ def _query_backtest(mode: str) -> str:
                 if not rows_cat:
                     return "📊 暂无已结算记录，等待积累数据。"
 
-                from collections import defaultdict
                 cat_rows = defaultdict(list)
                 for r in rows_cat:
                     cat_rows[r[0]].append((r[1], r[2]))
 
-                lines = [f"📊 <b>回测：催化剂有无对比</b>（已结算{total_done}条）\n"]
+                lines = [f"📊 <b>回测：催化剂有无对比（实盘前向追踪）</b>（已结算{total_done}条）\n"]
                 for cat_name in ["有催化剂", "无催化剂"]:
                     if cat_name not in cat_rows:
                         lines.append(f"<b>{cat_name}</b>：暂无数据")
@@ -379,6 +395,255 @@ def _query_backtest(mode: str) -> str:
         log.error(f"_query_backtest失败 [{mode}]: {e}")
         return f"❌ 查询失败：{e}"
 
+
+# ══════════════════════════════════════════════════════════════
+# 历史回测(模拟)查询函数 —— backtest_results.db / signals_history_backtest
+#
+# 跟上面 _query_backtest() 的关键区别：
+#   _query_backtest()  查 announcements.db 的 signals_history
+#                      → 实盘每天真实选出的信号，前向追踪结果
+#   _query_htbt()      查 backtest_results.db 的 signals_history_backtest
+#                      → backtest_engine.py离线跑出来的历史模拟结果，
+#                        用来验证"改这个参数会不会更好"，跟实盘交易无关
+#
+# 数据库用只读模式打开（file:...?mode=ro）——backtest_engine.py可能正在
+# VM上通过nohup长时间写入这个db，bot.py这边只应该读，不应该有任何写操作，
+# 避免锁冲突，也避免bot意外污染回测数据。
+# ══════════════════════════════════════════════════════════════
+
+def _htbt_connect():
+    if not os.path.exists(HTBT_DB_PATH):
+        return None
+    try:
+        return sqlite3.connect(f"file:{HTBT_DB_PATH}?mode=ro", uri=True)
+    except Exception as e:
+        log.error(f"_htbt_connect失败: {e}")
+        return None
+
+
+def _htbt_calc_stats(rows: list) -> dict:
+    """rows: [(outcome, outcome_pct), ...] → 胜率/盈亏比等汇总。"""
+    n = len(rows)
+    if n == 0:
+        return {"n": 0, "win_rate": 0.0, "avg_win": 0.0,
+                "avg_loss": 0.0, "profit_factor": None}
+    wins = sum(1 for o, _ in rows if o == "WIN")
+    pcts = [p for _, p in rows if p is not None]
+    win_rate = round(wins / n * 100, 1)
+    pos = [p for p in pcts if p > 0]
+    neg = [p for p in pcts if p < 0]
+    avg_win  = round(sum(pos) / len(pos), 2) if pos else 0.0
+    avg_loss = round(sum(neg) / len(neg), 2) if neg else 0.0
+    gross_profit = sum(pos)
+    gross_loss   = abs(sum(neg))
+    pf = round(gross_profit / gross_loss, 2) if gross_loss > 0 else None
+    return {"n": n, "win_rate": win_rate, "avg_win": avg_win,
+            "avg_loss": avg_loss, "profit_factor": pf}
+
+
+def _htbt_latest_param_set(conn) -> str:
+    """按最后一次运行时间，找到最近跑过的参数集名字。"""
+    row = conn.execute("""
+        SELECT param_set FROM signals_history_backtest
+        GROUP BY param_set ORDER BY MAX(run_timestamp) DESC LIMIT 1
+    """).fetchone()
+    return row[0] if row else ""
+
+
+def _query_htbt_leaderboard(conn) -> str:
+    rows = conn.execute("""
+        SELECT param_set,
+               COUNT(*) AS n,
+               SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) AS wins,
+               AVG(outcome_pct) AS avg_pct,
+               MIN(signal_date) AS date_from, MAX(signal_date) AS date_to
+        FROM signals_history_backtest
+        WHERE outcome != 'PENDING' AND is_selected = 1
+        GROUP BY param_set
+        ORDER BY (wins * 1.0 / n) DESC
+    """).fetchall()
+    if not rows:
+        return ("📊 历史回测(模拟)暂无已结算数据\n"
+                "请先在VM上跑一次 backtest_engine.py")
+
+    lines = ["📊 <b>历史回测(模拟)参数实验排行榜</b>", "（backtest_engine.py离线结果，非实盘）\n"]
+    for param_set, n, wins, avg_pct, date_from, date_to in rows:
+        wr = round(wins / n * 100, 1) if n else 0
+        lines.append(f"<b>{html.escape(param_set)}</b>  样本{n}笔  胜率{wr}%  "
+                     f"平均{avg_pct:+.2f}%\n  覆盖 {date_from}~{date_to}")
+    lines.append("\n用 <code>/htbt 参数集名字</code> 看某个实验的详细分层统计")
+    lines.append("用 <code>/htbt params 参数集名字</code> 看实际参数内容+git commit")
+    lines.append("用 <code>/htbt csv 参数集名字</code> 导出完整交易明细CSV（推给Claude深挖用）")
+    return "\n".join(lines)
+
+
+def _query_htbt_detail(conn, param_set: str) -> str:
+    rows_all = conn.execute("""
+        SELECT outcome, outcome_pct FROM signals_history_backtest
+        WHERE outcome != 'PENDING' AND is_selected = 1 AND param_set = ?
+    """, (param_set,)).fetchall()
+    if not rows_all:
+        return (f"📊 参数集「{html.escape(param_set)}」暂无已结算数据\n"
+                f"（检查名字是否打对了，用 /htbt 看排行榜里的实际名字）")
+
+    stats = _htbt_calc_stats(rows_all)
+    pf_str = f"{stats['profit_factor']}" if stats["profit_factor"] is not None else "N/A"
+    lines = [
+        f"📊 <b>历史回测(模拟)详情 [{html.escape(param_set)}]</b>",
+        "（backtest_engine.py离线结果，非实盘）",
+        f"",
+        f"样本：{stats['n']}笔（仅Top3精选信号）",
+        f"胜率：{stats['win_rate']}%",
+        f"平均盈利/亏损：{stats['avg_win']:+.2f}% / {stats['avg_loss']:+.2f}%",
+        f"盈亏比：{pf_str}",
+    ]
+
+    outcome_dist = {}
+    for o, _ in rows_all:
+        outcome_dist[o] = outcome_dist.get(o, 0) + 1
+    lines.append("\n<b>出场原因：</b>")
+    for oc in ["WIN", "LOSS", "TIMEOUT"]:
+        if oc in outcome_dist:
+            lines.append(f"  {oc}: {outcome_dist[oc]}笔")
+
+    tier_rows = conn.execute("""
+        SELECT tier_level, outcome, outcome_pct FROM signals_history_backtest
+        WHERE outcome != 'PENDING' AND is_selected = 1 AND param_set = ?
+    """, (param_set,)).fetchall()
+    tier_grouped = defaultdict(list)
+    for tl, o, p in tier_rows:
+        tier_grouped[tl].append((o, p))
+    if tier_grouped:
+        lines.append("\n<b>分层级：</b>")
+        for tl in sorted(tier_grouped.keys()):
+            s = _htbt_calc_stats(tier_grouped[tl])
+            lines.append(f"  {tl}: {s['n']}笔  胜率{s['win_rate']}%  "
+                        f"平均{(s['avg_win'] if s['n'] else 0):+.2f}%/{(s['avg_loss'] if s['n'] else 0):+.2f}%")
+
+    # 健康度分层：早期跑的实验可能没有这个字段（health_status为NULL），
+    # 用IS NOT NULL过滤，避免把"没有数据"误显示成"accumulating"之类的假分组
+    health_rows = conn.execute("""
+        SELECT health_status, outcome, outcome_pct FROM signals_history_backtest
+        WHERE outcome != 'PENDING' AND is_selected = 1 AND param_set = ?
+              AND health_status IS NOT NULL
+    """, (param_set,)).fetchall()
+    if health_rows:
+        health_grouped = defaultdict(list)
+        for hs, o, p in health_rows:
+            health_grouped[hs].append((o, p))
+        lines.append("\n<b>跨日健康度分层：</b>")
+        for hs in sorted(health_grouped.keys()):
+            s = _htbt_calc_stats(health_grouped[hs])
+            lines.append(f"  {hs}: {s['n']}笔  胜率{s['win_rate']}%")
+
+    lines.append(f"\n⚠️ 这是backtest_engine.py的历史模拟结果，不是实盘数据；"
+                f"样本量&lt;30笔时结论仅供参考。")
+    return "\n".join(lines)
+
+
+def _query_htbt_params(conn, param_set: str) -> str:
+    try:
+        row = conn.execute("""
+            SELECT params_json, params_file, git_commit, first_seen_at
+            FROM experiment_metadata WHERE param_set = ?
+        """, (param_set,)).fetchone()
+    except sqlite3.OperationalError:
+        return "⚠️ experiment_metadata表还不存在，可能这个db是旧版本跑出来的，还没有参数档案功能"
+    if not row:
+        return f"没有找到参数集「{html.escape(param_set)}」的档案记录"
+    params_json, params_file, git_commit, first_seen_at = row
+    return (
+        f"📋 <b>参数集 [{html.escape(param_set)}] 详情</b>\n\n"
+        f"首次运行：{first_seen_at}\n"
+        f"参数文件：{html.escape(params_file or '(baseline)')}\n"
+        f"git commit：{html.escape(git_commit or '(未知)')}\n\n"
+        f"实际参数内容：\n<pre>{html.escape(params_json or '')}</pre>"
+    )
+
+
+def _export_htbt_csv(param_set: str) -> tuple:
+    """
+    把某个param_set的完整交易明细导出成CSV临时文件。
+    返回 (文件路径, 错误信息)——成功时错误信息为None，失败时文件路径为None。
+
+    导出范围：T1-T4全部候选（不只是Top3精选），因为Claude做深挖分析时
+    往往需要看全量数据自己筛选，而不是先被bot这边过滤掉一部分。
+    """
+    conn = _htbt_connect()
+    if conn is None:
+        return None, "⚠️ 历史回测数据库不存在（backtest_results.db）。"
+    try:
+        if param_set == "latest":
+            param_set = _htbt_latest_param_set(conn)
+            if not param_set:
+                return None, "暂无已跑过的历史回测实验"
+
+        cursor = conn.execute("""
+            SELECT * FROM signals_history_backtest
+            WHERE outcome != 'PENDING' AND param_set = ?
+            ORDER BY signal_date
+        """, (param_set,))
+        col_names = [d[0] for d in cursor.description]
+        rows = cursor.fetchall()
+        if not rows:
+            return None, (f"参数集「{param_set}」暂无已结算数据"
+                          f"（检查名字是否打对了，用 /htbt 看排行榜里的实际名字）")
+
+        safe_name = re.sub(r"[^A-Za-z0-9_\-]", "_", param_set)
+        path = f"/tmp/htbt_{safe_name}_{int(time.time())}.csv"
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(col_names)
+            writer.writerows(rows)
+        return path, None
+    except Exception as e:
+        log.error(f"_export_htbt_csv失败 [{param_set}]: {e}")
+        return None, f"❌ CSV导出失败：{e}"
+    finally:
+        conn.close()
+
+
+def _query_htbt(args: list) -> str:
+    """
+    /htbt              → 参数实验排行榜
+    /htbt latest       → 最近一次跑完的实验详情
+    /htbt <参数集名字>  → 某个具体实验的详情（胜率/分层/健康度）
+    /htbt params <参数集名字> → 查看该实验实际用的参数内容+git commit
+    /htbt csv <参数集名字|latest> → 导出该实验完整交易明细CSV并推送文件
+                                    （这个分支在cmd_htbt里单独处理，不走这个
+                                    返回文字的函数，因为要发文件而不是文字）
+    """
+    conn = _htbt_connect()
+    if conn is None:
+        return ("⚠️ 历史回测数据库不存在（backtest_results.db）。\n"
+                "请先在VM上跑一次 backtest_engine.py。")
+    try:
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        if "signals_history_backtest" not in tables:
+            return "⚠️ signals_history_backtest表尚未创建，请先跑一次 backtest_engine.py。"
+
+        if not args:
+            return _query_htbt_leaderboard(conn)
+        if args[0] == "board":
+            return _query_htbt_leaderboard(conn)
+        if args[0] == "params" and len(args) > 1:
+            return _query_htbt_params(conn, args[1])
+        if args[0] == "latest":
+            latest = _htbt_latest_param_set(conn)
+            if not latest:
+                return "暂无已跑过的历史回测实验"
+            return _query_htbt_detail(conn, latest)
+        # 否则把第一个参数当作param_set名字查详情
+        return _query_htbt_detail(conn, args[0])
+    except Exception as e:
+        log.error(f"_query_htbt失败: {e}")
+        return f"❌ 查询失败：{e}"
+    finally:
+        conn.close()
+
+
 # ── 命令处理 ──────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
@@ -396,9 +661,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               /watch BHP 15  — 添加BHP到长期监测，15天
               /unwatch BHP   — 移出监测队列
               /watchlist     — 查看当前监测队列
+
+              📊 实盘信号回测（前向追踪，真实数据）：
               /backtest           — 整体胜率和期望值
               /backtest tier      — 按T1-T4层级分组
               /backtest catalyst  — 有无催化剂对比
+
+              🧪 历史回测（离线模拟，调参用，非实盘）：
+              /htbt               — 参数实验排行榜
+              /htbt latest        — 最近一次实验详情
+              /htbt 参数集名字     — 某个具体实验详情
+              /htbt params 参数集名字 — 查看该实验实际参数内容+git commit
+              /htbt csv 参数集名字|latest — 导出交易明细CSV文件
+                                    （唯一产出文件的命令，其他都是文字总结）
 
            💬 直接用中文问我，例：
               "BHP最近有什么公告？"
@@ -493,6 +768,9 @@ async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     /backtest           → 整体胜率 + 期望值 + Top3 vs 落选候选对比
     /backtest tier      → 按T1-T4层级分组统计
     /backtest catalyst  → 有无催化剂对比
+
+    查的是实盘信号的前向追踪结果（announcements.db / signals_history）。
+    历史模拟调参请用 /htbt（查backtest_results.db，完全独立的数据源）。
     """
     if not auth(update): return
 
@@ -503,8 +781,56 @@ async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     arg  = ctx.args[0].lower() if ctx.args else ""
     mode = mode_map.get(arg, "overall")
 
-    await update.message.reply_text("📊 查询回测数据中...")
+    await update.message.reply_text("📊 查询实盘回测数据中...")
     result = _query_backtest(mode)
+    await update.message.reply_text(result[:4000], parse_mode="HTML")
+
+async def cmd_htbt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /htbt                      → 参数实验排行榜
+    /htbt latest               → 最近一次跑完的实验详情
+    /htbt 参数集名字            → 某个具体实验的详情（胜率/分层/健康度）
+    /htbt params 参数集名字     → 查看该实验实际用的参数内容+git commit
+    /htbt csv 参数集名字|latest → 导出该实验完整交易明细CSV，作为文件推送
+                                （不是文字总结——这是唯一能产出CSV文件的入口，
+                                给Claude做深挖分析用；日常查看用不带csv的其他子命令）
+
+    查的是backtest_engine.py离线跑出来的历史模拟结果
+    （backtest_results.db / signals_history_backtest），跟 /backtest
+    查询的实盘信号追踪数据完全独立，互不影响，也不会互相覆盖。
+    """
+    if not auth(update): return
+
+    if ctx.args and ctx.args[0] == "csv":
+        if len(ctx.args) < 2:
+            await update.message.reply_text(
+                "用法：/htbt csv 参数集名字\n或：/htbt csv latest（最近一次实验）"
+            )
+            return
+        param_set = ctx.args[1]
+        await update.message.reply_text(f"📄 正在导出「{param_set}」的交易明细CSV...")
+        path, err = _export_htbt_csv(param_set)
+        if err:
+            await update.message.reply_text(err)
+            return
+        try:
+            with open(path, "rb") as f:
+                await update.message.reply_document(
+                    document=f, filename=os.path.basename(path),
+                    caption=f"🧪 {param_set} 历史回测明细（T1-T4全部候选，非仅Top3）"
+                )
+        except Exception as e:
+            log.error(f"发送CSV文件失败 [{path}]: {e}")
+            await update.message.reply_text(f"❌ 文件发送失败：{e}")
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        return
+
+    await update.message.reply_text("🧪 查询历史回测(模拟)数据中...")
+    result = _query_htbt(ctx.args)
     await update.message.reply_text(result[:4000], parse_mode="HTML")
 
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -647,12 +973,13 @@ def main():
     app.add_handler(CommandHandler("status",    cmd_status))
     app.add_handler(CommandHandler("logs",      cmd_logs))
     app.add_handler(CommandHandler("backtest",  cmd_backtest))
+    app.add_handler(CommandHandler("htbt",      cmd_htbt))
     app.add_handler(CommandHandler("watch",     cmd_watch))
     app.add_handler(CommandHandler("unwatch",   cmd_unwatch))
     app.add_handler(CommandHandler("watchlist", cmd_watchlist))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_ai))
-    print("Bot v3.1 启动中...")
+    print("Bot v3.2 启动中...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
