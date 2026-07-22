@@ -179,6 +179,41 @@ def send_telegram(text: str, logger: Optional[logging.Logger] = None) -> None:
         time.sleep(0.4)
 
 
+def send_telegram_document(file_path: str, caption: str = "",
+                           logger: Optional[logging.Logger] = None) -> None:
+    """
+    推送文件附件到Telegram（比如CSV导出），用于需要深挖分析的场景——
+    纯文字摘要给日常查看用，文件附件给"要拿去做进一步定量分析"用。
+    同样是配置了才推，失败了只记日志，不影响回测主流程。
+    """
+    log = logger or logging.getLogger("backtest")
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram未配置，跳过文件推送")
+        return
+    if not os.path.exists(file_path):
+        log.error(f"要推送的文件不存在: {file_path}")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
+        try:
+            with open(file_path, "rb") as f:
+                r = requests.post(
+                    url,
+                    data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                    files={"document": (os.path.basename(file_path), f)},
+                    timeout=30,
+                )
+            r.raise_for_status()
+            log.info(f"文件已推送Telegram: {file_path}")
+            return
+        except Exception as e:
+            if attempt < TELEGRAM_MAX_RETRIES:
+                time.sleep(2 * attempt)
+            else:
+                log.error(f"文件推送失败（已重试{TELEGRAM_MAX_RETRIES}次）[{file_path}]: {e}")
+
+
 # ════════════════════════════════════════════════════════════
 # 配置
 # ════════════════════════════════════════════════════════════
@@ -1500,7 +1535,8 @@ class StatsReporter:
 
     def report(self, only_selected: bool = True, tier: Optional[str] = None,
                merge_live: bool = False, live_db: str = "",
-               health_status: Optional[str] = None, push_telegram: bool = False):
+               health_status: Optional[str] = None, push_telegram: bool = False,
+               export_csv: Optional[str] = None):
         self._buffer: list[str] = []
 
         bt_df = self._load_backtest_df(only_selected, tier)
@@ -1608,6 +1644,25 @@ class StatsReporter:
                        "说明这层过滤没有实际筛选力，可以考虑简化掉")
 
         self._analyze_score_predictiveness(combined)
+
+        if export_csv:
+            try:
+                # 导出前把不适合放CSV的内部对象列去掉（如果有的话），
+                # 保留人类/Claude都能直接用pandas读的干净表格
+                export_df = combined.copy()
+                export_df.to_csv(export_csv, index=False, encoding="utf-8-sig")
+                self.logger.info(f"CSV已导出: {export_csv}（{len(export_df)}行）")
+                self._emit(f"\n📄 CSV已导出: {export_csv}（{len(export_df)}行，"
+                           f"包含每笔交易的完整字段，适合做进一步定量分析）")
+                if push_telegram:
+                    send_telegram_document(
+                        export_csv,
+                        caption=f"{self.cfg.param_set} 回测明细（{len(export_df)}笔交易）",
+                        logger=self.logger,
+                    )
+            except Exception as e:
+                self.logger.error(f"CSV导出失败: {e}")
+                self._emit(f"⚠️ CSV导出失败: {e}")
 
         if push_telegram:
             send_telegram("\n".join(self._buffer), self.logger)
@@ -1857,6 +1912,10 @@ def main():
                         help="本次运行不推送Telegram（即使配置了TOKEN/CHAT_ID）")
     parser.add_argument("--show-param-set", default="",
                         help="查询某个param_set当时实际用的参数内容+git commit，用于事后追溯")
+    parser.add_argument("--export-csv", default="",
+                        help="把本次统计的完整交易明细导出为CSV（每笔交易一行），"
+                             "配合--no-telegram以外的情况会同时把CSV推送到Telegram，"
+                             "适合需要深挖分析时用（比纯文字/md更适合让Claude直接用代码分析）")
     args = parser.parse_args()
 
     cfg = BacktestConfig(
@@ -1943,6 +2002,7 @@ def main():
             live_db=args.live_db,
             health_status=args.health_status or None,
             push_telegram=cfg.push_telegram,
+            export_csv=args.export_csv or None,
         )
 
     except Exception as e:
