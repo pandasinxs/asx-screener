@@ -466,14 +466,10 @@ def _query_htbt_leaderboard(conn) -> str:
         return ("📊 历史回测(模拟)暂无已结算数据\n"
                 "请先在VM上跑一次 backtest_engine.py")
 
-    lines = ["📊 <b>历史回测(模拟)参数实验排行榜</b>", "（backtest_engine.py离线结果，非实盘）\n"]
+    lines = ["📊 <b>参数实验排行榜</b>（历史模拟，非实盘）\n"]
     for param_set, n, wins, avg_pct, date_from, date_to in rows:
         wr = round(wins / n * 100, 1) if n else 0
-        lines.append(f"<b>{html.escape(param_set)}</b>  样本{n}笔  胜率{wr}%  "
-                     f"平均{avg_pct:+.2f}%\n  覆盖 {date_from}~{date_to}")
-    lines.append("\n用 <code>/htbt 参数集名字</code> 看某个实验的详细分层统计")
-    lines.append("用 <code>/htbt params 参数集名字</code> 看实际参数内容+git commit")
-    lines.append("用 <code>/htbt csv 参数集名字</code> 导出完整交易明细CSV（推给Claude深挖用）")
+        lines.append(f"<b>{html.escape(param_set)}</b>  {n}笔  胜率{wr}%  平均{avg_pct:+.2f}%")
     return "\n".join(lines)
 
 
@@ -489,22 +485,16 @@ def _query_htbt_detail(conn, param_set: str) -> str:
     stats = _htbt_calc_stats(rows_all)
     pf_str = f"{stats['profit_factor']}" if stats["profit_factor"] is not None else "N/A"
     lines = [
-        f"📊 <b>历史回测(模拟)详情 [{html.escape(param_set)}]</b>",
-        "（backtest_engine.py离线结果，非实盘）",
-        f"",
-        f"样本：{stats['n']}笔（仅Top3精选信号）",
-        f"胜率：{stats['win_rate']}%",
-        f"平均盈利/亏损：{stats['avg_win']:+.2f}% / {stats['avg_loss']:+.2f}%",
-        f"盈亏比：{pf_str}",
+        f"📊 <b>[{html.escape(param_set)}]</b>（历史模拟，非实盘）",
+        f"样本：{stats['n']}笔（Top3）  胜率：{stats['win_rate']}%",
+        f"平均盈/亏：{stats['avg_win']:+.2f}% / {stats['avg_loss']:+.2f}%  盈亏比：{pf_str}",
     ]
 
     outcome_dist = {}
     for o, _ in rows_all:
         outcome_dist[o] = outcome_dist.get(o, 0) + 1
-    lines.append("\n<b>出场原因：</b>")
-    for oc in ["WIN", "LOSS", "TIMEOUT"]:
-        if oc in outcome_dist:
-            lines.append(f"  {oc}: {outcome_dist[oc]}笔")
+    outcome_str = "  ".join(f"{oc}:{outcome_dist[oc]}" for oc in ["WIN", "LOSS", "TIMEOUT"] if oc in outcome_dist)
+    lines.append(f"出场原因：{outcome_str}")
 
     tier_rows = conn.execute("""
         SELECT tier_level, outcome, outcome_pct FROM signals_history_backtest
@@ -536,8 +526,7 @@ def _query_htbt_detail(conn, param_set: str) -> str:
             s = _htbt_calc_stats(health_grouped[hs])
             lines.append(f"  {hs}: {s['n']}笔  胜率{s['win_rate']}%")
 
-    lines.append(f"\n⚠️ 这是backtest_engine.py的历史模拟结果，不是实盘数据；"
-                f"样本量&lt;30笔时结论仅供参考。")
+    lines.append(f"\n⚠️ 历史模拟，样本&lt;30笔仅供参考")
     return "\n".join(lines)
 
 
@@ -559,6 +548,65 @@ def _query_htbt_params(conn, param_set: str) -> str:
         f"git commit：{html.escape(git_commit or '(未知)')}\n\n"
         f"实际参数内容：\n<pre>{html.escape(params_json or '')}</pre>"
     )
+
+
+def _query_htbt_htf(conn, param_set: str) -> str:
+    """
+    查询小时级变种策略（intraday_htf_signals表）的结果——完全独立于
+    signals_history_backtest那张EOD核心回测表，物理上是两张不同的表。
+
+    ⚠️ 这里的警告文案和backtest_engine.py的htf_report()保持逐字一致，
+    确保不管从VM命令行还是Telegram查，看到的边界声明都一样，
+    不会因为查询入口不同就把这层"这不是验证intraday_monitor.py"的
+    提醒漏掉。
+    """
+    try:
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        if "intraday_htf_signals" not in tables:
+            return ("⚠️ intraday_htf_signals表尚未创建，"
+                    "请先用 --include-hourly-intraday 跑一次 backtest_engine.py")
+
+        if param_set == "latest":
+            param_set = _htbt_latest_param_set(conn)
+            if not param_set:
+                return "暂无已跑过的历史回测实验"
+
+        rows = conn.execute("""
+            SELECT htf_mode, outcome, outcome_pct FROM intraday_htf_signals
+            WHERE outcome != 'PENDING' AND param_set = ?
+        """, (param_set,)).fetchall()
+    except Exception as e:
+        return f"❌ 查询失败：{e}"
+
+    lines = [
+        f"🧪 <b>[{html.escape(param_set)}]</b> 小时级变种（⚠️非intraday_monitor.py验证，反应更慢的粗颗粒度独立研究）",
+        "",
+    ]
+
+    if not rows:
+        lines.append(f"参数集「{html.escape(param_set)}」暂无已结算的小时级变种信号")
+        return "\n".join(lines)
+
+    n = len(rows)
+    wins = sum(1 for _, o, _ in rows if o == "WIN")
+    pcts = [p for _, _, p in rows if p is not None]
+    win_rate = round(wins / n * 100, 1) if n else 0
+    avg_pct = round(sum(pcts) / len(pcts), 2) if pcts else 0
+    lines.append(f"样本：{n}笔  胜率：{win_rate}%  平均：{avg_pct:+.2f}%")
+
+    mode_grouped = defaultdict(list)
+    for mode, o, p in rows:
+        mode_grouped[mode or "unknown"].append((o, p))
+    lines.append("\n<b>按模式拆解：</b>")
+    for mode, mrows in mode_grouped.items():
+        mn = len(mrows)
+        mwins = sum(1 for o, _ in mrows if o == "WIN")
+        mwr = round(mwins / mn * 100, 1) if mn else 0
+        lines.append(f"  {html.escape(mode)}: {mn}笔  胜率{mwr}%")
+
+    return "\n".join(lines)
 
 
 def _export_htbt_csv(param_set: str) -> tuple:
@@ -630,6 +678,9 @@ def _query_htbt(args: list) -> str:
             return _query_htbt_leaderboard(conn)
         if args[0] == "params" and len(args) > 1:
             return _query_htbt_params(conn, args[1])
+        if args[0] == "htf":
+            target = args[1] if len(args) > 1 else "latest"
+            return _query_htbt_htf(conn, target)
         if args[0] == "latest":
             latest = _htbt_latest_param_set(conn)
             if not latest:
@@ -674,6 +725,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               /htbt params 参数集名字 — 查看该实验实际参数内容+git commit
               /htbt csv 参数集名字|latest — 导出交易明细CSV文件
                                     （唯一产出文件的命令，其他都是文字总结）
+              /htbt htf [参数集名字|latest] — 小时级变种策略结果
+                                    （独立实验性数据，不是intraday_monitor.py验证）
 
            💬 直接用中文问我，例：
               "BHP最近有什么公告？"
@@ -794,6 +847,8 @@ async def cmd_htbt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     /htbt csv 参数集名字|latest → 导出该实验完整交易明细CSV，作为文件推送
                                 （不是文字总结——这是唯一能产出CSV文件的入口，
                                 给Claude做深挖分析用；日常查看用不带csv的其他子命令）
+    /htbt htf [参数集名字|latest] → 小时级变种策略结果（intraday_htf_signals表，
+                                完全独立的实验性数据，不传参数集名字默认查latest）
 
     查的是backtest_engine.py离线跑出来的历史模拟结果
     （backtest_results.db / signals_history_backtest），跟 /backtest
