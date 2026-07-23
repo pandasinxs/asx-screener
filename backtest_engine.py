@@ -218,10 +218,36 @@ def send_telegram_document(file_path: str, caption: str = "",
 # 配置
 # ════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════
+# 标准化测试窗口 —— "每次都测一样的，只改参数"
+#
+# 统一规则：不再手动传--start/--end，一律自动算成"今天倒推700天"，
+# 加上再往前365天（1年）的热身缓冲用于计算MA200/52周高点这些长窗口
+# 指标的初始值。700天留了30天余量在yfinance 60m数据~729天的硬上限
+# 内，所以--use-hourly-vol-ratio/--include-hourly-intraday这两个
+# 现在默认开启的功能不会因为标准窗口本身而触发2年上限报错。
+#
+# 这样做的目的：让所有实验的"测试范围"完全一致，只有参数在变，
+# 排行榜/对比才有意义——如果每次连测试区间都不一样，胜率差异到底是
+# 参数改得好还是测试期市场行情不同，根本分不清。
+# ════════════════════════════════════════════════════════════
+STANDARD_WINDOW_DAYS = 700
+STANDARD_WARMUP_DAYS = 365
+
+
+def _today_str() -> str:
+    return pd.Timestamp.now().normalize().date().isoformat()
+
+
+def _standard_start_str() -> str:
+    return (pd.Timestamp.now().normalize()
+            - pd.Timedelta(days=STANDARD_WINDOW_DAYS)).date().isoformat()
+
+
 @dataclass
 class BacktestConfig:
-    start_date: str = "2025-07-01"
-    end_date: str = "2026-07-01"
+    start_date: Optional[str] = None  # None时自动算成"今天-700天"（标准窗口）
+    end_date: Optional[str] = None    # None时自动算成"今天"
 
     universe_source: str = "watchlist"     # watchlist | file | full
     universe_file: str = ""
@@ -230,13 +256,10 @@ class BacktestConfig:
     min_history_days: int = 60             # 与download_ohlcv()的有效性门槛一致
 
     # 技术指标热身缓冲：MA200/52周高点这些指标需要至少约252个交易日的
-    # 滚动窗口。如果直接从start_date开始下载数据，回测最早约1年的信号会
-    # 因为MA200还没"攒够"数据而系统性失真（ma200=None、w52_hi用不完整窗口）。
-    # 实际下载区间会往前多拉400个日历日（覆盖约260+个交易日），
-    # 但只对>=start_date的交易日生成信号，热身期本身不产出信号。
-    # 拉长到5-10年回测时，这个缓冲期占比很小，但对回测最早一段的
-    # 信号质量影响很大，必须加。
-    warmup_calendar_days: int = 400
+    # 滚动窗口。固定为1年（365天），不再随便调——这也是"统一标准"的一部分，
+    # 热身期长度本身变化也会轻微影响最早那段信号的质量，不应该在实验
+    # 之间变来变去。
+    warmup_calendar_days: int = STANDARD_WARMUP_DAYS
 
     db_path: str = os.path.join(ASX_DIR, "backtest_results.db")
     log_path: str = os.path.join(ASX_DIR, "backtest.log")
@@ -255,6 +278,27 @@ class BacktestConfig:
     health_min_days_exhaustion: int = 10         # MIN_DAYS_FOR_EXHAUSTION
     health_lookback_days: int = 70               # load_daily_summaries的lookback_days
 
+    # ── 60分钟线相关（yfinance对60m颗粒度的历史深度上限约730天，
+    # 明显宽于15m/30m等更细颗粒度的60天上限）────────────────────────
+    # 现在是标准测试方法论的一部分，默认开启（不再是可选的实验性flag）。
+    # 用60分钟线数据精确化health层的"尾盘时段量比"。
+    use_hourly_vol_ratio: bool = True
+    yf_60m_max_days: int = 729  # yfinance 60m颗粒度的实际上限是730天，留1天安全余量
+
+    # ── 小时级变种策略（近似intraday_monitor.py的三种入场模式，但用60分钟线
+    # 而不是真实的15分钟线）——这是一个全新的、独立的研究性回测，
+    # 不是对intraday_monitor.py本身的验证。现在默认开启（标准测试方法论
+    # 的一部分），结果始终写入独立的intraday_htf_signals表，跟核心EOD
+    # 回测结果物理隔离，不会混在一起。
+    include_hourly_intraday: bool = True
+    htf_breakout_lookback_days: int = 20       # 对应intraday_monitor.py的BREAKOUT_LOOKBACK_DAYS
+    htf_vol_spike_ratio: float = 1.5           # 对应VOL_SPIKE_RATIO_M1(1.8)，小时线成交量分布不同，起点估计值
+    htf_pullback_max_depth_pct: float = 6.0    # 对应PULLBACK_MAX_DEPTH_PCT(4.0)，小时线波动更大，起点估计值
+    htf_pullback_vol_shrink_ratio: float = 0.7  # 对应PULLBACK_VOL_SHRINK_RATIO
+    htf_late_session_near_high_pct: float = 2.0  # 对应LATE_SESSION_NEAR_HIGH_PCT(1.5)
+    htf_min_dollar_volume: float = 300_000.0   # 对应MIN_DOLLAR_VOLUME_INTRADAY
+    htf_stop_buffer_pct: float = 0.005         # 对应intraday_monitor.py止损位的0.995/0.99这类缓冲
+
     # 供"补充性、非可比"的真实成本估算层使用（不影响与signals_history可比的核心统计）
     commission_pct: float = 0.0011
     commission_min_aud: float = 7.0
@@ -263,6 +307,32 @@ class BacktestConfig:
     # 稳定性：连续多少个交易日算信号失败就熔断停止（避免系统性bug时空跑一整晚）
     max_consecutive_errors: int = 5
     push_telegram: bool = True  # 配置了TELEGRAM_TOKEN/CHAT_ID时是否推送通知
+
+
+def resolve_standard_window(cfg: BacktestConfig, logger: logging.Logger,
+                            explicitly_overridden: bool) -> None:
+    """
+    如果cfg.start_date/end_date没有手动指定，自动填成标准窗口
+    （今天 ~ 今天-700天）。如果是手动指定的（explicitly_overridden=True），
+    只做校验不做覆盖，但会大声提醒：手动指定的区间跑出来的结果，
+    不能直接和标准窗口跑出来的其他实验放在同一张排行榜里比较胜率，
+    因为测试期本身不一样，胜率差异可能只是市场行情不同，不是参数好坏。
+    """
+    if cfg.start_date is None:
+        cfg.start_date = _standard_start_str()
+    if cfg.end_date is None:
+        cfg.end_date = _today_str()
+
+    if explicitly_overridden:
+        logger.warning(
+            f"⚠️ 手动指定了--start/--end（{cfg.start_date}~{cfg.end_date}），"
+            f"偏离了标准测试窗口（今天倒推{STANDARD_WINDOW_DAYS}天）。"
+            f"这次实验的结果不能直接和用标准窗口跑出来的其他实验比胜率——"
+            f"测试期不同，差异可能只是市场行情不同，不是参数好坏。"
+        )
+    else:
+        logger.info(f"使用标准测试窗口: {cfg.start_date} ~ {cfg.end_date}"
+                   f"（今天倒推{STANDARD_WINDOW_DAYS}天，热身缓冲{cfg.warmup_calendar_days}天）")
 
 
 def setup_logging(log_path: str) -> logging.Logger:
@@ -337,6 +407,72 @@ class DataLayer:
                 time.sleep(self._backoff_seconds(attempt))
 
         self.logger.error(f"{ticker}: {self.max_retries}次重试后仍失败，跳过")
+        return None
+
+    def fetch_60m(self, ticker: str, start: str, end: str,
+                  max_days: int = 729) -> Optional[pd.DataFrame]:
+        """
+        拉取60分钟线（yfinance对60m颗粒度的历史深度上限约730天，
+        明显宽于15m/30m等更细颗粒度的60天上限）。
+
+        与fetch()的关键差异：
+          - 会先校验请求区间是否超出60m数据的可用窗口（相对"今天"算，
+            不是相对--end），超出的部分yfinance要么返回空、要么自动截断，
+            这里提前算清楚并在日志里说明，不让调用方在没意识到的情况下
+            拿到一份"看起来正常但其实被悄悄截断"的数据
+          - 返回的index会转换到悉尼时区（Australia/Sydney），
+            和intraday_monitor.py的时区处理方式保持一致，避免UTC/本地
+            时间混淆导致"最后一根K线"判断错误
+        """
+        from zoneinfo import ZoneInfo
+        syd_tz = ZoneInfo("Australia/Sydney")
+
+        key = f"60m|{ticker}|{start}|{end}"
+        if key in self._cache:
+            return self._cache[key]
+
+        today = pd.Timestamp.now().normalize()
+        earliest_available = today - pd.Timedelta(days=max_days)
+        requested_start = pd.Timestamp(start)
+        if requested_start < earliest_available:
+            self.logger.warning(
+                f"{ticker}: 60分钟线请求起点{start}早于可用窗口"
+                f"({earliest_available.date()})，实际能拿到的数据会从"
+                f"{earliest_available.date()}左右开始，更早的部分yfinance"
+                f"不提供，不是本代码的bug"
+            )
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                df = yf.download(
+                    ticker, start=start, end=end, interval="60m",
+                    auto_adjust=True, progress=False, threads=False,
+                )
+                if df is None or df.empty:
+                    self.logger.warning(f"{ticker}: 60分钟线返回空数据 "
+                                       f"attempt={attempt}/{self.max_retries}")
+                    time.sleep(self._backoff_seconds(attempt))
+                    continue
+
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df = df[~df.index.duplicated(keep="first")]
+                df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize("UTC").tz_convert(syd_tz)
+                else:
+                    df.index = df.index.tz_convert(syd_tz)
+
+                self._cache[key] = df
+                return df
+
+            except Exception as e:
+                self.logger.warning(f"{ticker}: 60分钟线拉取失败 "
+                                   f"attempt={attempt}/{self.max_retries} error={e}")
+                time.sleep(self._backoff_seconds(attempt))
+
+        self.logger.error(f"{ticker}: 60分钟线{self.max_retries}次重试后仍失败，跳过")
         return None
 
     @staticmethod
@@ -585,10 +721,41 @@ class DailyHealthEvaluator:
         except Exception:
             return 0.0
 
-    def evaluate(self, pit_df: pd.DataFrame, as_of: pd.Timestamp) -> dict:
+    @staticmethod
+    def _build_hourly_vol_ratio(hourly_df: pd.DataFrame, lookback_days: int = 20) -> pd.Series:
+        """
+        用60分钟线构建"尾盘时段量比"：每个交易日取当天最后一根60分钟K线的
+        成交量，除以过去lookback_days天"最后一根K线"成交量的历史均值。
+
+        这比日总成交量比例更贴近真实daily_analysis.py里close_vol_ratio
+        （"最后一个15分钟时段量比"）的本意——虽然60分钟线本身也不是
+        15分钟那么精细，但至少捕捉到了"尾盘"这个时间维度，而不是把
+        全天成交量混在一起看。
+
+        返回：index为交易日日期（Timestamp，不含时间），value为该日尾盘量比。
+        取不到数据的日期不会出现在返回的Series里，调用方需要reindex处理。
+        """
+        if hourly_df is None or hourly_df.empty:
+            return pd.Series(dtype=float)
+
+        df = hourly_df.copy()
+        df["trade_date"] = df.index.date
+        last_bar_vol = df.groupby("trade_date")["Volume"].last().astype(float)
+        last_bar_vol.index = pd.to_datetime(last_bar_vol.index)
+
+        rolling_avg = last_bar_vol.rolling(lookback_days).mean()
+        ratio = (last_bar_vol / rolling_avg.replace(0, np.nan)).dropna()
+        return ratio
+
+    def evaluate(self, pit_df: pd.DataFrame, as_of: pd.Timestamp,
+                 hourly_df: Optional[pd.DataFrame] = None) -> dict:
         """
         pit_df: 已经point-in-time截止到as_of的完整日线历史（用于rolling(20)
                 有足够的热身数据，不是只传最近70天）
+        hourly_df: 可选的60分钟线数据（point-in-time，已截止到as_of）。
+                传入且cfg.use_hourly_vol_ratio=True时，会用它精确化"尾盘
+                时段量比"这个近似字段；不传或数据覆盖不到的日期，
+                自动回退到原有的日总成交量比例代理，不会报错。
         返回health_status(ready/watch/caution/accumulating)及诊断字段。
         """
         cfg = self.cfg
@@ -612,6 +779,16 @@ class DailyHealthEvaluator:
             vol_ma20_full = pit_df["Volume"].astype(float).rolling(20).mean()
             vol_ratio_proxy = (window["Volume"].astype(float)
                                 / vol_ma20_full.reindex(window.index)).fillna(0)
+
+            if cfg.use_hourly_vol_ratio and hourly_df is not None and not hourly_df.empty:
+                try:
+                    htf_ratio = self._build_hourly_vol_ratio(hourly_df)
+                    htf_reindexed = htf_ratio.reindex(window.index)
+                    has_htf = htf_reindexed.notna()
+                    if has_htf.any():
+                        vol_ratio_proxy = vol_ratio_proxy.where(~has_htf, htf_reindexed)
+                except Exception as e:
+                    self.logger.debug(f"60分钟量比精确化失败，回退到日总量比例代理: {e}")
 
             signals: list[str] = []
             warnings: list[str] = []
@@ -745,8 +922,25 @@ class OutcomeSimulator:
         atr = entry_price * atr14_pct / 100.0
         stop_loss = round(entry_price - self.stop_mult * atr, 4)
         take_profit = round(entry_price + self.target_mult * atr, 4)
+        result = self.simulate_with_levels(df_full, signal_date, entry_price,
+                                           stop_loss, take_profit, self.timeout_days)
+        if result is not None:
+            result["stop_loss_atr"] = stop_loss
+            result["take_profit_atr"] = take_profit
+        return result
 
-        future = df_full[df_full.index > signal_date].iloc[: self.timeout_days]
+    def simulate_with_levels(self, df_full: pd.DataFrame, signal_date: pd.Timestamp,
+                             entry_price: float, stop_loss: float, take_profit: float,
+                             timeout_days: Optional[int] = None) -> Optional[dict]:
+        """
+        通用出场判定：给定明确的入场价/止损价/止盈价（不管这三个数字是
+        怎么算出来的——ATR倍数、还是小时级变种策略自己的prior_high逻辑），
+        统一用同一套"未来交易日扫描"规则判定WIN/LOSS/TIMEOUT。
+        EOD回测（simulate()）和小时级变种策略（HourlyIntradayApprox）
+        共用这一个方法，避免两处判定逻辑各写一遍、以后改一个忘了改另一个。
+        """
+        td = timeout_days if timeout_days is not None else self.timeout_days
+        future = df_full[df_full.index > signal_date].iloc[:td]
         if future.empty:
             return None  # 右侧数据不足（信号太靠近历史数据末尾），视为PENDING，不计入统计
 
@@ -761,7 +955,7 @@ class OutcomeSimulator:
                 break
 
         if outcome is None:
-            if len(future) >= self.timeout_days:
+            if len(future) >= td:
                 out_date = future.index[-1]
                 out_price = float(future["Close"].iloc[-1])
                 outcome = "TIMEOUT"
@@ -781,8 +975,173 @@ class OutcomeSimulator:
             "holding_days": holding_days,
             "max_gain_pct": max_gain_pct,
             "max_loss_pct": max_loss_pct,
-            "stop_loss_atr": stop_loss,
-            "take_profit_atr": take_profit,
+        }
+
+
+# ════════════════════════════════════════════════════════════
+# 小时级变种策略 —— 用60分钟线近似intraday_monitor.py的三种入场模式
+#
+# ⚠️ 极其重要的边界声明（在这里、在所有输出、在报告里都会反复出现）：
+# 这不是对intraday_monitor.py的验证。intraday_monitor.py的三种模式
+# 是按15分钟颗粒度设计的（突破瞬间买要求"这一根15分钟K线"放量突破，
+# 尾盘确认买锁定15:30-15:45这个精确窗口）。用60分钟线重新实现，
+# 意味着：
+#   - 检测粒度从15分钟粗化到60分钟，反应速度系统性变慢
+#     （模式1本来是抓"瞬间"，60分钟版本要等一整根小时线走完才能确认，
+#     等于把生产系统里最看重的"快速反应"这个特性去掉了）
+#   - 阈值（成交量倍数、回踩深度、尾盘窗口容忍度）是重新估计的起点值，
+#     不是从生产系统的15分钟阈值直接套用（套用了也没意义，因为两种
+#     颗粒度下"正常"的成交量分布本来就不一样）
+#   - 尾盘窗口从精确的15:30-15:45变成粗略的"当天最后一根60分钟K线"
+#     （大概率覆盖15:00-16:00，比真实窗口宽得多）
+#
+# 结论：这是"用小时线数据能不能测出一个类似方向的策略"这个独立研究
+# 问题，测出来的胜率/盈亏，不能被解读成"intraday_monitor.py现在这样
+# 设计是对是错"。两者是不同的策略，只是概念上相似。
+# ════════════════════════════════════════════════════════════
+
+class HourlyIntradayApprox:
+    def __init__(self, cfg: BacktestConfig, logger: logging.Logger):
+        self.cfg = cfg
+        self.logger = logger
+
+    def _daily_reference(self, daily_pit_df: pd.DataFrame, as_of: pd.Timestamp) -> Optional[dict]:
+        """
+        复刻intraday_monitor.py的lock_daily_reference()逻辑：用as_of之前
+        （不含当天）的20个交易日算prior_high/prior_low/avg_vol_20d。
+        这一步完全基于日线数据，不受60分钟线2年窗口限制。
+        """
+        hist = daily_pit_df[daily_pit_df.index < as_of]
+        lookback = self.cfg.htf_breakout_lookback_days
+        if len(hist) < lookback:
+            return None
+        recent = hist.iloc[-lookback:]
+        return {
+            "prior_high": float(recent["High"].max()),
+            "prior_low": float(recent["Low"].min()),
+            "avg_vol_20d": float(recent["Volume"].mean()),
+        }
+
+    def detect(self, ticker: str, daily_pit_df: pd.DataFrame,
+               hourly_day_bars: pd.DataFrame, as_of: pd.Timestamp) -> Optional[dict]:
+        """
+        对某一只股票在某一天的60分钟K线序列，依次尝试三种模式
+        （突破→回踩→尾盘，和intraday_monitor.py的优先级顺序一致），
+        命中第一个就返回，都没命中返回None。
+
+        hourly_day_bars: 只包含"这一天"的60分钟K线（已按时间排序）。
+        """
+        ref = self._daily_reference(daily_pit_df, as_of)
+        if ref is None or hourly_day_bars is None or hourly_day_bars.empty:
+            return None
+
+        prior_high = ref["prior_high"]
+        prior_low = ref["prior_low"]
+        avg_vol_20d = ref["avg_vol_20d"]
+        cfg = self.cfg
+
+        bars = []
+        for ts, row in hourly_day_bars.iterrows():
+            try:
+                o, h, l, c, v = (float(row["Open"]), float(row["High"]),
+                                 float(row["Low"]), float(row["Close"]), float(row["Volume"]))
+            except Exception:
+                continue
+            bars.append({"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v})
+
+        if not bars:
+            return None
+
+        day_high = max(b["high"] for b in bars)
+        signal = (self._detect_breakout(bars, prior_high, cfg)
+                  or self._detect_pullback(bars, prior_high, cfg)
+                  or self._detect_late_session(bars, day_high, avg_vol_20d, cfg))
+        return signal
+
+    @staticmethod
+    def _detect_breakout(bars: list, prior_high: float, cfg: BacktestConfig) -> Optional[dict]:
+        """近似intraday_monitor.py的模式1（突破瞬间买），60分钟颗粒度版本。"""
+        if len(bars) < 2 or not prior_high:
+            return None
+        for i in range(1, len(bars)):
+            cur, prev = bars[i], bars[i - 1]
+            if prev["close"] >= prior_high:
+                continue  # 前一根已经在prior_high上方，不是"新"突破
+            if cur["close"] < prior_high:
+                continue
+            dollar_vol = cur["close"] * cur["volume"]
+            if dollar_vol < cfg.htf_min_dollar_volume:
+                continue
+            same_day_prior_bars = bars[:i]
+            baseline_vol = (sum(b["volume"] for b in same_day_prior_bars) / len(same_day_prior_bars)
+                           if same_day_prior_bars else cur["volume"])
+            vol_ratio = cur["volume"] / baseline_vol if baseline_vol > 0 else 0
+            if vol_ratio < cfg.htf_vol_spike_ratio:
+                continue
+            stop_loss = round(prior_high * (1 - cfg.htf_stop_buffer_pct), 4)
+            return {
+                "htf_mode": "breakout", "trigger_time": cur["time"],
+                "trigger_price": cur["close"], "stop_loss": stop_loss,
+                "vol_ratio": round(vol_ratio, 2),
+            }
+        return None
+
+    @staticmethod
+    def _detect_pullback(bars: list, prior_high: float, cfg: BacktestConfig) -> Optional[dict]:
+        """近似intraday_monitor.py的模式2（回踩确认买），60分钟颗粒度版本。"""
+        if len(bars) < 3 or not prior_high:
+            return None
+        breakout_idx = None
+        for i, b in enumerate(bars):
+            if b["close"] >= prior_high:
+                breakout_idx = i
+                break
+        if breakout_idx is None or breakout_idx >= len(bars) - 1:
+            return None
+
+        for i in range(breakout_idx + 1, len(bars)):
+            cur, prev = bars[i], bars[i - 1]
+            pullback_depth_pct = (prior_high - prev["low"]) / prior_high * 100
+            if prev["close"] >= prior_high:
+                continue
+            if pullback_depth_pct > cfg.htf_pullback_max_depth_pct:
+                continue
+            if cur["close"] <= prev["close"]:
+                continue
+            if cur["close"] < prior_high * (1 - cfg.htf_pullback_max_depth_pct / 100):
+                continue
+            recent_low = min(b["low"] for b in bars[max(0, i - 2):i + 1])
+            stop_loss = round(recent_low * (1 - cfg.htf_stop_buffer_pct), 4)
+            return {
+                "htf_mode": "pullback", "trigger_time": cur["time"],
+                "trigger_price": cur["close"], "stop_loss": stop_loss,
+                "pullback_depth_pct": round(pullback_depth_pct, 2),
+            }
+        return None
+
+    @staticmethod
+    def _detect_late_session(bars: list, day_high: float, avg_vol_20d: float,
+                             cfg: BacktestConfig) -> Optional[dict]:
+        """
+        近似intraday_monitor.py的模式3（尾盘确认买）。真实版本锁定
+        15:30-15:45这个精确窗口，60分钟线只能粗略地用"当天最后一根
+        K线"代替（通常覆盖15:00-16:00左右，比真实窗口宽得多）。
+        """
+        if len(bars) < 1 or not day_high:
+            return None
+        cur = bars[-1]
+        dist_from_high_pct = (day_high - cur["close"]) / day_high * 100
+        if dist_from_high_pct > cfg.htf_late_session_near_high_pct:
+            return None
+        bar_avg_vol = avg_vol_20d / 6 if avg_vol_20d else 0  # 一天约6根60分钟K线（10:00-16:00）
+        is_red_bar = cur["close"] < cur["open"]
+        if is_red_bar and bar_avg_vol > 0 and cur["volume"] > bar_avg_vol * 1.5:
+            return None
+        stop_loss = round(day_high * (1 - cfg.htf_stop_buffer_pct * 2), 4)
+        return {
+            "htf_mode": "late_session", "trigger_time": cur["time"],
+            "trigger_price": cur["close"], "stop_loss": stop_loss,
+            "dist_from_high_pct": round(dist_from_high_pct, 2),
         }
 
 
@@ -835,6 +1194,29 @@ REQUIRED_COLUMNS = {
     "health_signal_count", "health_warn_count",
 }
 
+# 小时级变种策略结果 —— 独立的表，独立的schema，跟signals_history_backtest
+# 完全不共享任何迁移逻辑，物理上分开存放，避免这个明确标注为"非验证性
+# 研究"的实验性数据，和EOD核心回测结果混在一次查询里被误读。
+HTF_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS intraday_htf_signals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker          TEXT    NOT NULL,
+    signal_date     TEXT    NOT NULL,
+    htf_mode        TEXT,
+    trigger_time    TEXT,
+    entry_price     REAL,
+    stop_loss       REAL,
+    outcome         TEXT    DEFAULT 'PENDING',
+    outcome_date    TEXT,
+    outcome_price   REAL,
+    outcome_pct     REAL,
+    holding_days    INTEGER,
+    param_set       TEXT    DEFAULT 'baseline',
+    run_timestamp   TEXT,
+    UNIQUE(ticker, signal_date, param_set)
+)
+"""
+
 # 断点续跑进度表：记录"这一天已经完整跑过"，与signals_history_backtest
 # 分开存储的原因——某一天完全没有候选信号是合法结果（T1-T4全部为空），
 # 这种情况signals_history_backtest不会写入任何行，如果只靠这张表判断
@@ -857,6 +1239,8 @@ class BacktestEngine:
         self.sig_gen = SignalGenerator(cfg, self.logger)
         self.sim = OutcomeSimulator(cfg, self.logger)
         self.health_eval = DailyHealthEvaluator(cfg, self.logger)
+        self.htf_approx = HourlyIntradayApprox(cfg, self.logger)
+        self._hourly_cache: dict[str, pd.DataFrame] = {}
 
     def _init_db(self, conn: sqlite3.Connection):
         """
@@ -877,6 +1261,7 @@ class BacktestEngine:
             conn.execute(f"ALTER TABLE signals_history_backtest RENAME TO {backup_name}")
         conn.execute(SCHEMA_SQL)
         conn.execute(PROGRESS_SCHEMA_SQL)
+        conn.execute(HTF_SCHEMA_SQL)
         conn.commit()
 
     def _run_key(self) -> str:
@@ -888,6 +1273,22 @@ class BacktestEngine:
         raw = f"{self.cfg.start_date}|{self.cfg.end_date}|{self.cfg.universe_source}|" \
               f"{self.cfg.universe_file}|{self.cfg.min_market_cap}|{self.cfg.param_set}"
         return raw
+
+    def _get_hourly(self, ticker: str) -> Optional[pd.DataFrame]:
+        """
+        懒加载 + 缓存60分钟线数据。只在实际需要时才请求（health层精确化
+        或小时级变种检测都只涉及Top10/Top3候选，不是整个universe），
+        避免给大部分根本进不了候选池的股票也发一次60分钟线请求，浪费
+        网络配额和时间。缓存None也算（避免对已知失败的ticker重复请求）。
+        """
+        if ticker in self._hourly_cache:
+            return self._hourly_cache[ticker]
+        df = self.data_layer.fetch_60m(
+            ticker, self.cfg.start_date, self.cfg.end_date,
+            max_days=self.cfg.yf_60m_max_days,
+        )
+        self._hourly_cache[ticker] = df
+        return df
 
     def run(self, tickers: list[str], max_minutes: Optional[float] = None):
         """
@@ -1074,7 +1475,12 @@ class BacktestEngine:
 
                 try:
                     pit_for_health = history[ticker][history[ticker].index <= day]
-                    health = self.health_eval.evaluate(pit_for_health, day)
+                    hourly_for_health = None
+                    if self.cfg.use_hourly_vol_ratio:
+                        full_hourly = self._get_hourly(ticker)
+                        if full_hourly is not None:
+                            hourly_for_health = full_hourly[full_hourly.index <= day]
+                    health = self.health_eval.evaluate(pit_for_health, day, hourly_for_health)
                 except Exception as e:
                     self.logger.debug(f"健康度评估异常 [{ticker}] {day.date()}: {e}")
                     health = {"health_status": None, "health_data_days": None,
@@ -1138,6 +1544,53 @@ class BacktestEngine:
                 """, rows)
                 total_written += len(rows)
                 total_selected += len(selected)
+
+            # ── 小时级变种策略检测（仅对Top3精选信号跑，独立写入
+            # intraday_htf_signals表，不进signals_history_backtest）──────
+            if self.cfg.include_hourly_intraday:
+                htf_rows = []
+                for s in selected:
+                    ticker = s["ticker"]
+                    try:
+                        hourly_full = self._get_hourly(ticker)
+                        if hourly_full is None or hourly_full.empty:
+                            continue
+                        day_bars = hourly_full[hourly_full.index.date == day.date()]
+                        if day_bars.empty:
+                            continue
+                        daily_pit = history[ticker][history[ticker].index <= day]
+                        sig = self.htf_approx.detect(ticker, daily_pit, day_bars, day)
+                        if sig is None:
+                            continue
+                        entry_price = sig["trigger_price"]
+                        stop_loss = sig["stop_loss"]
+                        stop_dist = abs(entry_price - stop_loss)
+                        take_profit = entry_price + stop_dist * 2  # 与intraday_monitor.py的1:2目标一致
+                        outcome_result = self.sim.simulate_with_levels(
+                            history[ticker], day, entry_price, stop_loss, take_profit,
+                            timeout_days=screener.BT_TIMEOUT_DAYS,
+                        )
+                        if outcome_result is None:
+                            continue
+                        htf_rows.append((
+                            ticker, str(day.date()), sig["htf_mode"],
+                            str(sig["trigger_time"]), entry_price, stop_loss,
+                            outcome_result["outcome"], outcome_result["outcome_date"],
+                            outcome_result["outcome_price"], outcome_result["outcome_pct"],
+                            outcome_result["holding_days"], self.cfg.param_set, run_ts,
+                        ))
+                    except Exception as e:
+                        self.logger.debug(f"小时级变种检测异常 [{ticker}] {day.date()}: {e}")
+
+                if htf_rows:
+                    conn.executemany("""
+                        INSERT OR IGNORE INTO intraday_htf_signals (
+                            ticker, signal_date, htf_mode, trigger_time,
+                            entry_price, stop_loss, outcome, outcome_date,
+                            outcome_price, outcome_pct, holding_days,
+                            param_set, run_timestamp
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, htf_rows)
 
             # 标记这一天已完整处理（无论有没有信号），供下次断点续跑判断
             conn.execute("INSERT OR IGNORE INTO backtest_progress VALUES (?, ?)",
@@ -1401,6 +1854,71 @@ class StatsReporter:
     def __init__(self, cfg: BacktestConfig, logger: logging.Logger):
         self.cfg = cfg
         self.logger = logger
+
+    def htf_report(self, push_telegram: bool = False):
+        """
+        小时级变种策略（HourlyIntradayApprox）的独立统计报告。
+        故意不并入report()里的主统计——这是一个明确标注为"非验证性
+        研究"的独立数据集，混在核心报告里容易让人误以为这是
+        intraday_monitor.py的验证结果。
+        """
+        buffer: list[str] = []
+
+        def emit(text: str) -> None:
+            print(text)
+            buffer.append(text)
+
+        if not os.path.exists(self.cfg.db_path):
+            emit("回测数据库还不存在")
+            if push_telegram:
+                send_telegram("\n".join(buffer), self.logger)
+            return
+
+        conn = sqlite3.connect(self.cfg.db_path)
+        try:
+            df = pd.read_sql_query("""
+                SELECT * FROM intraday_htf_signals
+                WHERE outcome != 'PENDING' AND param_set = ?
+            """, conn, params=[self.cfg.param_set])
+        except Exception as e:
+            emit(f"查询失败（可能还没跑过--include-hourly-intraday）: {e}")
+            conn.close()
+            if push_telegram:
+                send_telegram("\n".join(buffer), self.logger)
+            return
+        conn.close()
+
+        emit("\n" + "=" * 58)
+        emit(f"小时级变种策略报告 [参数集: {self.cfg.param_set}]")
+        emit("=" * 58)
+        emit("⚠️ 这不是intraday_monitor.py的验证结果。这是用60分钟线做的")
+        emit("一个反应速度慢得多的粗颗粒度变种策略，独立研究性质，")
+        emit("不能用来评判intraday_monitor.py现在的设计是否正确。")
+        emit("-" * 58)
+
+        if df.empty:
+            emit("暂无已结算的小时级变种信号")
+            emit("=" * 58)
+            if push_telegram:
+                send_telegram("\n".join(buffer), self.logger)
+            return
+
+        wins = (df["outcome"] == "WIN").astype(int).values
+        pcts = df["outcome_pct"].astype(float).values
+        win_rate = wins.mean()
+        emit(f"样本：{len(df)}笔")
+        emit(f"胜率：{win_rate:.1%}")
+        emit(f"平均单笔收益：{pcts.mean():+.2f}%")
+
+        emit("\n【按模式拆解】")
+        for mode, g in df.groupby("htf_mode"):
+            w = (g["outcome"] == "WIN").mean()
+            emit(f"  {mode}: 样本{len(g)}笔  胜率{w:.1%}  "
+                f"平均{g['outcome_pct'].astype(float).mean():+.2f}%")
+
+        emit("=" * 58)
+        if push_telegram:
+            send_telegram("\n".join(buffer), self.logger)
 
     def leaderboard(self, push_telegram: bool = False):
         """
@@ -1747,7 +2265,11 @@ def run_queue(queue_path: str, max_minutes: Optional[float], logger: logging.Log
     读一个纯文本队列文件，依次跑里面的实验。
 
     队列文件格式（逗号分隔，#开头的行和空行忽略）：
-        param_set_name,params_file,start_date,end_date,universe[,universe_file]
+        param_set_name,params_file,universe[,universe_file]
+
+    统一用标准测试窗口（今天倒推700天），不再支持每行单独指定
+    start_date/end_date——所有实验必须用同一个测试窗口，只有参数
+    在变，这样排行榜上的胜率对比才有意义。
 
     params_file留空表示用screener.py当前默认值(baseline)。
     params_file写相对路径时，相对的是队列文件所在目录（方便你把
@@ -1783,18 +2305,17 @@ def run_queue(queue_path: str, max_minutes: Optional[float], logger: logging.Log
             if not line or line.startswith("#"):
                 continue
             parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 5:
-                logger.warning(f"队列文件第{line_no}行格式不对（少于5个字段），跳过: {line}")
+            if len(parts) < 3:
+                logger.warning(f"队列文件第{line_no}行格式不对（少于3个字段），跳过: {line}")
                 continue
-            param_set_name, params_file, start_date, end_date, universe = parts[:5]
-            universe_file = parts[5] if len(parts) > 5 else ""
+            param_set_name, params_file, universe = parts[:3]
+            universe_file = parts[3] if len(parts) > 3 else ""
             if params_file and not os.path.isabs(params_file):
                 params_file = os.path.join(queue_dir, params_file)
             if universe_file and not os.path.isabs(universe_file):
                 universe_file = os.path.join(queue_dir, universe_file)
             entries.append({
                 "param_set_name": param_set_name, "params_file": params_file,
-                "start_date": start_date, "end_date": end_date,
                 "universe": universe, "universe_file": universe_file,
             })
 
@@ -1821,9 +2342,9 @@ def run_queue(queue_path: str, max_minutes: Optional[float], logger: logging.Log
         reset_screener_to_defaults()
 
         cfg = BacktestConfig(
-            start_date=entry["start_date"], end_date=entry["end_date"],
             universe_source=entry["universe"], universe_file=entry["universe_file"],
         )
+        resolve_standard_window(cfg, logger, explicitly_overridden=False)
 
         overrides = {}
         if entry["params_file"]:
@@ -1880,8 +2401,11 @@ def run_queue(queue_path: str, max_minutes: Optional[float], logger: logging.Log
 
 def main():
     parser = argparse.ArgumentParser(description="ASX Screener EOD历史回测引擎（复用screener.py真实逻辑）")
-    parser.add_argument("--start", default="2025-07-01")
-    parser.add_argument("--end", default="2026-07-01")
+    parser.add_argument("--start", default=None,
+                        help="不传则自动用标准窗口（今天倒推700天）。手动传了会跟标准窗口"
+                             "跑出来的其他实验不可直接比较，运行时会有明确提示")
+    parser.add_argument("--end", default=None,
+                        help="不传则自动用标准窗口（今天）。同上，手动传会有提示")
     parser.add_argument("--universe", choices=["watchlist", "file", "full"], default="watchlist")
     parser.add_argument("--universe-file", default="")
     parser.add_argument("--stats-only", action="store_true", help="跳过回测，只对已有backtest_results.db做统计")
@@ -1916,14 +2440,39 @@ def main():
                         help="把本次统计的完整交易明细导出为CSV（每笔交易一行），"
                              "配合--no-telegram以外的情况会同时把CSV推送到Telegram，"
                              "适合需要深挖分析时用（比纯文字/md更适合让Claude直接用代码分析）")
+    parser.add_argument("--disable-hourly-vol-ratio", action="store_true",
+                        help="关闭健康度层的60分钟线尾盘量比精确化（默认是标准方法论的一部分，"
+                             "始终开启；这个flag只在你明确想临时排除60分钟数据时使用）")
+    parser.add_argument("--disable-hourly-intraday", action="store_true",
+                        help="关闭小时级变种策略检测（默认是标准方法论的一部分，始终开启；"
+                             "这个flag只在你明确想临时跳过这部分时使用）")
     args = parser.parse_args()
 
     cfg = BacktestConfig(
         start_date=args.start, end_date=args.end,
         universe_source=args.universe, universe_file=args.universe_file,
         push_telegram=not args.no_telegram,
+        use_hourly_vol_ratio=not args.disable_hourly_vol_ratio,
+        include_hourly_intraday=not args.disable_hourly_intraday,
     )
     logger = setup_logging(cfg.log_path)
+
+    resolve_standard_window(cfg, logger, explicitly_overridden=bool(args.start or args.end))
+
+    if cfg.use_hourly_vol_ratio or cfg.include_hourly_intraday:
+        earliest_allowed = (pd.Timestamp.now().normalize()
+                            - pd.Timedelta(days=cfg.yf_60m_max_days))
+        if pd.Timestamp(cfg.start_date) < earliest_allowed:
+            msg = (f"🔴 --start={cfg.start_date} 早于60分钟线可用窗口"
+                   f"({earliest_allowed.date()}起)。当前开启了60分钟线相关功能"
+                   f"（默认开启，标准方法论的一部分），只在最近~{cfg.yf_60m_max_days}天内"
+                   f"有60分钟数据，请把--start改到{earliest_allowed.date()}或更晚，"
+                   f"或者加 --disable-hourly-vol-ratio --disable-hourly-intraday"
+                   f"只跑纯日线回测")
+            logger.error(msg)
+            if cfg.push_telegram:
+                send_telegram(msg, logger)
+            return
 
     # 顶层崩溃兜底：任何没被内层捕获的异常（比如resolve_universe本身出错、
     # 队列文件解析出错等），都在这里兜住，推一条Telegram报警，
@@ -2004,6 +2553,9 @@ def main():
             push_telegram=cfg.push_telegram,
             export_csv=args.export_csv or None,
         )
+
+        if cfg.include_hourly_intraday:
+            reporter.htf_report(push_telegram=cfg.push_telegram)
 
     except Exception as e:
         tb = traceback.format_exc()
