@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 backtest_engine.py
 ====================
@@ -277,6 +278,19 @@ class BacktestConfig:
     health_min_days_exhaustion: int = 10         # MIN_DAYS_FOR_EXHAUSTION
     health_lookback_days: int = 70               # load_daily_summaries的lookback_days
 
+    # ── daily_analysis.py v3.2新增：回调健康度判断（calc_pullback_health()），
+    # 产出pullback_healthy/pullback_bottoming两个新状态，跟原有
+    # ready/watch/caution/accumulating平级。这不是模式2那种"突破后
+    # 浅回踩"，是"确认趋势中8%-25%的深回调，判断是否健康"这个独立概念，
+    # 两套逻辑、两套参数，不要混用。──────────────────────────────────
+    health_pullback_min_depth_pct: float = 8.0      # PULLBACK_MIN_DEPTH_PCT
+    health_pullback_max_depth_pct: float = 25.0     # PULLBACK_MAX_DEPTH_PCT
+    health_pullback_vol_shrink_ratio: float = 0.8   # PULLBACK_VOL_SHRINK_RATIO（<=此值=健康缩量）
+    health_pullback_vol_danger_ratio: float = 1.3   # PULLBACK_VOL_DANGER_RATIO（>=此值=放量下跌）
+    health_pullback_lookback_days: int = 20         # PULLBACK_LOOKBACK_DAYS
+    health_bottom_close_pos_min: float = 0.60       # BOTTOM_CLOSE_POS_MIN
+    health_bottom_vol_uptick_min: float = 1.0       # BOTTOM_VOL_UPTICK_MIN
+
     # ── 60分钟线相关（yfinance对60m颗粒度的历史深度上限约730天，
     # 明显宽于15m/30m等更细颗粒度的60天上限）────────────────────────
     # 现在是标准测试方法论的一部分，默认开启（不再是可选的实验性flag）。
@@ -292,8 +306,11 @@ class BacktestConfig:
     include_hourly_intraday: bool = True
     htf_breakout_lookback_days: int = 20       # 对应intraday_monitor.py的BREAKOUT_LOOKBACK_DAYS
     htf_vol_spike_ratio: float = 1.5           # 对应VOL_SPIKE_RATIO_M1(1.8)，小时线成交量分布不同，起点估计值
-    htf_pullback_max_depth_pct: float = 6.0    # 对应PULLBACK_MAX_DEPTH_PCT(4.0)，小时线波动更大，起点估计值
-    htf_pullback_vol_shrink_ratio: float = 0.7  # 对应PULLBACK_VOL_SHRINK_RATIO
+    # 模式2专属（浅回踩+跨天，配合模式1突破——不是health层那种8%-25%深回调判断，
+    # 两套概念不要混，对应intraday_monitor.py v3的MODE2_*常量）
+    htf_mode2_pullback_max_depth_pct: float = 6.0     # 对应MODE2_PULLBACK_MAX_DEPTH_PCT(4.0)，小时线波动更大，起点估计值
+    htf_mode2_vol_shrink_ratio: float = 0.7            # 对应MODE2_PULLBACK_VOL_SHRINK_RATIO
+    htf_mode2_breakout_lookback_days: int = 5          # 对应MODE2_BREAKOUT_LOOKBACK_DAYS(跨天回踩窗口上限)
     htf_late_session_near_high_pct: float = 2.0  # 对应LATE_SESSION_NEAR_HIGH_PCT(1.5)
     htf_min_dollar_volume: float = 300_000.0   # 对应MIN_DOLLAR_VOLUME_INTRADAY
     htf_stop_buffer_pct: float = 0.005         # 对应intraday_monitor.py止损位的0.995/0.99这类缓冲
@@ -458,10 +475,20 @@ class DataLayer:
                 df = df[~df.index.duplicated(keep="first")]
                 df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
 
+                # 转成悉尼当地时间的挂钟数值后，去掉tz标记（tz_localize(None)）。
+                # 保留naive但去掉tz本身，是因为：日线数据（yfinance interval=1d）
+                # 返回的index本来就是tz-naive的，如果60分钟线这边保留
+                # tz-aware，后续所有"和日线的as_of时间戳比较"（比如
+                # hourly_full.index <= day）都会抛TypeError（tz-aware和
+                # tz-naive不能直接比较）——这个异常之前被下游的except
+                # Exception静默吞掉了，导致health_status全部变成None、
+                # 小时级变种功能全部失效，却没有任何报错，是这次回测里
+                # 目前为止最隐蔽的一个bug。修复后两边的时间戳都是naive，
+                # 数值上都代表悉尼当地时间，可以正确比较。
                 if df.index.tz is None:
-                    df.index = df.index.tz_localize("UTC").tz_convert(syd_tz)
+                    df.index = df.index.tz_localize("UTC").tz_convert(syd_tz).tz_localize(None)
                 else:
-                    df.index = df.index.tz_convert(syd_tz)
+                    df.index = df.index.tz_convert(syd_tz).tz_localize(None)
 
                 self._cache[key] = df
                 return df
@@ -678,14 +705,19 @@ class SignalGenerator:
 
 class DailyHealthEvaluator:
     """
-    近似复刻 daily_analysis.py 的跨日健康度判断，改用纯日线OHLCV实现
+    近似复刻 daily_analysis.py v3.2 的跨日健康度判断，改用纯日线OHLCV实现
     （真实系统读的是intraday_snapshots表，那是15分钟数据聚合出来的，
     只能回溯60天，没法做多年历史回测——这是绕开这个限制的近似方案）。
+
+    产出6种状态（与v3.2一一对应）：ready / watch / caution / accumulating
+    / pullback_healthy / pullback_bottoming。后两个是v3新增的"确认趋势中
+    的回调健康度判断"（calc_pullback_health()），不是反转策略，前提是
+    这只股票已经通过trend_strength_score筛选进入watchlist。
 
     没有直接 `import daily_analysis` 复用：该模块在导入时会执行
     `logging.basicConfig(handlers=[FileHandler("/home/ubuntu/logs/daily_analysis.log")])`，
     路径写死了，你VM上如果这个目录不存在或用户不是ubuntu，import会直接
-    FileNotFoundError把整个回测进程带崩。所以这里是把四个核心因子函数
+    FileNotFoundError把整个回测进程带崩。所以这里是把核心因子函数
     （它们本身是纯计算，不做I/O）逐行照抄，而不是运行时依赖那个文件。
     如果你之后把daily_analysis.py的日志路径改成可配置，可以换成真正
     import复用，避免两份代码以后走岔。
@@ -693,7 +725,8 @@ class DailyHealthEvaluator:
     与真实版本的核心差异（只有一处，其余字段定义/阈值/组合逻辑逐行一致）：
       close_vol_ratio —— 真实定义是"当天最后一个15分钟时段的成交量，
       相对这个具体时段历史均值的比值"，本质是"尾盘有没有放量"。
-      这里用"当天总成交量 / 20日平均总成交量"代替，丢失了"是不是尾盘
+      这里用"当天总成交量 / 20日平均总成交量"代替（若开启
+      use_hourly_vol_ratio则用60分钟线精确化），丢失了"是不是尾盘
       放量"这个时间维度，只保留"这天有没有放量"这个更粗的信号。
       如果某天放量发生在开盘但尾盘已萎缩，这个代理会误判为recent_spike，
       真实系统不会——这是唯一的系统性偏差来源。
@@ -746,6 +779,86 @@ class DailyHealthEvaluator:
         ratio = (last_bar_vol / rolling_avg.replace(0, np.nan)).dropna()
         return ratio
 
+    def _calc_pullback_health(self, window: pd.DataFrame) -> dict:
+        """
+        近似复刻daily_analysis.py v3.2的calc_pullback_health()。
+        判断"确认趋势中的健康回调"——不是反转策略，前提是这只股票已经
+        通过trend_strength_score筛选，这里只判断当前的回撤是健康缩量
+        还是危险放量，以及是否出现触底反弹信号。
+
+        逐行对应真实版本的字段：day_high→High, day_low→Low,
+        day_volume→Volume, close_proxy→Close。
+        """
+        cfg = self.cfg
+        result = {
+            "is_pullback": False, "is_healthy": False, "is_bottoming": False,
+            "depth_pct": 0.0, "recent_low": None, "vol_ratio": None,
+            "broke_ma50": False,
+        }
+        if len(window) < cfg.health_pullback_lookback_days:
+            return result
+
+        high_col = window["High"].astype(float)
+        low_col = window["Low"].astype(float)
+        close_col = window["Close"].astype(float)
+        vol_col = window["Volume"].astype(float)
+
+        recent_high = float(high_col.iloc[-cfg.health_pullback_lookback_days:].max())
+        if recent_high <= 0:
+            return result
+
+        current_close = float(close_col.iloc[-1])
+        depth_pct = round((recent_high - current_close) / recent_high * 100, 2)
+        result["depth_pct"] = depth_pct
+
+        if not (cfg.health_pullback_min_depth_pct <= depth_pct <= cfg.health_pullback_max_depth_pct):
+            return result
+
+        if len(close_col) >= 50:
+            ma50 = float(close_col.rolling(50).mean().iloc[-1])
+            if current_close < ma50:
+                result["broke_ma50"] = True
+                return result
+
+        result["is_pullback"] = True
+
+        high_idx_pos = int(high_col.iloc[-cfg.health_pullback_lookback_days:].values.argmax())
+        pullback_start_idx = len(window) - cfg.health_pullback_lookback_days + high_idx_pos
+        if pullback_start_idx >= len(window) - 1:
+            return result
+
+        pullback_period_low = low_col.iloc[pullback_start_idx:]
+        pullback_period_vol = vol_col.iloc[pullback_start_idx:]
+        pre_pullback_vol = vol_col.iloc[max(0, pullback_start_idx - 10):pullback_start_idx]
+
+        result["recent_low"] = round(float(pullback_period_low.min()), 4)
+
+        if len(pre_pullback_vol) > 0:
+            pre_avg = float(pre_pullback_vol.mean())
+            during_avg = float(pullback_period_vol.mean())
+            if pre_avg > 0:
+                vol_ratio = round(during_avg / pre_avg, 3)
+                result["vol_ratio"] = vol_ratio
+                if vol_ratio <= cfg.health_pullback_vol_shrink_ratio:
+                    result["is_healthy"] = True
+                elif vol_ratio >= cfg.health_pullback_vol_danger_ratio:
+                    result["is_healthy"] = False
+
+        if result["is_healthy"]:
+            today_high = float(high_col.iloc[-1])
+            today_low = float(low_col.iloc[-1])
+            today_vol = float(vol_col.iloc[-1])
+            prev_vol = float(vol_col.iloc[-2]) if len(vol_col) >= 2 else today_vol
+
+            day_range = today_high - today_low
+            close_pos = (current_close - today_low) / day_range if day_range > 0 else 0.5
+            vol_uptick = (today_vol / prev_vol) if prev_vol > 0 else 1.0
+
+            if close_pos >= cfg.health_bottom_close_pos_min and vol_uptick >= cfg.health_bottom_vol_uptick_min:
+                result["is_bottoming"] = True
+
+        return result
+
     def evaluate(self, pit_df: pd.DataFrame, as_of: pd.Timestamp,
                  hourly_df: Optional[pd.DataFrame] = None) -> dict:
         """
@@ -755,7 +868,9 @@ class DailyHealthEvaluator:
                 传入且cfg.use_hourly_vol_ratio=True时，会用它精确化"尾盘
                 时段量比"这个近似字段；不传或数据覆盖不到的日期，
                 自动回退到原有的日总成交量比例代理，不会报错。
-        返回health_status(ready/watch/caution/accumulating)及诊断字段。
+        返回health_status(ready/watch/caution/accumulating/
+        pullback_healthy/pullback_bottoming)及诊断字段（含
+        health_pullback_recent_low，供小时级变种模式4使用）。
         """
         cfg = self.cfg
         cutoff = as_of - pd.Timedelta(days=cfg.health_lookback_days)
@@ -765,6 +880,7 @@ class DailyHealthEvaluator:
         empty_result = {
             "health_status": "accumulating", "health_data_days": n_days,
             "health_signal_count": 0, "health_warn_count": 0,
+            "health_pullback_recent_low": None,
         }
         if n_days < cfg.health_min_days_analysis:
             return empty_result
@@ -831,12 +947,30 @@ class DailyHealthEvaluator:
             else:
                 warnings.append("振幅未见收窄")
 
-            # ── 价格结构因子 ──
-            price_slope = round(self._linreg_slope(close_proxy), 4)
-            if price_slope > 0:
-                signals.append("价格重心上移")
+            # ── 回调健康度判断（v3.2新增，优先于笼统的价格重心判断）──
+            # 严格对应daily_analysis.py v3.1/v3.2的修复：不再用price_slope
+            # 的正负作为是否检查回调的前置门槛（那样会被"暴涨后小幅回调"
+            # 的整体正斜率掩盖），calc_pullback_health()内部用最近20天
+            # 高点独立判断回撤幅度，应始终调用。
+            pullback_result = self._calc_pullback_health(window)
+
+            if pullback_result["is_bottoming"]:
+                signals.append(f"健康回调触底反弹信号(回撤{pullback_result['depth_pct']}%)")
+            elif pullback_result["is_healthy"]:
+                signals.append(f"健康回调中(回撤{pullback_result['depth_pct']}%,缩量)")
+            elif pullback_result["is_pullback"] and not pullback_result["is_healthy"]:
+                warnings.append(f"回调但非缩量(回撤{pullback_result['depth_pct']}%,非健康回调)")
+            elif pullback_result["depth_pct"] > cfg.health_pullback_max_depth_pct:
+                warnings.append(f"回撤{pullback_result['depth_pct']}%超过健康回调上限,存在反转风险")
+            elif pullback_result["broke_ma50"]:
+                warnings.append(f"回撤{pullback_result['depth_pct']}%但已跌破MA50,非健康回调")
             else:
-                warnings.append("价格重心未见上移")
+                # ── 价格结构因子（笼统判断，只在不处于回调状态时才用）──
+                price_slope = round(self._linreg_slope(close_proxy), 4)
+                if price_slope > 0:
+                    signals.append("价格重心上移")
+                else:
+                    warnings.append("价格重心未见上移")
 
             day_range = day_high - day_low
             valid = day_range > 0
@@ -873,7 +1007,13 @@ class DailyHealthEvaluator:
             sig_count = len(signals)
             warn_count = len(warnings)
 
-            if sig_count >= 4 and warn_count == 0:
+            # ── 状态判断：回调轨道优先于常规ready/watch/caution判断，
+            # 与daily_analysis.py v3.2的优先级逐行一致 ──
+            if pullback_result["is_bottoming"]:
+                status = "pullback_bottoming"
+            elif pullback_result["is_healthy"]:
+                status = "pullback_healthy"
+            elif sig_count >= 4 and warn_count == 0:
                 status = "ready"
             elif sig_count >= 3 and warn_count <= 1:
                 status = "watch"
@@ -885,9 +1025,10 @@ class DailyHealthEvaluator:
             return {
                 "health_status": status, "health_data_days": n_days,
                 "health_signal_count": sig_count, "health_warn_count": warn_count,
+                "health_pullback_recent_low": pullback_result.get("recent_low"),
             }
         except Exception as e:
-            self.logger.debug(f"健康度评估异常 as_of={as_of.date()}: {e}")
+            self.logger.warning(f"健康度评估异常(内部) as_of={as_of.date()}: {e}")
             return empty_result
 
 
@@ -978,10 +1119,10 @@ class OutcomeSimulator:
 
 
 # ════════════════════════════════════════════════════════════
-# 小时级变种策略 —— 用60分钟线近似intraday_monitor.py的三种入场模式
+# 小时级变种策略 —— 用60分钟线近似intraday_monitor.py v3的四种入场模式
 #
 # ⚠️ 极其重要的边界声明（在这里、在所有输出、在报告里都会反复出现）：
-# 这不是对intraday_monitor.py的验证。intraday_monitor.py的三种模式
+# 这不是对intraday_monitor.py的验证。intraday_monitor.py的四种模式
 # 是按15分钟颗粒度设计的（突破瞬间买要求"这一根15分钟K线"放量突破，
 # 尾盘确认买锁定15:30-15:45这个精确窗口）。用60分钟线重新实现，
 # 意味着：
@@ -994,6 +1135,20 @@ class OutcomeSimulator:
 #   - 尾盘窗口从精确的15:30-15:45变成粗略的"当天最后一根60分钟K线"
 #     （大概率覆盖15:00-16:00，比真实窗口宽得多）
 #
+# v3更新（对齐intraday_monitor.py v3的四模式+状态路由架构）：
+#   - 模式2从"同日内突破+回踩"改成跨天版本，用_breakout_memory这个
+#     实例状态记住"哪只股票哪天触发过模式1"，之后最多
+#     htf_mode2_breakout_lookback_days天内allowed尝试模式2
+#     （对应真实系统的last_breakout_date/last_breakout_price机制）
+#   - 新增模式4（回调确认买），依赖DailyHealthEvaluator算出的
+#     health_pullback_recent_low（8%-25%深回调的止损参考位），
+#     跟模式2那种"突破后浅回踩"是完全不同的概念
+#   - 新增状态路由：health_status="ready"才试模式1/2/3（突破轨道），
+#     health_status="pullback_bottoming"才试模式4（回调轨道），
+#     其他状态（watch/caution/accumulating/pullback_healthy/
+#     未知状态）一律不产生小时级信号——对应真实系统的路由逻辑，
+#     不是"每天对每只Top3都无脑跑三个模式"
+#
 # 结论：这是"用小时线数据能不能测出一个类似方向的策略"这个独立研究
 # 问题，测出来的胜率/盈亏，不能被解读成"intraday_monitor.py现在这样
 # 设计是对是错"。两者是不同的策略，只是概念上相似。
@@ -1003,6 +1158,10 @@ class HourlyIntradayApprox:
     def __init__(self, cfg: BacktestConfig, logger: logging.Logger):
         self.cfg = cfg
         self.logger = logger
+        # 跨天状态记忆：ticker -> {"date": 触发模式1那天, "price": 触发价}
+        # 供模式2（跨天回踩确认）使用，对应真实系统watchlist_db里的
+        # last_breakout_date/last_breakout_price字段
+        self._breakout_memory: dict[str, dict] = {}
 
     def _daily_reference(self, daily_pit_df: pd.DataFrame, as_of: pd.Timestamp) -> Optional[dict]:
         """
@@ -1022,16 +1181,22 @@ class HourlyIntradayApprox:
         }
 
     def detect(self, ticker: str, daily_pit_df: pd.DataFrame,
-               hourly_day_bars: pd.DataFrame, as_of: pd.Timestamp) -> Optional[dict]:
+               hourly_day_bars: pd.DataFrame, as_of: pd.Timestamp,
+               health_status: Optional[str] = None,
+               pullback_recent_low: Optional[float] = None) -> Optional[dict]:
         """
-        对某一只股票在某一天的60分钟K线序列，依次尝试三种模式
-        （突破→回踩→尾盘，和intraday_monitor.py的优先级顺序一致），
-        命中第一个就返回，都没命中返回None。
+        按health_status路由到对应轨道，跟intraday_monitor.py v3的
+        状态路由逻辑一致：
+          "ready"              → 突破轨道：模式1→模式2(跨天)→模式3
+          "pullback_bottoming" → 回调轨道：模式4
+          其他状态（含None/未知）→ 不产生信号
 
         hourly_day_bars: 只包含"这一天"的60分钟K线（已按时间排序）。
         """
         ref = self._daily_reference(daily_pit_df, as_of)
         if ref is None or hourly_day_bars is None or hourly_day_bars.empty:
+            return None
+        if health_status not in ("ready", "pullback_bottoming"):
             return None
 
         prior_high = ref["prior_high"]
@@ -1051,11 +1216,24 @@ class HourlyIntradayApprox:
         if not bars:
             return None
 
+        if health_status == "pullback_bottoming":
+            return self._detect_pullback_confirm(bars, pullback_recent_low, cfg)
+
+        # health_status == "ready"：突破轨道，模式1→模式2(跨天)→模式3
         day_high = max(b["high"] for b in bars)
-        signal = (self._detect_breakout(bars, prior_high, cfg)
-                  or self._detect_pullback(bars, prior_high, cfg)
-                  or self._detect_late_session(bars, day_high, avg_vol_20d, cfg))
-        return signal
+
+        signal = self._detect_breakout(bars, prior_high, cfg)
+        if signal is not None:
+            # 记住这次突破，供之后最多htf_mode2_breakout_lookback_days天内
+            # 的模式2（跨天回踩）使用
+            self._breakout_memory[ticker] = {"date": as_of, "price": signal["trigger_price"]}
+            return signal
+
+        signal = self._detect_pullback_crossday(ticker, bars, prior_high, as_of, cfg)
+        if signal is not None:
+            return signal
+
+        return self._detect_late_session(bars, day_high, avg_vol_20d, cfg)
 
     @staticmethod
     def _detect_breakout(bars: list, prior_high: float, cfg: BacktestConfig) -> Optional[dict]:
@@ -1085,36 +1263,73 @@ class HourlyIntradayApprox:
             }
         return None
 
-    @staticmethod
-    def _detect_pullback(bars: list, prior_high: float, cfg: BacktestConfig) -> Optional[dict]:
-        """近似intraday_monitor.py的模式2（回踩确认买），60分钟颗粒度版本。"""
-        if len(bars) < 3 or not prior_high:
-            return None
-        breakout_idx = None
-        for i, b in enumerate(bars):
-            if b["close"] >= prior_high:
-                breakout_idx = i
-                break
-        if breakout_idx is None or breakout_idx >= len(bars) - 1:
+    def _detect_pullback_crossday(self, ticker: str, bars: list, prior_high: float,
+                                  as_of: pd.Timestamp, cfg: BacktestConfig) -> Optional[dict]:
+        """
+        近似intraday_monitor.py v3的模式2（回踩确认买，跨天版）。
+        不再从当天bars里搜索突破点，改成读取self._breakout_memory里
+        之前某天记住的突破事件，跟真实系统读取
+        last_breakout_date/last_breakout_price的机制一致。
+        """
+        memory = self._breakout_memory.get(ticker)
+        if not memory or not prior_high:
             return None
 
-        for i in range(breakout_idx + 1, len(bars)):
+        days_since = (as_of.normalize() - memory["date"].normalize()).days
+        if days_since <= 0 or days_since > cfg.htf_mode2_breakout_lookback_days:
+            return None
+        if len(bars) < 2:
+            return None
+
+        for i in range(1, len(bars)):
             cur, prev = bars[i], bars[i - 1]
             pullback_depth_pct = (prior_high - prev["low"]) / prior_high * 100
             if prev["close"] >= prior_high:
                 continue
-            if pullback_depth_pct > cfg.htf_pullback_max_depth_pct:
+            if pullback_depth_pct > cfg.htf_mode2_pullback_max_depth_pct:
+                continue
+            if cur["close"] < prior_high * (1 - cfg.htf_mode2_pullback_max_depth_pct / 100):
                 continue
             if cur["close"] <= prev["close"]:
-                continue
-            if cur["close"] < prior_high * (1 - cfg.htf_pullback_max_depth_pct / 100):
                 continue
             recent_low = min(b["low"] for b in bars[max(0, i - 2):i + 1])
             stop_loss = round(recent_low * (1 - cfg.htf_stop_buffer_pct), 4)
             return {
-                "htf_mode": "pullback", "trigger_time": cur["time"],
+                "htf_mode": "pullback_crossday", "trigger_time": cur["time"],
                 "trigger_price": cur["close"], "stop_loss": stop_loss,
                 "pullback_depth_pct": round(pullback_depth_pct, 2),
+                "days_since_breakout": days_since,
+            }
+        return None
+
+    def _detect_pullback_confirm(self, bars: list, pullback_recent_low: Optional[float],
+                                 cfg: BacktestConfig) -> Optional[dict]:
+        """
+        近似intraday_monitor.py v3的模式4（回调确认买）。前提是
+        health_status已经是"pullback_bottoming"（DailyHealthEvaluator
+        已经判断过这是健康回调+触底反弹），这里只做两件事：
+          1. 硬性止损检查：今天有没有跌破回调最低点（pullback_recent_low）
+          2. 当日confirm：收盘位置强 + 温和放量
+        止损就是回调最低点本身，不加ATR缓冲——对应真实系统"跌破即视为
+        判断证伪"的设计。
+        """
+        if len(bars) < 2 or pullback_recent_low is None:
+            return None
+        for i in range(1, len(bars)):
+            cur, prev = bars[i], bars[i - 1]
+            if cur["close"] <= pullback_recent_low:
+                continue
+            day_range = cur["high"] - cur["low"]
+            close_pos = (cur["close"] - cur["low"]) / day_range if day_range > 0 else 0.5
+            if close_pos < cfg.health_bottom_close_pos_min:
+                continue
+            vol_uptick = (cur["volume"] / prev["volume"]) if prev["volume"] > 0 else 1.0
+            if vol_uptick < cfg.health_bottom_vol_uptick_min:
+                continue
+            return {
+                "htf_mode": "pullback_confirm", "trigger_time": cur["time"],
+                "trigger_price": cur["close"], "stop_loss": round(pullback_recent_low, 4),
+                "close_pos": round(close_pos, 2), "vol_uptick": round(vol_uptick, 2),
             }
         return None
 
@@ -1466,6 +1681,7 @@ class BacktestEngine:
                 continue
 
             selected_tickers = {s["ticker"] for s in selected}
+            health_by_ticker: dict[str, dict] = {}  # 供下面htf检测复用，避免重复计算
             rows = []
             for s in raw_top10:
                 ticker = s["ticker"]
@@ -1481,9 +1697,11 @@ class BacktestEngine:
                             hourly_for_health = full_hourly[full_hourly.index <= day]
                     health = self.health_eval.evaluate(pit_for_health, day, hourly_for_health)
                 except Exception as e:
-                    self.logger.debug(f"健康度评估异常 [{ticker}] {day.date()}: {e}")
+                    self.logger.warning(f"健康度评估异常 [{ticker}] {day.date()}: {e}")
                     health = {"health_status": None, "health_data_days": None,
-                              "health_signal_count": None, "health_warn_count": None}
+                              "health_signal_count": None, "health_warn_count": None,
+                              "health_pullback_recent_low": None}
+                health_by_ticker[ticker] = health
 
                 outcome_result = None
                 try:
@@ -1558,7 +1776,12 @@ class BacktestEngine:
                         if day_bars.empty:
                             continue
                         daily_pit = history[ticker][history[ticker].index <= day]
-                        sig = self.htf_approx.detect(ticker, daily_pit, day_bars, day)
+                        h = health_by_ticker.get(ticker, {})
+                        sig = self.htf_approx.detect(
+                            ticker, daily_pit, day_bars, day,
+                            health_status=h.get("health_status"),
+                            pullback_recent_low=h.get("health_pullback_recent_low"),
+                        )
                         if sig is None:
                             continue
                         entry_price = sig["trigger_price"]
@@ -1579,7 +1802,7 @@ class BacktestEngine:
                             outcome_result["holding_days"], self.cfg.param_set, run_ts,
                         ))
                     except Exception as e:
-                        self.logger.debug(f"小时级变种检测异常 [{ticker}] {day.date()}: {e}")
+                        self.logger.warning(f"小时级变种检测异常 [{ticker}] {day.date()}: {e}")
 
                 if htf_rows:
                     conn.executemany("""
@@ -1666,6 +1889,13 @@ def export_default_params(path: str, cfg: BacktestConfig, logger: logging.Logger
             "MIN_DAYS_FOR_ANALYSIS": cfg.health_min_days_analysis,
             "MIN_DAYS_FOR_EXHAUSTION": cfg.health_min_days_exhaustion,
             "LOOKBACK_DAYS": cfg.health_lookback_days,
+            "PULLBACK_MIN_DEPTH_PCT": cfg.health_pullback_min_depth_pct,
+            "PULLBACK_MAX_DEPTH_PCT": cfg.health_pullback_max_depth_pct,
+            "PULLBACK_VOL_SHRINK_RATIO": cfg.health_pullback_vol_shrink_ratio,
+            "PULLBACK_VOL_DANGER_RATIO": cfg.health_pullback_vol_danger_ratio,
+            "PULLBACK_LOOKBACK_DAYS": cfg.health_pullback_lookback_days,
+            "BOTTOM_CLOSE_POS_MIN": cfg.health_bottom_close_pos_min,
+            "BOTTOM_VOL_UPTICK_MIN": cfg.health_bottom_vol_uptick_min,
         },
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -1721,6 +1951,13 @@ def apply_param_overrides(overrides: dict, cfg: BacktestConfig, logger: logging.
             "MIN_DAYS_FOR_ANALYSIS": "health_min_days_analysis",
             "MIN_DAYS_FOR_EXHAUSTION": "health_min_days_exhaustion",
             "LOOKBACK_DAYS": "health_lookback_days",
+            "PULLBACK_MIN_DEPTH_PCT": "health_pullback_min_depth_pct",
+            "PULLBACK_MAX_DEPTH_PCT": "health_pullback_max_depth_pct",
+            "PULLBACK_VOL_SHRINK_RATIO": "health_pullback_vol_shrink_ratio",
+            "PULLBACK_VOL_DANGER_RATIO": "health_pullback_vol_danger_ratio",
+            "PULLBACK_LOOKBACK_DAYS": "health_pullback_lookback_days",
+            "BOTTOM_CLOSE_POS_MIN": "health_bottom_close_pos_min",
+            "BOTTOM_VOL_UPTICK_MIN": "health_bottom_vol_uptick_min",
         }
         for k, v in overrides["DAILY_HEALTH"].items():
             field = health_field_map.get(k)
