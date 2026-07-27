@@ -36,6 +36,24 @@
 #          （此前只匹配限速相关字符串，网络超时会被判定为不可重试）
 #        - screener.log路径从相对路径改为绝对路径（锚定脚本目录），
 #          与announcements.db/tier_validation.log保持一致
+#
+# v18.4（本轮修复）：
+#   5) get_asx_universe() 修复"No columns to parse from file"故障：
+#        - 根因：该函数此前直接用 pd.read_csv(url) 发起请求，走的是
+#          urllib默认UA（形如 Python-urllib/3.x），没有携带
+#          ASX_HEADERS（浏览器UA/Referer）。而本文件里所有其他对
+#          asx.com.au / markitdigital 的请求（_get、_extract_pdf_keywords
+#          等）都已经统一使用 requests + ASX_HEADERS。ASX站点的反爬
+#          （Akamai/WAF类）大概率对非浏览器UA或云主机IP返回空响应
+#          或拦截页，pandas对空内容解析会抛"No columns to parse from
+#          file"——这是一个"快速失败"（几乎瞬间返回），10次重试用的
+#          是完全相同的请求方式，自然次次失败，与真正的网络抖动
+#          （慢速超时）特征不同。
+#        - 修复：改为用 requests.get(url, headers=ASX_HEADERS) 获取
+#          文本内容，再用 pd.read_csv(io.StringIO(text)) 解析，与其余
+#          函数请求方式保持一致。
+#        - 同时在失败时记录HTTP状态码、Content-Type、正文前200字符，
+#          方便下次一旦再失败能立刻判断是"被拦截"还是"真断网"。
 # ============================================================
 
 import os, io, re, sys, time, logging, json, subprocess
@@ -729,21 +747,67 @@ def _get(url: str, params: dict = None, label: str = "") -> Optional[dict]:
 
 
 def get_asx_universe() -> list:
+    """
+    获取ASX全市场股票代码列表。
+
+    v18.4修复：此前用 pd.read_csv(url) 直接请求，走urllib默认UA，
+    未携带 ASX_HEADERS（浏览器UA/Referer），容易被ASX站点的反爬
+    拦截返回空内容/拦截页，导致pandas解析报"No columns to parse
+    from file"。现改为与全文件其余请求一致：requests+ASX_HEADERS
+    获取文本后再用pandas解析，并在失败时记录状态码/Content-Type/
+    正文片段，便于下次快速定位是"被拦截"还是"真断网"。
+    """
+    url = "https://www.asx.com.au/asx/research/ASXListedCompanies.csv"
+
     for attempt in range(1, NET_RETRY_MAX + 1):
         try:
-            df  = pd.read_csv(
-                "https://www.asx.com.au/asx/research/ASXListedCompanies.csv",
-                skiprows=1, encoding="latin1",
+            resp = requests.get(url, headers=ASX_HEADERS, timeout=TIMEOUT)
+            resp.raise_for_status()
+
+            content_type = resp.headers.get("Content-Type", "")
+            text         = resp.text
+
+            if not text or not text.strip():
+                log.warning(
+                    f"get_asx_universe第{attempt}次: 响应为空 "
+                    f"status={resp.status_code} content-type={content_type}"
+                )
+                raise ValueError("empty response body")
+
+            df = pd.read_csv(
+                io.StringIO(text), skiprows=1, encoding="latin1",
             )
             col = next((c for c in df.columns if "code" in c.lower()), None)
             if not col:
-                log.error("ASX列表列名未找到")
+                log.error(
+                    f"ASX列表列名未找到，实际列名={list(df.columns)} "
+                    f"status={resp.status_code} content-type={content_type} "
+                    f"正文片段={text[:200]!r}"
+                )
                 return []
+
             codes  = df[col].dropna().astype(str).str.strip()
             valid  = codes[codes.str.match(r"^[A-Z]{1,5}$")]
             result = [f"{c}.AX" for c in valid]
             log.info(f"ASX股票池：{len(result)} 只")
             return result
+
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt < NET_RETRY_MAX:
+                wait = NET_RETRY_WAIT * attempt
+                log.warning(f"get_asx_universe网络异常 第{attempt}次: {e}，{wait:.0f}s后重试...")
+                time.sleep(wait)
+            else:
+                log.error(f"get_asx_universe网络异常达到{NET_RETRY_MAX}次重试上限: {e}")
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "N/A"
+            body   = e.response.text[:200] if e.response is not None else ""
+            log.error(f"get_asx_universe HTTP错误 status={status} body={body!r}: {e}")
+            if attempt < NET_RETRY_MAX:
+                wait = NET_RETRY_WAIT * attempt
+                time.sleep(wait)
+            else:
+                log.error(f"get_asx_universe HTTP错误达到{NET_RETRY_MAX}次重试上限")
         except Exception as e:
             if attempt < NET_RETRY_MAX:
                 wait = NET_RETRY_WAIT * attempt
@@ -2969,7 +3033,7 @@ def run_report_flow(all_data: dict, market_snap: dict,
 def main() -> None:
     start = time.time()
     log.info("=" * 60)
-    log.info(f"ASX System v18.3 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
+    log.info(f"ASX System v18.4 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
     log.info("=" * 60)
 
     log.info("【Step 1】大盘快照...")
@@ -3025,7 +3089,7 @@ def main() -> None:
     log.info(f"ASX System 全部完成，总耗时：{elapsed} 分钟")
     log.info("=" * 60)
     send_telegram(
-        f"🏁 <b>ASX System v18.3 全部完成</b>\n"
+        f"🏁 <b>ASX System v18.4 全部完成</b>\n"
         f"📅 {date.today().isoformat()} | ⏱ 总耗时：{elapsed} 分钟\n"
         f"选股：{'跳过（大盘红灯）' if status == 'red' else f'Top{len(screener_signals)}已完成'}\n"
         f"SEO文章/信号JSON：{'已生成，见上方推送结果' if screener_signals else '跳过'}\n"
