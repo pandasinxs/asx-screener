@@ -1,5 +1,5 @@
 # ============================================================
-# ASX SYSTEM — screener.py  v18.5
+# ASX SYSTEM — screener.py  v18.3
 #
 # 流程一：EOD选股
 #   全市场K线 → T1-T4筛选 → Top3加权评分 → 新闻/公告时间线
@@ -855,10 +855,15 @@ def get_asx_universe() -> list:
             diag = ""
             if resp is not None:
                 try:
+                    # 注意：Python 3.12以前，f-string的{}表达式内部不允许
+                    # 出现反斜杠（如'\n'），所以先在f-string外面把转义处理
+                    # 好，再作为普通变量放进{}里，避免SyntaxError。
+                    resp_text_raw = resp.text or ""
+                    resp_snippet  = resp_text_raw[:300].replace("\n", "\\n")
                     diag = (f" status={resp.status_code} "
                             f"content-type={resp.headers.get('Content-Type','')!r} "
-                            f"content-length={len(resp.text or '')} "
-                            f"正文片段={(resp.text or '')[:300].replace(chr(10), '\\n')!r}")
+                            f"content-length={len(resp_text_raw)} "
+                            f"正文片段={resp_snippet!r}")
                 except Exception:
                     diag = " (无法读取resp诊断信息)"
             if attempt < NET_RETRY_MAX:
