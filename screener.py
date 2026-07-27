@@ -1,5 +1,5 @@
 # ============================================================
-# ASX SYSTEM — screener.py  v18.4
+# ASX SYSTEM — screener.py  v18.3
 #
 # 流程一：EOD选股
 #   全市场K线 → T1-T4筛选 → Top3加权评分 → 新闻/公告时间线
@@ -746,48 +746,89 @@ def _get(url: str, params: dict = None, label: str = "") -> Optional[dict]:
     return None
 
 
+ASX_DIRECTORY_URL = (
+    "https://asx.api.markitdigital.com/asx-research/1.0/"
+    "companies/directory/file?access_token=83ff96335c2d45a094df02a206a39ff4"
+)
+
 def get_asx_universe() -> list:
     """
     获取ASX全市场股票代码列表。
 
-    v18.4修复：此前用 pd.read_csv(url) 直接请求，走urllib默认UA，
-    未携带 ASX_HEADERS（浏览器UA/Referer），容易被ASX站点的反爬
-    拦截返回空内容/拦截页，导致pandas解析报"No columns to parse
-    from file"。现改为与全文件其余请求一致：requests+ASX_HEADERS
-    获取文本后再用pandas解析，并在失败时记录状态码/Content-Type/
-    正文片段，便于下次快速定位是"被拦截"还是"真断网"。
+    v18.4第一版修复（给www.asx.com.au加ASX_HEADERS）验证无效：加了
+    浏览器UA之后仍然复现一模一样的"No columns to parse from file"。
+
+    v18.5改动（本轮，用户提议+验证后采纳）：
+    不再请求前端网站 www.asx.com.au/asx/research/ASXListedCompanies.csv，
+    改用 asx.api.markitdigital.com 后端API的公司目录文件接口
+    （ASX_DIRECTORY_URL）。选择这个方案而不是继续排查前端URL的理由：
+      1) 这个域名+access_token本文件里已经在用（ASX_ANN_ALL公告接口、
+         PDF_DL_BASE公告PDF下载都走这个域名），过去一个月每天稳定
+         工作，不是新引入的未知依赖。
+      2) 已实测验证：直接请求该URL能拿到完整、格式正常的CSV
+         （表头 "ASX code","Company name","GICs industry group",
+         "Listing date","Market Cap"，且不像前端页面那样有反爬拦截）。
+      3) www.asx.com.au 是面向浏览器用户的前端站点，通常挂在跟API
+         子域名不同的WAF/反爬规则后面，这也是它"跑了一个月突然失效"
+         最可能的原因——前端站点的反爬策略随时可能调整，而已经在稳定
+         使用的后端API相对更可控。
+
+    注意：这个接口返回的CSV没有前端CSV那个"第一行说明文字"，因此不
+    再需要 skiprows=1；表头直接就是数据表头。
+
+    诊断日志部分保留：不管走到哪个分支失败，都把status_code、
+    content-type、content-length、正文前300字符打进日志，避免下次
+    出问题时又要靠猜。
     """
-    url = "https://www.asx.com.au/asx/research/ASXListedCompanies.csv"
+    url = ASX_DIRECTORY_URL
 
     for attempt in range(1, NET_RETRY_MAX + 1):
+        resp = None
         try:
             resp = requests.get(url, headers=ASX_HEADERS, timeout=TIMEOUT)
-            resp.raise_for_status()
+            status  = resp.status_code
+            ctype   = resp.headers.get("Content-Type", "")
+            text    = resp.text or ""
+            snippet = text[:300].replace("\n", "\\n")
 
-            content_type = resp.headers.get("Content-Type", "")
-            text         = resp.text
+            # 不完全信任HTTP状态码：有些WAF/反爬会用200返回验证页或
+            # 拦截页而不是403。这里额外做一次内容层面的健全性检查。
+            looks_like_csv = ("ASX code" in text) or (text.count(",") > 20 and "\n" in text)
 
-            if not text or not text.strip():
+            if status != 200 or not looks_like_csv:
                 log.warning(
-                    f"get_asx_universe第{attempt}次: 响应为空 "
-                    f"status={resp.status_code} content-type={content_type}"
+                    f"get_asx_universe第{attempt}次: 响应可疑 "
+                    f"status={status} content-type={ctype!r} "
+                    f"content-length={len(text)} 正文片段={snippet!r}"
                 )
-                raise ValueError("empty response body")
+                if attempt < NET_RETRY_MAX:
+                    wait = NET_RETRY_WAIT * attempt
+                    time.sleep(wait)
+                    continue
+                else:
+                    log.error(
+                        f"get_asx_universe达到{NET_RETRY_MAX}次重试上限（响应可疑）"
+                        f"最后一次 status={status} content-type={ctype!r} "
+                        f"正文片段={snippet!r}"
+                    )
+                    return []
 
-            df = pd.read_csv(
-                io.StringIO(text), skiprows=1, encoding="latin1",
-            )
+            df  = pd.read_csv(io.StringIO(text))
             col = next((c for c in df.columns if "code" in c.lower()), None)
             if not col:
                 log.error(
                     f"ASX列表列名未找到，实际列名={list(df.columns)} "
-                    f"status={resp.status_code} content-type={content_type} "
-                    f"正文片段={text[:200]!r}"
+                    f"status={status} content-type={ctype!r} 正文片段={snippet!r}"
                 )
                 return []
 
             codes  = df[col].dropna().astype(str).str.strip()
-            valid  = codes[codes.str.match(r"^[A-Z]{1,5}$")]
+            # v18.5修复：原正则 ^[A-Z]{1,5}$ 只匹配纯字母，会漏掉
+            # "10X""1AD""3DA""4DS""29M""88E""360"这类含数字的合法
+            # ASX代码——这些不是异常数据，是正常的上市代码格式，
+            # 之前每天都在被无声丢弃，相当于股票池长期缺了一块。
+            # 现改为允许字母+数字混合（含纯数字如"360"）。
+            valid  = codes[codes.str.match(r"^[A-Z0-9]{1,5}$")]
             result = [f"{c}.AX" for c in valid]
             log.info(f"ASX股票池：{len(result)} 只")
             return result
@@ -801,7 +842,7 @@ def get_asx_universe() -> list:
                 log.error(f"get_asx_universe网络异常达到{NET_RETRY_MAX}次重试上限: {e}")
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else "N/A"
-            body   = e.response.text[:200] if e.response is not None else ""
+            body   = e.response.text[:300] if e.response is not None else ""
             log.error(f"get_asx_universe HTTP错误 status={status} body={body!r}: {e}")
             if attempt < NET_RETRY_MAX:
                 wait = NET_RETRY_WAIT * attempt
@@ -809,12 +850,23 @@ def get_asx_universe() -> list:
             else:
                 log.error(f"get_asx_universe HTTP错误达到{NET_RETRY_MAX}次重试上限")
         except Exception as e:
+            # 即使是pandas等解析异常，也把resp的诊断信息带出来，不再让
+            # "No columns to parse from file"这种通用消息吞掉现场信息。
+            diag = ""
+            if resp is not None:
+                try:
+                    diag = (f" status={resp.status_code} "
+                            f"content-type={resp.headers.get('Content-Type','')!r} "
+                            f"content-length={len(resp.text or '')} "
+                            f"正文片段={(resp.text or '')[:300].replace(chr(10), '\\n')!r}")
+                except Exception:
+                    diag = " (无法读取resp诊断信息)"
             if attempt < NET_RETRY_MAX:
                 wait = NET_RETRY_WAIT * attempt
-                log.warning(f"get_asx_universe第{attempt}次失败: {e}，{wait:.0f}s后重试...")
+                log.warning(f"get_asx_universe第{attempt}次失败: {e}{diag}，{wait:.0f}s后重试...")
                 time.sleep(wait)
             else:
-                log.error(f"get_asx_universe达到{NET_RETRY_MAX}次重试上限: {e}")
+                log.error(f"get_asx_universe达到{NET_RETRY_MAX}次重试上限: {e}{diag}")
     return []
 
 
