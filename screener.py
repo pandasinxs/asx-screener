@@ -2155,7 +2155,7 @@ STRICT RULES:
 
 --------------------------------------------------
 
-📉 STRUCTURE (FIXED 4 TWEETS ONLY)
+📉 STRUCTURE
 
 TWEET 1 — CATALYST + MARKET INTERPRETATION
 1. HOOK: Force an immediate high-stakes opening using AI Token allocation/compute usage.
