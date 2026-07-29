@@ -2011,7 +2011,7 @@ BACKTEST BEFORE FINAL OUTPUT (MANDATORY EXECUTION)
 4. Verify the format meets the criteria of md files and output exactly one EN article + one ZH article + one slug.
 5. Verify every marker above is spelled exactly as specified.
 6. Skip any explanation of this process — output ONLY the final version, using the exact
-   marker format above."""
+   marker format in OUTPUT FORMAT session above."""
 
 
 def _parse_seo_article_response(raw_text: str, ticker: str,
