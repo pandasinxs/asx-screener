@@ -2169,11 +2169,11 @@ Deliver a high-hook, high-conviction trading observation backed by "AI compute p
 HOOK VARIATION ENGINE (Randomize 1 style per tweet to prevent fatigue):
 
 - Style A (High Stakes / Dump All): 
-  "Dumped my entire daily Token limit into [Ticker] today..."
+  For example "Dumped my entire daily Token limit into [Ticker] today..."
 - Style B (Hard Compute / Quant Audit): 
-  "Burned [8k-15k] Tokens running [liquidity/order-flow/decay] models on [Ticker]..."
+  For example "Burned [8k-15k] Tokens running [liquidity/order-flow/decay] models on [Ticker]..."
 - Style C (Model Stress-Test / Asymmetry Alert): 
-  "Maxed out my AI Token budget stress-testing [Ticker]—the model is flagging a massive structural disconnect..."
+  For example "Maxed out my AI Token budget stress-testing [Ticker]—the model is flagging a massive structural disconnect..."
 
 NO EXPLANATION RULE: 
 
