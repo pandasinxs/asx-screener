@@ -2158,10 +2158,10 @@ STRICT RULES:
 📉 STRUCTURE (FIXED 4 TWEETS ONLY)
 
 TWEET 1 — CATALYST + MARKET INTERPRETATION
-- HOOK: Force an immediate high-stakes opening using AI Token allocation/compute usage.
-- [Ticker] + [price move]
-- The immediate trigger (news / announcement / market attention)
-- What traders are suddenly pricing in
+1. HOOK: Force an immediate high-stakes opening using AI Token allocation/compute usage.
+2. Price move
+3. The immediate trigger (news / announcement / market attention)
+4. What traders are suddenly pricing in
 
 Goal:
 Deliver a high-hook, high-conviction trading observation backed by "AI compute proof-of-work".
