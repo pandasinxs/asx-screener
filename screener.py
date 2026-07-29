@@ -2158,15 +2158,26 @@ STRICT RULES:
 📉 STRUCTURE (FIXED 4 TWEETS ONLY)
 
 TWEET 1 — CATALYST + MARKET INTERPRETATION
+- HOOK: Force an immediate high-stakes opening using AI Token allocation/compute usage.
 - [Ticker] + [price move]
 - The immediate trigger (news / announcement / market attention)
 - What traders are suddenly pricing in
 
 Goal:
-Explain the first reaction
+Deliver a high-hook, high-conviction trading observation backed by "AI compute proof-of-work".
 
-SHARP OPINION RULE：
-Tweet 1 must contain a non-obvious trading observation.
+HOOK VARIATION ENGINE (Randomize 1 style per tweet to prevent fatigue):
+
+- Style A (High Stakes / Dump All): 
+  "Dumped my entire daily Token limit into [Ticker] today..."
+- Style B (Hard Compute / Quant Audit): 
+  "Burned [8k-15k] Tokens running [liquidity/order-flow/decay] models on [Ticker]..."
+- Style C (Model Stress-Test / Asymmetry Alert): 
+  "Maxed out my AI Token budget stress-testing [Ticker]—the model is flagging a massive structural disconnect..."
+
+NO EXPLANATION RULE: 
+
+- Never explain what Tokens or AI Workflows are. Treat Tokens purely as scarce compute currency you burned to audit this ticker.
 
 Focus on:
 - what market participants may be misunderstanding
