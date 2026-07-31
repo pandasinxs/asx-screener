@@ -1394,6 +1394,14 @@ CREATE TABLE IF NOT EXISTS signals_history_backtest (
     health_data_days    INTEGER,
     health_signal_count INTEGER,
     health_warn_count   INTEGER,
+    trend_strength_score REAL,
+    trend_sub_volume_multiple REAL,
+    trend_sub_near_52w_hi REAL,
+    trend_sub_ma_alignment REAL,
+    trend_sub_ma50_trend REAL,
+    trend_sub_hh_hl_structure REAL,
+    trend_sub_relative_strength REAL,
+    trend_sub_vwap_position REAL,
     param_set       TEXT    DEFAULT 'baseline',
     run_timestamp   TEXT,
     UNIQUE(ticker, signal_date, param_set)
@@ -1406,6 +1414,7 @@ CREATE TABLE IF NOT EXISTS signals_history_backtest (
 REQUIRED_COLUMNS = {
     "param_set", "health_status", "health_data_days",
     "health_signal_count", "health_warn_count",
+    "trend_strength_score", "trend_sub_relative_strength",
 }
 
 # 小时级变种策略结果 —— 独立的表，独立的schema，跟signals_history_backtest
@@ -1711,6 +1720,21 @@ class BacktestEngine:
                 except Exception as e:
                     self.logger.debug(f"simulate异常 [{ticker}] {day.date()}: {e}")
 
+                # trend_strength_score和它的7个子维度——_passes_tier()内部
+                # 调用calc_trend_strength_score()时会把这两样写回tech字典
+                # （也就是这里的s），之前没有导出，导致像"T2内部分数越高越差"
+                # 这种深挖分析没法精确定位到底是7个子维度里哪一个在拖后腿，
+                # 只能靠composite_score/persistence_score这些间接猜测。
+                sub_scores = s.get("trend_sub_scores") or {}
+                trend_strength_score = s.get("trend_strength_score")
+                sub_vol_mult = sub_scores.get("volume_multiple")
+                sub_near_52w = sub_scores.get("near_52w_hi")
+                sub_ma_align = sub_scores.get("ma_alignment")
+                sub_ma50_trend = sub_scores.get("ma50_trend")
+                sub_hh_hl = sub_scores.get("hh_hl_structure")
+                sub_rs = sub_scores.get("relative_strength")
+                sub_vwap = sub_scores.get("vwap_position")
+
                 if outcome_result is None:
                     # 右侧数据不足，无法评估结果，仍然把信号本身记下来（outcome=PENDING），
                     # 保持和真实signals_history一样"PENDING"的语义，供以后数据补齐后重跑
@@ -1725,6 +1749,8 @@ class BacktestEngine:
                         "PENDING", None, None, None, None, None, None,
                         health.get("health_status"), health.get("health_data_days"),
                         health.get("health_signal_count"), health.get("health_warn_count"),
+                        trend_strength_score, sub_vol_mult, sub_near_52w, sub_ma_align,
+                        sub_ma50_trend, sub_hh_hl, sub_rs, sub_vwap,
                         self.cfg.param_set, run_ts,
                     )
                 else:
@@ -1742,6 +1768,8 @@ class BacktestEngine:
                         outcome_result["max_loss_pct"],
                         health.get("health_status"), health.get("health_data_days"),
                         health.get("health_signal_count"), health.get("health_warn_count"),
+                        trend_strength_score, sub_vol_mult, sub_near_52w, sub_ma_align,
+                        sub_ma50_trend, sub_hh_hl, sub_rs, sub_vwap,
                         self.cfg.param_set, run_ts,
                     )
                 rows.append(row)
@@ -1756,8 +1784,11 @@ class BacktestEngine:
                         outcome, outcome_date, outcome_price, outcome_pct,
                         holding_days, max_gain_pct, max_loss_pct,
                         health_status, health_data_days, health_signal_count, health_warn_count,
+                        trend_strength_score, trend_sub_volume_multiple, trend_sub_near_52w_hi,
+                        trend_sub_ma_alignment, trend_sub_ma50_trend, trend_sub_hh_hl_structure,
+                        trend_sub_relative_strength, trend_sub_vwap_position,
                         param_set, run_timestamp
-                    ) VALUES ({",".join(["?"] * 30)})
+                    ) VALUES ({",".join(["?"] * 38)})
                 """, rows)
                 total_written += len(rows)
                 total_selected += len(selected)
