@@ -2,7 +2,7 @@
 """
 backtest_engine.py
 ====================
-ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2：复用screener.py真实逻辑版）
+ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.1：复用screener.py真实逻辑版）
 
 核心设计:
     本脚本不重新实现打分逻辑，而是直接 `import screener`，复用其中的
@@ -12,6 +12,24 @@ ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2：复用screen
 
     这意味着回测用的止盈止损/超时规则和你线上 signals_history 表完全一致，
     两者理论上可以合并统计（本脚本提供 --merge-live 选项做这件事）。
+
+v2.1改动（本轮修复，正式全市场700天回测前的检查中发现）：
+    1) 修复健康度评估的小时线日期对齐bug：原来用"hourly_full.index <= day"
+       比较，hourly_full的index是当天挂钟时间（如10:00/11:00），day是
+       日线index当天0点的时间戳，这个比较恒为False，导致"今天"这一天的
+       小时线K线永远被排除在_build_hourly_vol_ratio()之外，60分钟线
+       精确化尾盘量比这个功能对"今天"从未真正生效过，且不报错、不留痕。
+       改成按日期(.normalize())而非精确时间戳比较。
+    2) scan_day()性能重构（结果不变）：build_tech_summary()对同一只
+       股票同一天不受tier影响，原来"for tier: for ticker"两层循环导致
+       每只股票每天被重复计算最多4遍完全一样的技术指标。改成point-in-time
+       切片和build_tech_summary()只算一次，四层tier共用同一份tech字典，
+       "先到先得、T1优先"语义不变。
+    3) HourlyIntradayApprox._breakout_memory（模式2依赖的跨天突破记忆）
+       原来只存在进程内存里，--max-minutes分session续跑时会在进程重启后
+       丢失，导致跨进程边界附近的模式2信号被静默漏掉。新增
+       backtest_breakout_memory表持久化，引擎启动时按run_key恢复，
+       模式1触发时同步落盘。
 
 部署要求:
     本文件必须放在与 screener.py、watchlist_db.py 相同的目录下运行
@@ -628,50 +646,82 @@ class SignalGenerator:
         本身在跑但今天恰好没股票达标"是完全不同的两件事，必须让外层
         区分开，否则系统性bug会被伪装成"今天正常，只是没信号"，
         安安静静地跑完整个回测却一条有效数据都没产出。
+
+        v2.1性能重构（结果不变，只改循环结构）：build_tech_summary()
+        对同一只股票在同一天是完全不受tier影响的（只有_passes_tier()
+        内部的阈值/权重锚点才依赖tier），原实现是"for tier: for ticker"
+        两层循环，导致每只股票每天最多被重复算4遍完全一样的技术指标
+        （RSI/ADX/VWAP/ATR等）。全市场×700天×4层tier，这部分冗余计算
+        被放大了700倍。v2.1把point-in-time切片和build_tech_summary()
+        提到tier循环外面，每只股票每天只算一次，四层tier共用同一份
+        tech字典，只有_passes_tier()内部tier相关的判断才对每层重跑一次。
+
+        "先到先得、T1优先"的语义完全保留：对每只股票仍按TIERS列表顺序
+        （T1→T2→T3→T4）依次尝试，第一个通过的tier获胜，后面的tier不再
+        对这只股票尝试。
+
+        error_count/attempted_count的统计口径变化（不影响熔断机制的
+        判断结论）：原来是按(tier, ticker)这个组合计数，一只股票如果
+        在_passes_tier()异常，会在T1失败后仍去T2/T3/T4各自的循环里
+        重新构建tech、重新尝试（因为它从未被加入seen），异常会被重复
+        计数最多4次。v2.1改成每只股票每天只尝试一次：build_tech_summary
+        或任意一层_passes_tier抛异常就记一次错误、不再对该股票尝试其余
+        tier（calc_trend_strength_score()对同一份tech数据在不同tier下
+        只是数值锚点不同，不会出现"T1报错但T2不报错"这种情况，重试没有
+        意义，只是浪费算力）。新口径是attempted_count=当天尝试评估的
+        股票数，error_count=当天评估出错的股票数，语义上比旧口径更直接，
+        "全部失败"这个熔断判断条件（error_count==attempted_count）在
+        两种口径下都能正确触发。
         """
         xjo_slice = xjo_full[xjo_full.index <= as_of] if xjo_full is not None else None
         seen: dict[str, dict] = {}
         error_count = 0
         attempted_count = 0
 
-        for tier in screener.TIERS:
-            for ticker, df in history.items():
-                if ticker in seen:
-                    continue
-                pit_df = self.__class__._slice(df, as_of)
-                if len(pit_df) < self.cfg.min_history_days:
-                    continue
+        for ticker, df in history.items():
+            pit_df = self.__class__._slice(df, as_of)
+            if len(pit_df) < self.cfg.min_history_days:
+                continue
 
-                attempted_count += 1
-                try:
-                    tech = screener.build_tech_summary(pit_df, xjo_slice)
-                except Exception as e:
-                    error_count += 1
-                    self.logger.debug(f"build_tech_summary异常 [{ticker}] {as_of.date()}: {e}")
-                    continue
+            attempted_count += 1
+            try:
+                tech = screener.build_tech_summary(pit_df, xjo_slice)
+            except Exception as e:
+                error_count += 1
+                self.logger.debug(f"build_tech_summary异常 [{ticker}] {as_of.date()}: {e}")
+                continue
 
+            passed_tier = None
+            tier_errored = False
+            for tier in screener.TIERS:
                 try:
                     passed = screener._passes_tier(tech, tier)
                 except Exception as e:
                     error_count += 1
-                    self.logger.debug(f"_passes_tier异常 [{ticker}] {as_of.date()}: {e}")
-                    continue
-
-                if not passed:
-                    continue
-
-                tech["ticker"] = ticker
-                tech["tier_level"] = tier["level"]
-                tech["tier_label"] = tier["label"]
-                try:
-                    tech["persistence_score"] = screener._check_trend_persistence(
-                        tech["_close"], tech["_adx_s"], tech["_pdi_s"], tech["_mdi_s"]
+                    tier_errored = True
+                    self.logger.debug(
+                        f"_passes_tier异常 [{ticker}] {as_of.date()} tier={tier['level']}: {e}"
                     )
-                except Exception:
-                    tech["persistence_score"] = 0.0
+                    break  # 同一份tech数据，其余tier大概率会遇到同样的异常，不再重试
+                if passed:
+                    passed_tier = tier
+                    break
 
-                tech["catalyst"] = 0.0  # 历史回测无法重建公告驱动因子，诚实置0
-                seen[ticker] = tech
+            if tier_errored or passed_tier is None:
+                continue
+
+            tech["ticker"] = ticker
+            tech["tier_level"] = passed_tier["level"]
+            tech["tier_label"] = passed_tier["label"]
+            try:
+                tech["persistence_score"] = screener._check_trend_persistence(
+                    tech["_close"], tech["_adx_s"], tech["_pdi_s"], tech["_mdi_s"]
+                )
+            except Exception:
+                tech["persistence_score"] = 0.0
+
+            tech["catalyst"] = 0.0  # 历史回测无法重建公告驱动因子，诚实置0
+            seen[ticker] = tech
 
         if not seen:
             return [], [], error_count, attempted_count
@@ -1453,6 +1503,24 @@ CREATE TABLE IF NOT EXISTS backtest_progress (
 )
 """
 
+# 跨天突破记忆持久化表（v2.1新增）——HourlyIntradayApprox._breakout_memory
+# 原来只是一个进程内存字典，模式2（跨天回踩确认）依赖它记住"哪只股票哪天
+# 触发过模式1"。全市场+700天+小时线默认开启，大概率要分多个session
+# （--max-minutes）才能跑完，每次进程重启这个字典都会被重新初始化成空的，
+# 导致跨进程边界附近的模式2信号被静默漏掉（不报错，只是样本变少）。
+# 这张表按run_key（同backtest_progress的隔离粒度）持久化每只股票最近一次
+# 模式1触发的日期和价格，引擎启动时加载进内存，模式1触发时写回DB，
+# 让断点续跑不再丢失这部分状态。
+BREAKOUT_MEMORY_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS backtest_breakout_memory (
+    run_key         TEXT NOT NULL,
+    ticker          TEXT NOT NULL,
+    breakout_date   TEXT NOT NULL,
+    breakout_price  REAL NOT NULL,
+    PRIMARY KEY (run_key, ticker)
+)
+"""
+
 
 class BacktestEngine:
     def __init__(self, cfg: BacktestConfig):
@@ -1485,6 +1553,7 @@ class BacktestEngine:
         conn.execute(SCHEMA_SQL)
         conn.execute(PROGRESS_SCHEMA_SQL)
         conn.execute(HTF_SCHEMA_SQL)
+        conn.execute(BREAKOUT_MEMORY_SCHEMA_SQL)
         conn.commit()
 
     def _run_key(self) -> str:
@@ -1582,6 +1651,27 @@ class BacktestEngine:
         self._init_db(conn)
         run_ts = datetime.now().isoformat()
         run_key = self._run_key()
+
+        # ── 恢复跨天突破记忆（模式2需要，v2.1新增）：如果这个run_key之前
+        # 跑过部分交易日（断点续跑场景），把之前session里记录的"哪只股票
+        # 哪天突破过"读回内存，避免进程重启导致模式2在续跑的头几天里
+        # 静默失效 ──────────────────────────────────────────────
+        try:
+            memory_rows = conn.execute(
+                "SELECT ticker, breakout_date, breakout_price "
+                "FROM backtest_breakout_memory WHERE run_key = ?",
+                (run_key,),
+            ).fetchall()
+            for m_ticker, m_date, m_price in memory_rows:
+                self.htf_approx._breakout_memory[m_ticker] = {
+                    "date": pd.Timestamp(m_date), "price": m_price,
+                }
+            if memory_rows:
+                self.logger.info(f"跨天突破记忆已恢复：{len(memory_rows)}条 "
+                                  f"（run_key={run_key}），模式2可以正常识别断点前的突破事件")
+        except Exception as e:
+            self.logger.warning(f"跨天突破记忆恢复失败（不影响主流程，"
+                                 f"续跑头几天的模式2可能会缺失记忆）: {e}")
 
         # ── 断点续跑：跳过本次run_key下已经完整处理过的交易日 ──────────
         done_rows = conn.execute(
@@ -1703,7 +1793,16 @@ class BacktestEngine:
                     if self.cfg.use_hourly_vol_ratio:
                         full_hourly = self._get_hourly(ticker)
                         if full_hourly is not None:
-                            hourly_for_health = full_hourly[full_hourly.index <= day]
+                            # v2.1修复：full_hourly的index是当天挂钟时间（如10:00/
+                            # 11:00/.../16:00），而day是日线index，是当天0点的
+                            # 时间戳。原来"<= day"的比较是"10:00:00 <= 00:00:00"，
+                            # 恒为False——导致"今天"这一天的小时线K线永远被排除在
+                            # 健康度评估之外，_build_hourly_vol_ratio()里最关键的
+                            # recent_ratio.tail(3)吃不到当天数据，60分钟线精确化
+                            # 尾盘量比这个功能对"今天"从未真正生效过，静默回退到
+                            # 粗糙的日总量比例代理，且不报错、不留痕。改成按日期
+                            # （而非精确时间戳）比较，正确包含当天全部小时线K线。
+                            hourly_for_health = full_hourly[full_hourly.index.normalize() <= day]
                     health = self.health_eval.evaluate(pit_for_health, day, hourly_for_health)
                 except Exception as e:
                     self.logger.warning(f"健康度评估异常 [{ticker}] {day.date()}: {e}")
@@ -1797,6 +1896,7 @@ class BacktestEngine:
             # intraday_htf_signals表，不进signals_history_backtest）──────
             if self.cfg.include_hourly_intraday:
                 htf_rows = []
+                breakout_memory_rows = []
                 for s in selected:
                     ticker = s["ticker"]
                     try:
@@ -1815,6 +1915,17 @@ class BacktestEngine:
                         )
                         if sig is None:
                             continue
+
+                        # v2.1新增：模式1（突破）触发时，HourlyIntradayApprox.
+                        # detect()内部已经把这次突破写进了self.htf_approx.
+                        # _breakout_memory这个内存字典（供模式2跨天回踩使用）。
+                        # 这里同步落盘，让下次进程重启（--max-minutes断点续跑）
+                        # 也能读到这次突破事件，不再只依赖单次进程的生命周期。
+                        if sig["htf_mode"] == "breakout":
+                            breakout_memory_rows.append((
+                                run_key, ticker, str(day.date()), sig["trigger_price"],
+                            ))
+
                         entry_price = sig["trigger_price"]
                         stop_loss = sig["stop_loss"]
                         stop_dist = abs(entry_price - stop_loss)
@@ -1844,6 +1955,18 @@ class BacktestEngine:
                             param_set, run_timestamp
                         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, htf_rows)
+
+                if breakout_memory_rows:
+                    try:
+                        conn.executemany("""
+                            INSERT OR REPLACE INTO backtest_breakout_memory
+                                (run_key, ticker, breakout_date, breakout_price)
+                            VALUES (?, ?, ?, ?)
+                        """, breakout_memory_rows)
+                    except Exception as e:
+                        self.logger.warning(f"跨天突破记忆落盘失败 {day.date()}: {e}"
+                                             f"（不影响本次进程内存中的记忆，仅影响下次"
+                                             f"进程重启后的续跑）")
 
             # 标记这一天已完整处理（无论有没有信号），供下次断点续跑判断
             conn.execute("INSERT OR IGNORE INTO backtest_progress VALUES (?, ?)",
