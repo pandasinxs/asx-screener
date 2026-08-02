@@ -2051,6 +2051,21 @@ def export_default_params(path: str, cfg: BacktestConfig, logger: logging.Logger
             "BOTTOM_CLOSE_POS_MIN": cfg.health_bottom_close_pos_min,
             "BOTTOM_VOL_UPTICK_MIN": cfg.health_bottom_vol_uptick_min,
         },
+        # v2.1新增：HTF（小时级变种策略）参数——之前这组cfg字段没有接入
+        # 覆盖系统，params.json完全改不动它们。补上后跟DAILY_HEALTH是
+        # 同一套机制：JSON里的HTF字段名对应intraday_monitor.py的真实
+        # 常量名（方便你对照两边），apply_param_overrides()内部再映射回
+        # cfg.htf_*这些实际字段。
+        "HTF": {
+            "BREAKOUT_LOOKBACK_DAYS": cfg.htf_breakout_lookback_days,
+            "VOL_SPIKE_RATIO": cfg.htf_vol_spike_ratio,
+            "MODE2_PULLBACK_MAX_DEPTH_PCT": cfg.htf_mode2_pullback_max_depth_pct,
+            "MODE2_VOL_SHRINK_RATIO": cfg.htf_mode2_vol_shrink_ratio,
+            "MODE2_BREAKOUT_LOOKBACK_DAYS": cfg.htf_mode2_breakout_lookback_days,
+            "LATE_SESSION_NEAR_HIGH_PCT": cfg.htf_late_session_near_high_pct,
+            "MIN_DOLLAR_VOLUME": cfg.htf_min_dollar_volume,
+            "STOP_BUFFER_PCT": cfg.htf_stop_buffer_pct,
+        },
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -2120,6 +2135,25 @@ def apply_param_overrides(overrides: dict, cfg: BacktestConfig, logger: logging.
                 continue
             setattr(cfg, field, v)
             logger.info(f"覆盖 DAILY_HEALTH.{k} -> {v}")
+
+    if "HTF" in overrides:
+        htf_field_map = {
+            "BREAKOUT_LOOKBACK_DAYS": "htf_breakout_lookback_days",
+            "VOL_SPIKE_RATIO": "htf_vol_spike_ratio",
+            "MODE2_PULLBACK_MAX_DEPTH_PCT": "htf_mode2_pullback_max_depth_pct",
+            "MODE2_VOL_SHRINK_RATIO": "htf_mode2_vol_shrink_ratio",
+            "MODE2_BREAKOUT_LOOKBACK_DAYS": "htf_mode2_breakout_lookback_days",
+            "LATE_SESSION_NEAR_HIGH_PCT": "htf_late_session_near_high_pct",
+            "MIN_DOLLAR_VOLUME": "htf_min_dollar_volume",
+            "STOP_BUFFER_PCT": "htf_stop_buffer_pct",
+        }
+        for k, v in overrides["HTF"].items():
+            field = htf_field_map.get(k)
+            if field is None:
+                logger.warning(f"HTF里的未知字段 {k}，忽略")
+                continue
+            setattr(cfg, field, v)
+            logger.info(f"覆盖 HTF.{k} -> {v}")
 
 
 def resolve_param_set_name(params_file: str, explicit_name: str) -> str:
