@@ -90,4 +90,7 @@
     "BOTTOM_CLOSE_POS_MIN": 0.6,
     "BOTTOM_VOL_UPTICK_MIN": 1.0
   }
+  "HTF": {
+  "LATE_SESSION_NEAR_HIGH_PCT": 0.7
+  }
 }
