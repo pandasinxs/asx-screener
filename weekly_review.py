@@ -1,8 +1,8 @@
 # ============================================================
-# ASX SYSTEM — weekly_review.py  v2
+# ASX SYSTEM — weekly_review.py  v3
 #
-# 月报（原周报，跨度从7天拉长到30天）：只看EOD screener.py选出的
-# Top3表现，不再包含落选候选和intraday信号（v1里有，v2按需求砍掉）。
+# 月报：只看EOD screener.py选出的Top3表现，不含落选候选和
+# intraday信号。
 #
 #   对每一个Top3入选：
 #     1) 已经resolve成WIN/LOSS/TIMEOUT的，直接读screener.py自己
@@ -15,27 +15,29 @@
 #           "(含离场后走势，仅供参考)"，避免误读成"系统抓住了这个
 #           高点"
 #
-# v1 → v2 变更：
-#   - REVIEW_DAYS: 7 → 30
-#   - 砍掉落选候选（is_selected=0）展示，SQL直接WHERE is_selected=1
-#   - 砍掉intraday_signals_log整块（build_intraday_section等）
-#   - 新增 get_price_stats_since()：入选日至今的区间最高/最低价+日期
-#   - 效率优化：不再单独调fast_info查"现价"，直接复用区间日线数据
-#     最后一根收盘价（周报固定周六跑，此时市场已收盘，两者等价，
-#     省一次网络请求，Top3拉到30天后单只股票可能到60+条，减少请求
-#     量能降低被yfinance限流的风险）
-#   - 投递方式：原来是HTML文本按4000字符分段发sendMessage；30天
-#     60+条记录太长，改成生成.txt文件用sendDocument整个推送，
-#     Telegram消息本身只带一句caption
-#   - 报告文件本地留档在 weekly_reports/ 子目录（体积很小，一年
-#     52份也就几百KB，留着方便你回溯，不做自动清理）
+# v2 → v3 变更（起因：拿v2输出的报告手动喂给LLM生成社媒文案，
+# LLM心算37笔outcome_pct的平均值算错了0.3个百分点——这种类型
+# 的错误不报错、不崩溃，光看报告和文案表面结构完全看不出来，
+# 属于典型的silent wrong number）：
+#   - 新增 compute_summary_stats() + build_summary_block()：
+#     去重股票数、已平仓/PENDING拆分、WIN/LOSS/TIMEOUT计数、
+#     胜率、平均收益、最大单笔盈亏，全部用Python确定性算好，
+#     放在报告最前面。后续生成社媒文案的prompt要求直接引用
+#     这个区块的数字，不允许LLM自己重新求和/心算
+#   - build_eod_section()底部原来的"已平仓X只/进行中Y只"删掉了
+#     （单位本来就用错了——那是笔数不是股票数，现在统一由汇总
+#     区块出，只有一处，不会两个数字打架）
+#   - 说明区块加了一条：入选后期（接近月报窗口右边界）的信号
+#     多数还是PENDING，是因为screener.py固定的20个交易日resolve
+#     窗口还没到期，不是系统卡住，避免被误读成"选了没结果"
 #
 # 触发方式不变：
 #   1) crontab周六自动跑一次
 #   2) bot.py的/weekly命令通过run_script()调用
 #
-# 明确不做的事（跟v1一致）：
-#   - 不判定"最终胜率"（意义不大，样本大部分还没跑完）
+# 明确不做的事：
+#   - 不判定跨月度的"最终胜率"趋势（意义不大，样本本身有右侧
+#     截断偏差，参见上面的resolve窗口说明）
 #   - 不做intraday信号的WIN/LOSS/TIMEOUT持久化结果记录
 # ============================================================
 
@@ -205,6 +207,76 @@ def query_eod_top3(days: int = REVIEW_DAYS) -> list:
         return []
 
 
+def compute_summary_stats(rows: list) -> dict:
+    """
+    去重＋汇总统计，在这里用Python确定性算好，不依赖后续任何
+    人工或LLM在生成文案时自己去重/求平均——37笔outcome_pct的
+    平均值，人心算或LLM心算都很容易算错个零点几个百分点，而且
+    这种错误报告本身和文案结构看起来都完全正常，属于典型的
+    "silent wrong number"，比脚本直接崩溃更难发现、也更容易
+    在发出去之后才被读者挑出来。
+
+    返回None的字段表示样本不足（比如没有任何已平仓记录），
+    调用方要处理这个情况。
+    """
+    distinct_tickers = len(set(r["ticker"] for r in rows))
+    total_signals = len(rows)
+
+    resolved = [r for r in rows if r["outcome"] and r["outcome"] != "PENDING"]
+    pending_count = total_signals - len(resolved)
+
+    win = [r for r in resolved if r["outcome"] == "WIN"]
+    loss = [r for r in resolved if r["outcome"] == "LOSS"]
+    timeout = [r for r in resolved if r["outcome"] == "TIMEOUT"]
+
+    pct_values = [r["outcome_pct"] for r in resolved if r.get("outcome_pct") is not None]
+    avg_pct = round(sum(pct_values) / len(pct_values), 2) if pct_values else None
+    win_rate = round(len(win) / len(resolved) * 100, 1) if resolved else None
+
+    valid = [r for r in resolved if r.get("outcome_pct") is not None]
+    best = max(valid, key=lambda r: r["outcome_pct"]) if valid else None
+    worst = min(valid, key=lambda r: r["outcome_pct"]) if valid else None
+
+    return {
+        "distinct_tickers": distinct_tickers,
+        "total_signals": total_signals,
+        "resolved_count": len(resolved),
+        "pending_count": pending_count,
+        "win_count": len(win),
+        "loss_count": len(loss),
+        "timeout_count": len(timeout),
+        "win_rate": win_rate,
+        "avg_pct": avg_pct,
+        "best": best,
+        "worst": worst,
+    }
+
+
+def build_summary_block(stats: dict) -> str:
+    """
+    渲染成文本区块，放在报告最前面。后续喂给LLM生成社媒文案的
+    prompt要求直接抄这里的数字，不允许重新求和/心算。
+    """
+    if stats["resolved_count"] == 0:
+        return (f"去重股票数:{stats['distinct_tickers']}  总信号数:{stats['total_signals']}\n"
+                f"本期尚无已平仓记录，暂不计算胜率/平均收益。")
+
+    lines = [
+        f"去重股票数:{stats['distinct_tickers']}   总信号数:{stats['total_signals']}",
+        f"已平仓:{stats['resolved_count']}笔（WIN {stats['win_count']} / "
+        f"LOSS {stats['loss_count']} / TIMEOUT {stats['timeout_count']}）"
+        f"   进行中:{stats['pending_count']}笔",
+        f"胜率:{stats['win_rate']}%   平均收益(已平仓):{stats['avg_pct']:+.2f}%",
+    ]
+    if stats["best"] is not None:
+        b = stats["best"]
+        lines.append(f"最大单笔盈利:{b['outcome_pct']:+.1f}%（{b['ticker']}，{b['signal_date']}入选）")
+    if stats["worst"] is not None:
+        w = stats["worst"]
+        lines.append(f"最大单笔亏损:{w['outcome_pct']:+.1f}%（{w['ticker']}，{w['signal_date']}入选）")
+    return "\n".join(lines)
+
+
 def _format_row(r: dict) -> str:
     """单只股票的三行展示：标题 / 状态 / 区间高低点。"""
     name = wdb.get_company_name(r["ticker"]) or ""
@@ -246,12 +318,9 @@ def build_eod_section(rows: list) -> str:
     if not rows:
         return f"过去{REVIEW_DAYS}天无Top3入选记录，或数据库暂不可用。"
 
-    lines = [f"📊 EOD Top3选股表现（共{len(rows)}只）\n"]
+    lines = [f"📊 EOD Top3选股表现（共{len(rows)}笔信号，逐笔明细如下）\n"]
 
-    resolved_count = 0
     for i, r in enumerate(rows):
-        if r["outcome"] and r["outcome"] != "PENDING":
-            resolved_count += 1
         lines.append(_format_row(r))
         lines.append("")
         # 轻微限速，避免连续密集请求yfinance被限流（30天*3只/天，
@@ -259,8 +328,6 @@ def build_eod_section(rows: list) -> str:
         if i < len(rows) - 1:
             time.sleep(0.3)
 
-    pending_count = len(rows) - resolved_count
-    lines.append(f"（已平仓{resolved_count}只 / 进行中{pending_count}只）")
     return "\n".join(lines)
 
 
@@ -273,9 +340,15 @@ def build_report() -> str:
     since = (date.today() - timedelta(days=REVIEW_DAYS)).isoformat()
 
     rows = query_eod_top3(REVIEW_DAYS)
+    stats = compute_summary_stats(rows)
 
     lines = [
         f"月报：Top3选股表现 ({since} ~ {today})",
+        "=" * 40,
+        "",
+        "📈 数据汇总（已用代码算好，写文案时直接引用，不要重新求和/心算）",
+        build_summary_block(stats),
+        "",
         "=" * 40,
         "",
         build_eod_section(rows),
@@ -287,6 +360,9 @@ def build_report() -> str:
         "   持仓期间表现。",
         "2. 这是回顾快照，不是严格胜率统计——PENDING的浮盈浮亏",
         "   只是当前状态，不是最终结果。",
+        "3. 入选日期越接近本报告右边界的信号，越大概率还是",
+        "   PENDING——这是因为screener.py固定的20个交易日resolve",
+        "   窗口还没到期，不是系统卡住了，属于正常的右侧截断。",
     ]
     return "\n".join(lines)
 
