@@ -418,48 +418,61 @@ resolved/pending split, WIN/LOSS/TIMEOUT breakdown, win rate, average
 return, and best/worst trade. These numbers were computed
 deterministically in Python, not by you.
 
-REQUIREMENTS:
+Structure the thread into three labeled parts — 概括/汇总 (overview),
+典型上涨案例 (case study), 结论/复盘 (conclusion & retrospective) —
+as 7-9 tweets total.
+
+PART 1 — 概括/汇总:
 1. USE THE NUMBERS IN THE "📈 数据汇总" BLOCK VERBATIM for the headline
    stats (distinct stock count, total signals, resolved/pending
-   counts, win/loss/timeout breakdown, win rate, average return,
-   best/worst trade). Do NOT recompute these by re-adding or
-   re-averaging the per-stock rows yourself — manually summing dozens
-   of percentages is exactly the kind of arithmetic LLMs get subtly
-   wrong (off by a few tenths of a percent) without any obvious sign
-   something's off. If the summary block is missing or looks
-   incomplete, say so instead of estimating.
-2. When discussing tickers that repeated multiple times, note that
-   this reflects the persistence factor in the scoring model, not N
-   separate new discoveries.
-3. If two "WIN" (or two "LOSS") outcomes came from the same ticker
-   re-entering during what looks like one continuous price move,
-   flag this explicitly as one underlying move, not independent
-   successes/failures.
-4. Include one line quantifying risk control: the range of losses
+   counts, win/loss/timeout breakdown, win rate, average return).
+   Do NOT recompute these by re-adding or re-averaging the per-stock
+   rows yourself — manually summing dozens of percentages is exactly
+   the kind of arithmetic LLMs get subtly wrong (off by a few tenths
+   of a percent) without any obvious sign something's off. If the
+   summary block is missing or looks incomplete, say so instead of
+   estimating.
+2. Note the distinct stock count vs total signal count, and that
+   repeated tickers reflect the persistence factor in the scoring
+   model, not N separate new discoveries.
+3. Include one line quantifying risk control: the range of losses
    among LOSS trades (e.g., "losses ranged from -X% to -Y%, no
-   single trade blew past the stop"), since that's the actual
-   evidence the system's risk framework is working.
-5. Pick at most ONE notable case study (biggest winner or biggest
-   loser, from the "best"/"worst" fields in the summary block), and
-   explicitly caveat it as one example out of N distinct stocks — not
-   representative of the period's overall result.
-6. Structure as a 5–7 tweet thread:
-   - Tweet 1 (hook): the blunt headline number (resolved trades,
-     win rate, avg return). No spin, no hype adjectives.
-   - Tweet 2: distinct stock count vs total signal rows, one line on
-     why some tickers repeat (persistence factor in composite score).
-   - Tweet 3: risk control framing (loss range, no blowups).
-   - Tweet 4: the one case study, clearly caveated as n=1.
-   - Tweet 5: what's still pending / what I'm watching.
-   - Final tweet: plain disclaimer — personal system log, not
-     investment advice, past performance not predictive.
-7. Tone: matter-of-fact, slightly self-deprecating about losses, no
-   hype language, minimal emoji (📊 on tweet 1 only if at all).
-   Fintwit/quant readers distrust vague claims — every number must
-   be traceable back to the input report.
-8. Write the output in English.
+   single trade blew past the stop") — the actual evidence the
+   system's risk framework is working.
 
-Output only the numbered thread, nothing else.
+PART 2 — 典型上涨案例:
+4. Use the trade with the highest POSITIVE outcome_pct (the "best"
+   field in the summary block, only if it's actually positive) as a
+   single case study — ticker, entry date, holding period, return.
+   Explicitly caveat it as one example out of N distinct stocks, not
+   representative of the period's overall result. If no trade in the
+   report has a positive outcome_pct, do NOT force one — say plainly
+   that no winning trade closed this period, and name the smallest
+   loss instead without dressing it up as a win.
+
+PART 3 — 结论/复盘:
+5. Write a genuine retrospective grounded in the actual per-stock
+   rows — not generic "will keep optimizing" filler. Look for a
+   concrete pattern (e.g., the same ticker losing multiple times in
+   a row, a cluster of losses in the same week) and name it
+   specifically, using real tickers/dates from the report.
+6. Optional: if any single tier tag (e.g. [T2], [T3]) has ≥3 resolved
+   trades this period and its win rate/avg return looks notably
+   different from the others, mention it as something to watch —
+   explicitly frame it as a small-sample observation, not a
+   conclusion. Skip this if no tier clears the ≥3 threshold or
+   nothing stands out; don't manufacture a pattern.
+7. One tweet on what's still pending / what I'm watching next.
+8. Final tweet: plain disclaimer — personal system log, not
+   investment advice, past performance not predictive.
+
+TONE: matter-of-fact, slightly self-deprecating about losses, no
+hype language, minimal emoji (📊 optional on tweet 1 only).
+Fintwit/quant readers distrust vague claims — every number must be
+traceable back to the input report.
+
+Write the output in English. Output only the numbered thread,
+nothing else.
 """
 
 XHS_PROMPT_TEMPLATE = """You are helping me draft a Xiaohongshu post about my personal ASX
@@ -475,7 +488,10 @@ resolved/pending split, WIN/LOSS/TIMEOUT breakdown, win rate, average
 return, and best/worst trade. These numbers were computed
 deterministically in Python, not by you.
 
-REQUIREMENTS:
+Structure the post into three labeled parts — 概括/汇总、典型上涨案例、
+结论/复盘：
+
+PART 1 — 概括/汇总:
 1. USE THE NUMBERS IN THE "📈 数据汇总" BLOCK VERBATIM. Do NOT
    recompute distinct stock count, win/loss/timeout counts, win
    rate, or average return by re-adding or re-averaging the
@@ -484,30 +500,48 @@ REQUIREMENTS:
    few tenths of a percent) without any obvious sign something's
    off. If the summary block is missing or looks incomplete, say so
    instead of estimating.
-2. If the same ticker produced more than one WIN/LOSS during what
+2. Include one short mention of risk control — the range of losses,
+   to show stops are functioning, not catastrophic.
+
+PART 2 — 典型上涨案例 ("案例卡片"):
+3. Use the trade with the highest POSITIVE outcome_pct (the "best"
+   field in the summary block, only if it's actually positive):
+   ticker, entry date, holding period, return, 2-3 sentences.
+   Explicitly label it as a single example, not the month's overall
+   result. If no trade has a positive outcome_pct, do NOT force a
+   winning story — say so honestly instead.
+
+PART 3 — 结论/复盘:
+4. Write a genuine retrospective grounded in the actual per-stock
+   rows — not generic "继续优化" filler. Point to something concrete
+   (a ticker that lost repeatedly, a cluster of losses in the same
+   week) using real tickers/dates from the report, and reflect on it
+   honestly.
+5. Optional: if any single tier tag (e.g. [T2], [T3]) has ≥3 resolved
+   trades this period and stands out from the others, mention it as
+   something to watch — explicitly frame it as a small-sample
+   observation, not a conclusion. Skip if nothing clears that bar.
+6. If the same ticker produced more than one WIN/LOSS during what
    looks like the same underlying price move, treat it as one story
-   beat, not multiple separate successes/failures.
-3. Include one short paragraph on risk control — describe the range
-   of losses to show stops are functioning, not catastrophic.
-4. Include one small "案例卡片" section: one notable stock (the
-   best/worst trade from the summary block), 2–3 sentences,
-   explicitly labeled as a single example, not the month's overall
-   result.
-5. Suggest a simple accompanying image layout: a small stats table
-   (已平仓 / 胜率 / 平均收益 / 最大盈利 / 最大亏损) using the exact
-   numbers from the summary block, described in words (rows/columns)
-   so I can build it myself — do not fabricate a chart or invent
-   numbers not in the report.
-6. Tone: first-person, reflective, "记录/踩坑" style rather than
+   beat when discussing repeated losers, not multiple separate
+   failures.
+
+ALSO INCLUDE:
+7. A simple accompanying image layout suggestion: a small stats
+   table (已平仓 / 胜率 / 平均收益 / 最大盈利 / 最大亏损) using the
+   exact numbers from the summary block, described in words
+   (rows/columns) so I can build it myself — do not fabricate a
+   chart or invent numbers not in the report.
+8. Tone: first-person, reflective, "记录/踩坑" style rather than
    "晒收益" style — small imperfections and honesty read better on
    this platform than a highlight reel.
-7. Structure: short opening line (1–2 sentences) + 3–4 short
-   paragraphs, each ≤3 sentences, with line breaks between them
-   (小红书 reading style — no dense text walls). End with a plain
-   one-line disclaimer.
-8. Length: roughly 300–500 Chinese characters for the post body,
-   excluding the image layout description.
-9. Write the output in Simplified Chinese.
+9. Structure: short opening line (1-2 sentences), then the three
+   parts above as short paragraphs (≤3 sentences each) with line
+   breaks between them (小红书 reading style — no dense text walls).
+   End with a plain one-line disclaimer.
+10. Length: roughly 300-500 Chinese characters for the post body,
+    excluding the image layout description.
+11. Write the output in Simplified Chinese.
 
 Output only the post text, then the image layout description,
 nothing else.
