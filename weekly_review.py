@@ -1,5 +1,5 @@
 # ============================================================
-# ASX SYSTEM — weekly_review.py  v3
+# ASX SYSTEM — weekly_review.py  v4
 #
 # 月报：只看EOD screener.py选出的Top3表现，不含落选候选和
 # intraday信号。
@@ -15,21 +15,19 @@
 #           "(含离场后走势，仅供参考)"，避免误读成"系统抓住了这个
 #           高点"
 #
-# v2 → v3 变更（起因：拿v2输出的报告手动喂给LLM生成社媒文案，
-# LLM心算37笔outcome_pct的平均值算错了0.3个百分点——这种类型
-# 的错误不报错、不崩溃，光看报告和文案表面结构完全看不出来，
-# 属于典型的silent wrong number）：
-#   - 新增 compute_summary_stats() + build_summary_block()：
-#     去重股票数、已平仓/PENDING拆分、WIN/LOSS/TIMEOUT计数、
-#     胜率、平均收益、最大单笔盈亏，全部用Python确定性算好，
-#     放在报告最前面。后续生成社媒文案的prompt要求直接引用
-#     这个区块的数字，不允许LLM自己重新求和/心算
-#   - build_eod_section()底部原来的"已平仓X只/进行中Y只"删掉了
-#     （单位本来就用错了——那是笔数不是股票数，现在统一由汇总
-#     区块出，只有一处，不会两个数字打架）
-#   - 说明区块加了一条：入选后期（接近月报窗口右边界）的信号
-#     多数还是PENDING，是因为screener.py固定的20个交易日resolve
-#     窗口还没到期，不是系统卡住，避免被误读成"选了没结果"
+# v3 → v4 变更：
+#   - 不再单独生成/推送原始report.txt——完整report现在只以
+#     "内嵌在两份prompt txt里"的形式存在，Telegram每周只收到
+#     两个文件（X版 + 小红书版），而不是三个
+#   - Telegram消息本体改发一段代码算好的精简结论（去重股票数、
+#     已平仓胜率、平均收益、最大盈亏），2-3行，不再是完整report
+#   - X_PROMPT_TEMPLATE / XHS_PROMPT_TEMPLATE 两份prompt模板直接
+#     写死在这个文件里，不再放在外部social_media_prompts.md让
+#     脚本运行时读取解析——单文件部署，改语气/结构直接改这两个
+#     常量就行，不用担心两个文件不同步，也不用管路径配置
+#   - main()里rows/stats只查/算一次，短结论和两份prompt共用同一份，
+#     避免重复查库、重复对70+只票发yfinance请求（v3那版如果直接
+#     加一次独立的"短结论"计算，会让请求量翻倍，这里提前避开了）
 #
 # 触发方式不变：
 #   1) crontab周六自动跑一次
@@ -37,7 +35,7 @@
 #
 # 明确不做的事：
 #   - 不判定跨月度的"最终胜率"趋势（意义不大，样本本身有右侧
-#     截断偏差，参见上面的resolve窗口说明）
+#     截断偏差，参见说明区块里的resolve窗口说明）
 #   - 不做intraday信号的WIN/LOSS/TIMEOUT持久化结果记录
 # ============================================================
 
@@ -335,12 +333,16 @@ def build_eod_section(rows: list) -> str:
 # 4. 主流程
 # ════════════════════════════════════════════════════════════
 
-def build_report() -> str:
+def build_report(rows: list, stats: dict) -> str:
+    """
+    组装完整report文本。rows/stats必须由调用方先查/算好再传进来
+    （query_eod_top3 + compute_summary_stats），不在这里重新查——
+    这个report的内容后面要塞进两份prompt里，如果每次都重新查一遍
+    数据库、重新对70+只票发yfinance请求，一次月报的请求量会直接
+    翻倍。
+    """
     today = date.today().isoformat()
     since = (date.today() - timedelta(days=REVIEW_DAYS)).isoformat()
-
-    rows = query_eod_top3(REVIEW_DAYS)
-    stats = compute_summary_stats(rows)
 
     lines = [
         f"月报：Top3选股表现 ({since} ~ {today})",
@@ -367,21 +369,190 @@ def build_report() -> str:
     return "\n".join(lines)
 
 
+def build_short_conclusion(stats: dict, since: str, today: str) -> str:
+    """
+    发到Telegram消息本体的精简结论，2-3行。完整数据不在这里，
+    只存在于两份prompt txt里（内嵌了完整report），自己要看明细
+    直接翻那两个文件。
+    """
+    header = f"月报 Top3选股表现 {since} ~ {today}"
+    if stats["resolved_count"] == 0:
+        return (f"{header}\n去重{stats['distinct_tickers']}只 / "
+                f"{stats['total_signals']}次信号，本期尚无已平仓记录。")
+
+    line2 = (f"已平仓{stats['resolved_count']}笔"
+              f"（{stats['win_count']}胜/{stats['loss_count']}负/"
+              f"{stats['timeout_count']}超时），胜率{stats['win_rate']}%，"
+              f"平均收益{stats['avg_pct']:+.2f}%")
+
+    parts = []
+    if stats["best"] is not None:
+        b = stats["best"]
+        parts.append(f"最大盈利{b['outcome_pct']:+.1f}%（{b['ticker']}）")
+    if stats["worst"] is not None:
+        w = stats["worst"]
+        parts.append(f"最大亏损{w['outcome_pct']:+.1f}%（{w['ticker']}）")
+
+    lines = [header, line2]
+    if parts:
+        lines.append("／".join(parts))
+    return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════
+# 5. 社媒文案prompt（模板直接写在代码里，单文件部署，
+#    改语气/结构直接改这两个常量，不用管外部文件路径）
+# ════════════════════════════════════════════════════════════
+
+X_PROMPT_TEMPLATE = """You are helping me draft an X (Twitter) thread summarizing my personal
+ASX quantitative trading system's performance for the trailing period
+covered in the report below. Use ONLY the numbers in that report — do
+not estimate, round generously, or invent figures.
+
+INPUT:
+[PASTE REPORT HERE]
+
+The report begins with a "📈 数据汇总" block containing pre-computed,
+code-verified numbers: distinct ticker count, total signal count,
+resolved/pending split, WIN/LOSS/TIMEOUT breakdown, win rate, average
+return, and best/worst trade. These numbers were computed
+deterministically in Python, not by you.
+
+REQUIREMENTS:
+1. USE THE NUMBERS IN THE "📈 数据汇总" BLOCK VERBATIM for the headline
+   stats (distinct stock count, total signals, resolved/pending
+   counts, win/loss/timeout breakdown, win rate, average return,
+   best/worst trade). Do NOT recompute these by re-adding or
+   re-averaging the per-stock rows yourself — manually summing dozens
+   of percentages is exactly the kind of arithmetic LLMs get subtly
+   wrong (off by a few tenths of a percent) without any obvious sign
+   something's off. If the summary block is missing or looks
+   incomplete, say so instead of estimating.
+2. When discussing tickers that repeated multiple times, note that
+   this reflects the persistence factor in the scoring model, not N
+   separate new discoveries.
+3. If two "WIN" (or two "LOSS") outcomes came from the same ticker
+   re-entering during what looks like one continuous price move,
+   flag this explicitly as one underlying move, not independent
+   successes/failures.
+4. Include one line quantifying risk control: the range of losses
+   among LOSS trades (e.g., "losses ranged from -X% to -Y%, no
+   single trade blew past the stop"), since that's the actual
+   evidence the system's risk framework is working.
+5. Pick at most ONE notable case study (biggest winner or biggest
+   loser, from the "best"/"worst" fields in the summary block), and
+   explicitly caveat it as one example out of N distinct stocks — not
+   representative of the period's overall result.
+6. Structure as a 5–7 tweet thread:
+   - Tweet 1 (hook): the blunt headline number (resolved trades,
+     win rate, avg return). No spin, no hype adjectives.
+   - Tweet 2: distinct stock count vs total signal rows, one line on
+     why some tickers repeat (persistence factor in composite score).
+   - Tweet 3: risk control framing (loss range, no blowups).
+   - Tweet 4: the one case study, clearly caveated as n=1.
+   - Tweet 5: what's still pending / what I'm watching.
+   - Final tweet: plain disclaimer — personal system log, not
+     investment advice, past performance not predictive.
+7. Tone: matter-of-fact, slightly self-deprecating about losses, no
+   hype language, minimal emoji (📊 on tweet 1 only if at all).
+   Fintwit/quant readers distrust vague claims — every number must
+   be traceable back to the input report.
+8. Write the output in English.
+
+Output only the numbered thread, nothing else.
+"""
+
+XHS_PROMPT_TEMPLATE = """You are helping me draft a Xiaohongshu post about my personal ASX
+quant trading system, covering the period in the report below. Use
+ONLY the numbers from that report.
+
+INPUT:
+[PASTE REPORT HERE]
+
+The report begins with a "📈 数据汇总" block containing pre-computed,
+code-verified numbers: distinct ticker count, total signal count,
+resolved/pending split, WIN/LOSS/TIMEOUT breakdown, win rate, average
+return, and best/worst trade. These numbers were computed
+deterministically in Python, not by you.
+
+REQUIREMENTS:
+1. USE THE NUMBERS IN THE "📈 数据汇总" BLOCK VERBATIM. Do NOT
+   recompute distinct stock count, win/loss/timeout counts, win
+   rate, or average return by re-adding or re-averaging the
+   per-stock rows yourself — manually summing dozens of percentages
+   is exactly the kind of arithmetic LLMs get subtly wrong (off by a
+   few tenths of a percent) without any obvious sign something's
+   off. If the summary block is missing or looks incomplete, say so
+   instead of estimating.
+2. If the same ticker produced more than one WIN/LOSS during what
+   looks like the same underlying price move, treat it as one story
+   beat, not multiple separate successes/failures.
+3. Include one short paragraph on risk control — describe the range
+   of losses to show stops are functioning, not catastrophic.
+4. Include one small "案例卡片" section: one notable stock (the
+   best/worst trade from the summary block), 2–3 sentences,
+   explicitly labeled as a single example, not the month's overall
+   result.
+5. Suggest a simple accompanying image layout: a small stats table
+   (已平仓 / 胜率 / 平均收益 / 最大盈利 / 最大亏损) using the exact
+   numbers from the summary block, described in words (rows/columns)
+   so I can build it myself — do not fabricate a chart or invent
+   numbers not in the report.
+6. Tone: first-person, reflective, "记录/踩坑" style rather than
+   "晒收益" style — small imperfections and honesty read better on
+   this platform than a highlight reel.
+7. Structure: short opening line (1–2 sentences) + 3–4 short
+   paragraphs, each ≤3 sentences, with line breaks between them
+   (小红书 reading style — no dense text walls). End with a plain
+   one-line disclaimer.
+8. Length: roughly 300–500 Chinese characters for the post body,
+   excluding the image layout description.
+9. Write the output in Simplified Chinese.
+
+Output only the post text, then the image layout description,
+nothing else.
+"""
+
+
+def build_social_prompts(report: str) -> dict:
+    """把report内容塞进两份prompt模板的占位符，返回可以直接
+    复制粘贴发给LLM的完整文本。"""
+    return {
+        "x": X_PROMPT_TEMPLATE.replace("[PASTE REPORT HERE]", report),
+        "xhs": XHS_PROMPT_TEMPLATE.replace("[PASTE REPORT HERE]", report),
+    }
+
+
 def main() -> None:
     log.info(f"=== weekly_review.py 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ===")
     try:
         wdb.init_watchlist_db()
-        report = build_report()
 
-        os.makedirs(_REPORTS_DIR, exist_ok=True)
+        # rows/stats只查/算一次，短结论和两份prompt共用，避免重复
+        # 查库、重复对70+只票发yfinance请求
+        rows = query_eod_top3(REVIEW_DAYS)
+        stats = compute_summary_stats(rows)
+        report = build_report(rows, stats)
+
         today = date.today().isoformat()
-        file_path = os.path.join(_REPORTS_DIR, f"weekly_review_{today}.txt")
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(report)
-
         since = (date.today() - timedelta(days=REVIEW_DAYS)).isoformat()
-        caption = f"月报 Top3选股表现 {since} ~ {today}"
-        send_telegram_document(file_path, caption=caption)
+
+        # 1) 精简结论直接发Telegram文本
+        send_telegram_text(build_short_conclusion(stats, since, today))
+
+        # 2) X / 小红书 prompt（已嵌入本周完整数据，复制粘贴直接发给LLM）
+        os.makedirs(_REPORTS_DIR, exist_ok=True)
+        prompts = build_social_prompts(report)
+
+        x_path = os.path.join(_REPORTS_DIR, f"weekly_review_{today}_x_prompt.txt")
+        with open(x_path, "w", encoding="utf-8") as f:
+            f.write(prompts["x"])
+        send_telegram_document(x_path, caption="X thread prompt（已嵌入本周数据，直接复制粘贴发给LLM）")
+
+        xhs_path = os.path.join(_REPORTS_DIR, f"weekly_review_{today}_xhs_prompt.txt")
+        with open(xhs_path, "w", encoding="utf-8") as f:
+            f.write(prompts["xhs"])
+        send_telegram_document(xhs_path, caption="小红书 prompt（已嵌入本周数据，直接复制粘贴发给LLM）")
 
     except Exception as e:
         log.error(f"weekly_review.py 执行失败: {e}", exc_info=True)
