@@ -2,7 +2,7 @@
 """
 backtest_engine.py
 ====================
-ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.1：复用screener.py真实逻辑版）
+ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.2：复用screener.py真实逻辑版）
 
 核心设计:
     本脚本不重新实现打分逻辑，而是直接 `import screener`，复用其中的
@@ -12,6 +12,15 @@ ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.1：复用scre
 
     这意味着回测用的止盈止损/超时规则和你线上 signals_history 表完全一致，
     两者理论上可以合并统计（本脚本提供 --merge-live 选项做这件事）。
+
+v2.2改动（本轮，数据层与回测逻辑解耦）：
+    DataLayer不再直接调用yfinance，改为通过market_data_cache.py这个
+    本地Parquet缓存层读取——本地已经覆盖的区间完全不碰网络，只有真正
+    缺口的部分才会实际请求。建议在跑本脚本之前先执行一次
+    `python3 data_fetcher.py --mode backfill --universe full` 预热标准
+    窗口，之后同一测试窗口下反复跑多组参数实验，数据下载阶段基本不会
+    再碰网络。没有提前预热也完全不影响正确性，只是第一次跑会慢一些
+    （跟v2.1之前的行为等价，只是顺手把拿到的数据存起来供下次用）。
 
 v2.1改动（本轮修复，正式全市场700天回测前的检查中发现）：
     1) 修复健康度评估的小时线日期对齐bug：原来用"hourly_full.index <= day"
@@ -123,6 +132,15 @@ try:
     import watchlist_db as wdb  # noqa: E402  用于 --universe watchlist
 except ImportError:
     wdb = None  # 只有选择 --universe watchlist 时才会真正需要，这里不强制退出
+
+try:
+    import market_data_cache  # noqa: E402  v2.2新增：本地行情数据缓存层，DataLayer依赖它
+except ImportError as e:
+    print(
+        "无法 import market_data_cache —— 本脚本必须和 market_data_cache.py "
+        f"放在同一目录下运行。原始错误: {e}"
+    )
+    sys.exit(1)
 
 # ────────────────────────────────────────────────────────────
 # 拍一份screener.py原始默认参数的快照，供--run-queue模式在同一进程里
@@ -390,134 +408,86 @@ def setup_logging(log_path: str) -> logging.Logger:
 # ════════════════════════════════════════════════════════════
 
 class DataLayer:
-    """历史OHLCV拉取 + 清洗 + point-in-time切片。所有网络调用带重试。"""
+    """
+    历史OHLCV拉取 + 清洗 + point-in-time切片。
+
+    v2.2改动：不再直接调用yfinance，而是通过market_data_cache.py这个
+    本地Parquet缓存层读取——本地已经覆盖的区间完全不碰网络，只有真正
+    缺口的部分才会实际发请求（缺口检测、补齐、重试退避、OHLCV清洗
+    这些逻辑都搬到了market_data_cache.py里集中管理，不再在这里重复
+    一份）。
+
+    建议在跑backtest_engine.py之前先执行一次：
+        python3 data_fetcher.py --mode backfill --universe full
+    预热标准窗口，之后同一测试窗口下反复跑多组参数实验，数据下载
+    阶段基本不会再碰网络。即使没有提前预热，本类依然会在缓存未命中
+    时自动请求并顺手写入缓存，行为上跟v2.1之前完全一致（只是多了
+    "顺手存起来供下次用"这个副作用），不会影响本次回测的正确性。
+
+    self._cache是这个类自己维护的进程内存字典，跟market_data_cache的
+    Parquet磁盘缓存是两层不同的缓存——前者避免同一次回测进程内对同一
+    区间重复读磁盘/反序列化Parquet，后者避免跨进程/跨实验重复下载。
+    """
 
     def __init__(self, logger: logging.Logger, max_retries: int = 5):
         self.logger = logger
         self.max_retries = max_retries
         self._cache: dict[str, pd.DataFrame] = {}
-
-    @staticmethod
-    def _backoff_seconds(attempt: int) -> float:
-        """指数退避，封顶60秒。整晚运行更需要能扛住偶发的限流/网络抖动，
-        而不是像交互式场景那样追求快速失败。"""
-        return min(60.0, 3.0 * (2 ** (attempt - 1)))
+        self._mdc = market_data_cache.MarketDataCache(logger=logger, max_retries=max_retries)
 
     def fetch(self, ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
         key = f"{ticker}|{start}|{end}"
         if key in self._cache:
             return self._cache[key]
 
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                df = yf.download(
-                    ticker, start=start, end=end,
-                    auto_adjust=True, progress=False, threads=False,
-                )
-                if df is None or df.empty:
-                    self.logger.warning(f"{ticker}: 返回空数据 attempt={attempt}/{self.max_retries}")
-                    time.sleep(self._backoff_seconds(attempt))
-                    continue
+        df = self._mdc.get_daily(ticker, start, end)
+        if df is None or df.empty:
+            self.logger.warning(f"{ticker}: 日线数据（缓存+补齐后）仍为空，跳过")
+            return None
+        if len(df) < 30:
+            self.logger.warning(f"{ticker}: 有效交易日不足30天，跳过")
+            return None
 
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                df = df[~df.index.duplicated(keep="first")]
-                df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-
-                bad = df["Close"].pct_change().abs() > 0.80
-                if bad.sum() > 0:
-                    self.logger.warning(f"{ticker}: 剔除{bad.sum()}个疑似异常价格bar")
-                    df = df[~bad]
-
-                if len(df) < 30:
-                    self.logger.warning(f"{ticker}: 有效交易日不足30天，跳过")
-                    return None
-
-                self._cache[key] = df
-                return df
-
-            except Exception as e:
-                self.logger.warning(f"{ticker}: 拉取失败 attempt={attempt}/{self.max_retries} error={e}")
-                time.sleep(self._backoff_seconds(attempt))
-
-        self.logger.error(f"{ticker}: {self.max_retries}次重试后仍失败，跳过")
-        return None
+        self._cache[key] = df
+        return df
 
     def fetch_60m(self, ticker: str, start: str, end: str,
                   max_days: int = 729) -> Optional[pd.DataFrame]:
         """
-        拉取60分钟线（yfinance对60m颗粒度的历史深度上限约730天，
-        明显宽于15m/30m等更细颗粒度的60天上限）。
-
-        与fetch()的关键差异：
-          - 会先校验请求区间是否超出60m数据的可用窗口（相对"今天"算，
-            不是相对--end），超出的部分yfinance要么返回空、要么自动截断，
-            这里提前算清楚并在日志里说明，不让调用方在没意识到的情况下
-            拿到一份"看起来正常但其实被悄悄截断"的数据
-          - 返回的index会转换到悉尼时区（Australia/Sydney），
-            和intraday_monitor.py的时区处理方式保持一致，避免UTC/本地
-            时间混淆导致"最后一根K线"判断错误
+        max_days参数保留用于接口兼容（cfg.yf_60m_max_days默认729，
+        跟market_data_cache.GRANULARITY_CONFIG里"60m"的内置上限一致），
+        实际的"是否早于可用窗口"校验和提醒已经在market_data_cache内部
+        统一处理，这里不再重复判断。
         """
-        from zoneinfo import ZoneInfo
-        syd_tz = ZoneInfo("Australia/Sydney")
-
         key = f"60m|{ticker}|{start}|{end}"
         if key in self._cache:
             return self._cache[key]
 
-        today = pd.Timestamp.now().normalize()
-        earliest_available = today - pd.Timedelta(days=max_days)
-        requested_start = pd.Timestamp(start)
-        if requested_start < earliest_available:
-            self.logger.warning(
-                f"{ticker}: 60分钟线请求起点{start}早于可用窗口"
-                f"({earliest_available.date()})，实际能拿到的数据会从"
-                f"{earliest_available.date()}左右开始，更早的部分yfinance"
-                f"不提供，不是本代码的bug"
-            )
+        df = self._mdc.get_60m(ticker, start, end)
+        if df is None or df.empty:
+            return None
 
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                df = yf.download(
-                    ticker, start=start, end=end, interval="60m",
-                    auto_adjust=True, progress=False, threads=False,
-                )
-                if df is None or df.empty:
-                    self.logger.warning(f"{ticker}: 60分钟线返回空数据 "
-                                       f"attempt={attempt}/{self.max_retries}")
-                    time.sleep(self._backoff_seconds(attempt))
-                    continue
+        self._cache[key] = df
+        return df
 
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                df = df[~df.index.duplicated(keep="first")]
-                df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    def fetch_15m(self, ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
+        """
+        15分钟线读取接口（v2.2新增，供未来对intraday_monitor.py做更贴近
+        真实颗粒度的验证时使用）。yfinance该颗粒度只能看最近~60天，
+        更长的历史需要靠data_fetcher.py --mode weekly15m按周持续累积，
+        这里只是把market_data_cache里已经攒下来的部分读出来，本身
+        不负责"从头补全多年历史"（那件事做不到，是数据源硬限制）。
+        """
+        key = f"15m|{ticker}|{start}|{end}"
+        if key in self._cache:
+            return self._cache[key]
 
-                # 转成悉尼当地时间的挂钟数值后，去掉tz标记（tz_localize(None)）。
-                # 保留naive但去掉tz本身，是因为：日线数据（yfinance interval=1d）
-                # 返回的index本来就是tz-naive的，如果60分钟线这边保留
-                # tz-aware，后续所有"和日线的as_of时间戳比较"（比如
-                # hourly_full.index <= day）都会抛TypeError（tz-aware和
-                # tz-naive不能直接比较）——这个异常之前被下游的except
-                # Exception静默吞掉了，导致health_status全部变成None、
-                # 小时级变种功能全部失效，却没有任何报错，是这次回测里
-                # 目前为止最隐蔽的一个bug。修复后两边的时间戳都是naive，
-                # 数值上都代表悉尼当地时间，可以正确比较。
-                if df.index.tz is None:
-                    df.index = df.index.tz_localize("UTC").tz_convert(syd_tz).tz_localize(None)
-                else:
-                    df.index = df.index.tz_convert(syd_tz).tz_localize(None)
+        df = self._mdc.get_15m(ticker, start, end)
+        if df is None or df.empty:
+            return None
 
-                self._cache[key] = df
-                return df
-
-            except Exception as e:
-                self.logger.warning(f"{ticker}: 60分钟线拉取失败 "
-                                   f"attempt={attempt}/{self.max_retries} error={e}")
-                time.sleep(self._backoff_seconds(attempt))
-
-        self.logger.error(f"{ticker}: 60分钟线{self.max_retries}次重试后仍失败，跳过")
-        return None
+        self._cache[key] = df
+        return df
 
     @staticmethod
     def slice_up_to(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
