@@ -79,10 +79,12 @@ DEFAULT_CACHE_DIR = os.path.join(_MODULE_DIR, "market_data_cache")
 GRANULARITY_CONFIG = {
     "daily": {"interval": "1d", "max_history_days": None},
     "60m":   {"interval": "60m", "max_history_days": 729},
-    "15m":   {"interval": "15m", "max_history_days": 55},  # 实测59天仍会被Yahoo拒绝
-                                                              # （报错里的"60天"上限似乎是按
-                                                              # 精确UTC时间点算的，跟日历天数
-                                                              # 有偏差），留5天安全余量更稳妥
+    "15m":   {"interval": "15m", "max_history_days": 59},  # 留1天安全余量。曾经短暂改成55天，
+                                                              # 是误判——把"这只股票15m颗粒度本身
+                                                              # 没数据"错当成"窗口边界问题"，后经
+                                                              # 交叉验证（同一59天窗口下714只成功、
+                                                              # 失败的股票daily/60m数据都完好）证实
+                                                              # 与窗口宽度无关，改回59天
 }
 
 MANIFEST_SCHEMA_SQL = """
