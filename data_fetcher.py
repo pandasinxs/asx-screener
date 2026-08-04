@@ -84,8 +84,12 @@ STANDARD_WINDOW_DAYS = 700
 STANDARD_WARMUP_DAYS = 365
 HOURLY_MAX_HISTORY_DAYS = 729
 
-# yfinance 15分钟颗粒度实际上限约60天，留1天安全余量
-WEEKLY_15M_WINDOW_DAYS = 59
+# yfinance 15分钟颗粒度实际上限约60天，但实测59天就会被Yahoo拒绝
+# （报错里的"60天"上限似乎按精确UTC时间点计算，跟日历天数有偏差），
+# 留5天安全余量更稳妥，跟market_data_cache.py里15m的max_history_days
+# 保持一致（两处务必同步改，避免"窗口本身没问题、但内部校验又报警"
+# 这种自相矛盾的日志）
+WEEKLY_15M_WINDOW_DAYS = 55
 
 
 def setup_logging(log_path: str) -> logging.Logger:
@@ -175,7 +179,11 @@ def run_backfill(cache: "mdc.MarketDataCache", tickers: list[str],
 
         if i % 50 == 0 and i > 0:
             elapsed = time.time() - start_time
-            logger.info(f"进度 {i}/{len(tickers)}，已用{elapsed/60:.1f}分钟")
+            logger.info(
+                f"进度 {i}/{len(tickers)}，已用{elapsed/60:.1f}分钟 | "
+                f"日线成功{daily_ok}/失败{daily_fail} | "
+                f"60分钟线成功{hourly_ok}/失败{hourly_fail}"
+            )
 
         try:
             df = cache.get_daily(ticker, start, end)
@@ -236,7 +244,11 @@ def run_weekly_15m(cache: "mdc.MarketDataCache", tickers: list[str],
 
         if i % 50 == 0 and i > 0:
             elapsed = time.time() - start_time
-            logger.info(f"进度 {i}/{len(tickers)}，已用{elapsed/60:.1f}分钟")
+            fail_pct = fail / (ok + fail) * 100 if (ok + fail) > 0 else 0.0
+            logger.info(
+                f"进度 {i}/{len(tickers)}，已用{elapsed/60:.1f}分钟 | "
+                f"成功{ok}/失败{fail}（失败率{fail_pct:.1f}%）"
+            )
 
         try:
             df = cache.get_15m(ticker, start, end)
