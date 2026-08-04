@@ -90,15 +90,13 @@ HOURLY_MAX_HISTORY_DAYS = 729
 # 证实与窗口宽度无关，改回59天，跟market_data_cache.py的15m配置保持一致
 WEEKLY_15M_WINDOW_DAYS = 59
 
-# 熔断阈值（v1.1新增）：连续多少只股票"全部失败"就提前停止，避免系统性
-# 问题（网络整体不通/yfinance整体异常）时傻乎乎跑完全部universe才罢休。
-# backfill用daily失败数计数（daily理论上应该对几乎所有正常股票都有效，
-# 连续失败很反常，是系统性问题的强信号，阈值可以设得紧一些）；
-# weekly15m用15m失败数计数，但15m本身有约40%的正常背景失败率（数据源
-# 覆盖盲区，不是bug，参见market_data_cache.py里的说明），阈值需要设得
-# 更宽松，避免把"运气不好连续撞上几只没有15分钟数据的股票"误判成系统性故障。
-BACKFILL_MAX_CONSECUTIVE_DAILY_FAILURES = 30
-WEEKLY15M_MAX_CONSECUTIVE_FAILURES = 50
+# v1.2：批量请求的批次大小，跟screener.py的download_ohlcv()用同一个
+# 数值（已在生产环境验证过稳定可靠）。熔断逻辑（连续多少批全部失败
+# 就提前停止）现在搬进了market_data_cache.py的warm_batch()内部，
+# 按"批次"而不是"单只股票"计数——批量模式下，单只股票偶尔没数据是
+# 正常噪音，但连续好几批（每批50只）全部失败是极强的系统性问题信号，
+# 不再需要像v1.1那样对daily/15m分别设不同的宽松阈值。
+BATCH_SIZE = 50
 
 
 def setup_logging(log_path: str) -> logging.Logger:
@@ -152,21 +150,19 @@ def run_backfill(cache: "mdc.MarketDataCache", tickers: list[str],
                  max_minutes: Optional[float], logger: logging.Logger,
                  push_telegram: bool = True) -> dict:
     """
-    预热日线+60分钟线到标准回测窗口。对每只股票分别调用
-    cache.get_daily()/get_60m()——已经完整覆盖的股票这两次调用完全
-    不碰网络，直接从本地Parquet返回，几乎瞬间跳过；只有真正有缺口
-    的股票才会实际发请求。
+    预热日线+60分钟线到标准回测窗口。v1.2改为委托给
+    cache.warm_batch()，用批量请求（每批BATCH_SIZE只）替代逐票单独
+    请求——决定耗时的是网络请求次数，不是每次请求带的数据范围大小，
+    批量能把请求次数从~2000次压到~40次，带来数量级的提速。
 
-    天然幂等、天然支持断点续跑：不需要像backtest_engine.py那样
-    额外维护一张进度表——"这只股票的本地缓存是否已经覆盖所需区间"
-    这件事本身就是进度状态，被max_minutes打断后原样重跑同一条命令
-    即可，已经覆盖的股票会立刻跳过，只继续处理还没处理到的。
+    天然幂等、天然支持断点续跑：warm_batch()内部用manifest快速判断
+    "本地是否已经完整覆盖所需区间"，已覆盖的股票完全不碰网络；被
+    max_minutes打断后原样重跑同一条命令，已经覆盖的批次会立刻跳过，
+    只继续处理还没处理到的。
 
-    熔断（v1.1新增）：daily理论上应该对几乎所有正常股票都有效，
-    连续BACKFILL_MAX_CONSECUTIVE_DAILY_FAILURES只全部失败是很反常的
-    信号（大概率是网络整体不通/yfinance整体异常，不是个别股票没数据
-    这种正常噪音），这种情况下提前停止并报警，不再傻乎乎跑完全部
-    universe——那样只会在一个大概率无解的系统性问题上白白浪费时间。
+    日线和60分钟线分两次warm_batch()调用，共享同一个max_minutes
+    时间预算（日线先跑，用剩的时间再给60分钟线，避免两段加起来
+    超出用户设定的总预算）。
     """
     end = pd.Timestamp.now().normalize().date().isoformat()
     start = (pd.Timestamp.now().normalize()
@@ -180,76 +176,38 @@ def run_backfill(cache: "mdc.MarketDataCache", tickers: list[str],
     logger.info(f"60分钟线预热窗口: {hourly_start} ~ {end}"
                 f"（受yfinance约{HOURLY_MAX_HISTORY_DAYS}天上限约束）")
 
-    start_time = time.time()
-    daily_ok = daily_fail = hourly_ok = hourly_fail = 0
-    processed = 0
-    consecutive_daily_fail = 0
-    circuit_broken = False
+    overall_start = time.time()
+    daily_result = cache.warm_batch(tickers, "daily", start, end,
+                                    batch_size=BATCH_SIZE, max_minutes=max_minutes)
 
-    for i, ticker in enumerate(tickers):
-        if max_minutes is not None and (time.time() - start_time) / 60 >= max_minutes:
-            logger.info(
-                f"达到时间预算({max_minutes}分钟)，本次预热提前结束，"
-                f"已处理{processed}/{len(tickers)}只，下次原样重跑会自动跳过"
-                f"已经覆盖的部分，接着补剩下的"
-            )
-            break
+    if daily_result["circuit_broken"] and push_telegram:
+        send_telegram(f"🔴 data_fetcher.py熔断 [backfill/daily]\n"
+                      f"{daily_result['circuit_break_message']}", logger)
 
-        if i % 50 == 0 and i > 0:
-            elapsed = time.time() - start_time
-            logger.info(
-                f"进度 {i}/{len(tickers)}，已用{elapsed/60:.1f}分钟 | "
-                f"日线成功{daily_ok}/失败{daily_fail} | "
-                f"60分钟线成功{hourly_ok}/失败{hourly_fail}"
-            )
+    remaining_minutes = None
+    if max_minutes is not None:
+        elapsed_min = (time.time() - overall_start) / 60
+        remaining_minutes = max(0.0, max_minutes - elapsed_min)
 
-        daily_success = False
-        try:
-            df = cache.get_daily(ticker, start, end)
-            if df is not None:
-                daily_ok += 1
-                daily_success = True
-            else:
-                daily_fail += 1
-        except Exception as e:
-            daily_fail += 1
-            logger.warning(f"日线预热异常 [{ticker}]: {e}")
-
-        consecutive_daily_fail = 0 if daily_success else consecutive_daily_fail + 1
-        if consecutive_daily_fail >= BACKFILL_MAX_CONSECUTIVE_DAILY_FAILURES:
-            alert = (
-                f"🔴 data_fetcher.py熔断 [backfill]\n"
-                f"连续{consecutive_daily_fail}只股票日线全部拉取失败，"
-                f"大概率是系统性问题（网络整体不通/yfinance整体异常），"
-                f"已提前停止，不再继续空转浪费时间。\n"
-                f"已处理{processed + 1}/{len(tickers)}只，原样重跑本命令，"
-                f"已成功的部分会自动跳过，请先检查网络/yfinance状态"
-            )
-            logger.critical(alert)
-            if push_telegram:
-                send_telegram(alert, logger)
-            circuit_broken = True
-            processed += 1
-            break
-
-        try:
-            df60 = cache.get_60m(ticker, hourly_start, end)
-            if df60 is not None:
-                hourly_ok += 1
-            else:
-                hourly_fail += 1
-        except Exception as e:
-            hourly_fail += 1
-            logger.warning(f"60分钟线预热异常 [{ticker}]: {e}")
-
-        processed += 1
-        time.sleep(0.3)  # 轻微限速，避免对yfinance过快连续请求触发限流
+    if daily_result["circuit_broken"] or (remaining_minutes is not None and remaining_minutes <= 0):
+        if not daily_result["circuit_broken"]:
+            logger.info("日线阶段已用完全部时间预算，本次跳过60分钟线预热，下次重跑会继续")
+        hourly_result = {"fetched_ok": 0, "fetched_fail": 0, "already_cached": 0,
+                         "circuit_broken": False, "circuit_break_message": None}
+    else:
+        hourly_result = cache.warm_batch(tickers, "60m", hourly_start, end,
+                                         batch_size=BATCH_SIZE, max_minutes=remaining_minutes)
+        if hourly_result["circuit_broken"] and push_telegram:
+            send_telegram(f"🔴 data_fetcher.py熔断 [backfill/60m]\n"
+                          f"{hourly_result['circuit_break_message']}", logger)
 
     return {
-        "processed": processed, "total": len(tickers),
-        "daily_ok": daily_ok, "daily_fail": daily_fail,
-        "hourly_ok": hourly_ok, "hourly_fail": hourly_fail,
-        "circuit_broken": circuit_broken,
+        "total": len(tickers),
+        "daily_ok": daily_result["fetched_ok"] + daily_result["already_cached"],
+        "daily_fail": daily_result["fetched_fail"],
+        "hourly_ok": hourly_result["fetched_ok"] + hourly_result["already_cached"],
+        "hourly_fail": hourly_result["fetched_fail"],
+        "circuit_broken": daily_result["circuit_broken"] or hourly_result["circuit_broken"],
     }
 
 
@@ -257,81 +215,32 @@ def run_weekly_15m(cache: "mdc.MarketDataCache", tickers: list[str],
                    max_minutes: Optional[float], logger: logging.Logger,
                    push_telegram: bool = True) -> dict:
     """
-    拉取全市场15分钟线最近~59天窗口，合并进逐票累积的归档。每只股票
-    的15分钟缓存只要曾经覆盖过某段历史，这次只会补"缓存末尾到现在"
-    这一小段新增数据（get_15m内部的缺口检测逻辑），不会重新下载整个
-    59天窗口——除非这只股票是第一次被拉取。
+    拉取全市场15分钟线最近~59天窗口，合并进逐票累积的归档。v1.2改为
+    委托给cache.warm_batch()，用批量请求替代逐票单独请求，原因同
+    run_backfill()——决定耗时的是请求次数，不是每次请求的数据范围。
 
-    熔断（v1.1新增）：15分钟颗粒度本身有约40%的正常背景失败率（数据源
-    对部分股票缺少intraday覆盖，是已知现象，不是bug），所以这里的熔断
-    阈值（WEEKLY15M_MAX_CONSECUTIVE_FAILURES，默认50）比backfill的daily
-    阈值宽松得多，只有连续一长串全部失败才会触发，避免把"运气不好连续
-    撞上几只没有15分钟数据的股票"误判成网络/yfinance整体故障。
+    15分钟颗粒度本身有一定的正常背景失败率（部分股票在这个颗粒度上
+    yfinance数据源确实缺失intraday覆盖，不是bug），warm_batch()内部
+    的熔断判断是按"批次"计数（连续几批50只全部失败），这个信号比
+    "单只股票没数据"强得多，不会被正常的背景噪音误触发。
     """
     end = pd.Timestamp.now().normalize().date().isoformat()
     start = (pd.Timestamp.now().normalize()
              - pd.Timedelta(days=WEEKLY_15M_WINDOW_DAYS)).date().isoformat()
     logger.info(f"15分钟线增量窗口: {start} ~ {end}（yfinance约60天硬上限内）")
 
-    start_time = time.time()
-    ok = fail = 0
-    processed = 0
-    consecutive_fail = 0
-    circuit_broken = False
+    result = cache.warm_batch(tickers, "15m", start, end,
+                              batch_size=BATCH_SIZE, max_minutes=max_minutes)
 
-    for i, ticker in enumerate(tickers):
-        if max_minutes is not None and (time.time() - start_time) / 60 >= max_minutes:
-            logger.info(
-                f"达到时间预算({max_minutes}分钟)，本次提前结束，"
-                f"已处理{processed}/{len(tickers)}只，剩下的下次运行"
-                f"（比如下周同一个crontab任务）会自动补上——只要总断档"
-                f"不超过~60天，不会有永久缺口"
-            )
-            break
-
-        if i % 50 == 0 and i > 0:
-            elapsed = time.time() - start_time
-            fail_pct = fail / (ok + fail) * 100 if (ok + fail) > 0 else 0.0
-            logger.info(
-                f"进度 {i}/{len(tickers)}，已用{elapsed/60:.1f}分钟 | "
-                f"成功{ok}/失败{fail}（失败率{fail_pct:.1f}%）"
-            )
-
-        success = False
-        try:
-            df = cache.get_15m(ticker, start, end)
-            if df is not None:
-                ok += 1
-                success = True
-            else:
-                fail += 1
-        except Exception as e:
-            fail += 1
-            logger.warning(f"15分钟线增量拉取异常 [{ticker}]: {e}")
-
-        consecutive_fail = 0 if success else consecutive_fail + 1
-        if consecutive_fail >= WEEKLY15M_MAX_CONSECUTIVE_FAILURES:
-            alert = (
-                f"🔴 data_fetcher.py熔断 [weekly15m]\n"
-                f"连续{consecutive_fail}只股票15分钟线全部拉取失败"
-                f"（远超正常约40%的背景失败率），大概率是网络/yfinance"
-                f"整体出问题，已提前停止，不再继续空转浪费时间。\n"
-                f"已处理{processed + 1}/{len(tickers)}只，原样重跑本命令，"
-                f"已成功的部分会自动跳过，请先检查网络/yfinance状态"
-            )
-            logger.critical(alert)
-            if push_telegram:
-                send_telegram(alert, logger)
-            circuit_broken = True
-            processed += 1
-            break
-
-        processed += 1
-        time.sleep(0.3)
+    if result["circuit_broken"] and push_telegram:
+        send_telegram(f"🔴 data_fetcher.py熔断 [weekly15m]\n"
+                      f"{result['circuit_break_message']}", logger)
 
     return {
-        "processed": processed, "total": len(tickers),
-        "ok": ok, "fail": fail, "circuit_broken": circuit_broken,
+        "total": len(tickers),
+        "ok": result["fetched_ok"] + result["already_cached"],
+        "fail": result["fetched_fail"],
+        "circuit_broken": result["circuit_broken"],
     }
 
 
@@ -392,7 +301,7 @@ def main():
             result = run_backfill(cache, tickers, args.max_minutes, logger, push_telegram=push)
             status = "🛑 因熔断提前停止" if result.get("circuit_broken") else "✅ backfill完成"
             summary = (
-                f"{status}：{result['processed']}/{result['total']}只\n"
+                f"{status}：universe共{result['total']}只\n"
                 f"日线成功{result['daily_ok']}/失败{result['daily_fail']}\n"
                 f"60分钟线成功{result['hourly_ok']}/失败{result['hourly_fail']}"
             )
@@ -400,7 +309,7 @@ def main():
             result = run_weekly_15m(cache, tickers, args.max_minutes, logger, push_telegram=push)
             status = "🛑 因熔断提前停止" if result.get("circuit_broken") else "✅ weekly15m完成"
             summary = (
-                f"{status}：{result['processed']}/{result['total']}只\n"
+                f"{status}：universe共{result['total']}只\n"
                 f"成功{result['ok']}/失败{result['fail']}"
             )
         logger.info(summary.replace("\n", " | "))
