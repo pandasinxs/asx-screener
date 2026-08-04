@@ -151,6 +151,279 @@ class MarketDataCache:
         return df
 
     # ────────────────────────────────────────────────────────
+    # 批量预热（v1.2新增）—— 用少量大批次yfinance请求替代逐票单独
+    # 请求，大幅减少网络请求次数
+    #
+    # 背景：实测发现"每只股票只补1-2天增量"和"每只股票补完整历史"
+    # 耗时几乎一样长——真正决定总耗时的是请求次数（网络往返/连接
+    # 开销），不是每次请求带的数据范围大小。逐票请求2000次网络调用，
+    # 不管每次要的是1天还是1000天数据，总耗时量级不变。批量请求把
+    # 2000次压缩成~40次（每批50只，跟screener.py的download_ohlcv()
+    # 用的是同一个批次大小，已经在生产环境验证过稳定可靠），能带来
+    # 数量级的提速。
+    #
+    # 批量请求不影响数据本身的正确性/精度——同一个yfinance/Yahoo接口，
+    # 只是把50只股票的请求打包进一次HTTP调用，每只股票拿到的OHLCV
+    # 数值跟单独请求完全一致。
+    # ────────────────────────────────────────────────────────
+
+    def _coverage_from_manifest(self, granularity: str) -> dict:
+        """
+        从manifest批量读取"每只股票当前缓存到哪天"，用于warm_batch()
+        筛选"本地已经完整覆盖、完全不需要碰网络"的股票。比逐只打开
+        Parquet文件读取index快得多——manifest是一张小表，一次SQL查询
+        就能拿到全部股票的覆盖范围，不需要对每只股票单独做一次磁盘
+        I/O+反序列化。
+
+        如果manifest因为某种原因跟实际Parquet文件内容不完全同步
+        （比如某次_update_manifest()写入失败但Parquet本身写成功了），
+        最坏结果只是把那只股票误判成"需要重新拉取"，多打一次网络
+        请求，不会有数据正确性问题——真正的数据读写永远走Parquet
+        文件本身，manifest只是加速用的索引，不是唯一真相来源。
+        """
+        if not os.path.exists(self.manifest_path):
+            return {}
+        conn = sqlite3.connect(self.manifest_path)
+        try:
+            rows = conn.execute(
+                "SELECT ticker, earliest_date, latest_date FROM cache_coverage "
+                "WHERE granularity = ?",
+                (granularity,),
+            ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            conn.close()
+        result = {}
+        for ticker, earliest, latest in rows:
+            try:
+                result[ticker] = (pd.Timestamp(earliest), pd.Timestamp(latest))
+            except Exception:
+                continue
+        return result
+
+    def warm_batch(self, tickers: list[str], granularity: str, start: str, end: str,
+                   batch_size: int = 50, max_minutes: Optional[float] = None,
+                   max_consecutive_batch_failures: int = 3,
+                   progress_every_n_batches: int = 5) -> dict:
+        """
+        批量预热指定颗粒度的数据到[start, end]区间。
+
+        流程：
+          1. 用manifest快速筛掉"本地已经完整覆盖[start,end]"的股票，
+             这些完全不碰网络
+          2. 剩下真正需要更新的股票按batch_size分批，每批一次
+             yf.download(多只股票列表)请求
+          3. 批内每只股票各自merge进它自己的Parquet文件（跟单只
+             请求路径共享同一套_merge_and_save逻辑，保证两条路径
+             写出来的缓存格式完全一致）
+
+          为了让批量逻辑保持简单，批内每只需要更新的股票统一请求
+          [start,end]这整段（不是各自精确计算的缺口），代价是"本地
+          已经有的那部分会被重新拿一次、重新写一次"，这个代价很小
+          （多余的网络传输量本身不是瓶颈，请求次数才是），换来的是
+          代码简单、批内所有股票能共用同一次请求。
+
+        熔断：批次级别（不是单只股票级别）——如果连续
+        max_consecutive_batch_failures批全部返回空（每批已经内部
+        重试过self.max_retries次），这个信号比"个别股票没数据"强得多
+        （50只股票同时颗粒度缺失的概率极低），大概率是网络/yfinance
+        整体出问题，提前停止。
+
+        返回:
+            {
+                "total": 传入的股票总数,
+                "already_cached": 本地已完整覆盖、跳过的股票数,
+                "fetched_ok": 本次成功拉取到新数据的股票数,
+                "fetched_fail": 本次尝试但失败的股票数,
+                "processed_batches": 实际处理的批次数,
+                "total_batches": 需要处理的批次总数,
+                "circuit_broken": 是否因熔断提前停止,
+                "circuit_break_message": 熔断提示文字（没触发则为None）,
+                "time_budget_stopped": 是否因时间预算提前停止,
+            }
+        """
+        start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+        coverage_map = self._coverage_from_manifest(granularity)
+
+        need_fetch = []
+        already_cached = 0
+        for ticker in tickers:
+            cov = coverage_map.get(ticker)
+            if cov is not None and cov[0] <= start_ts and cov[1] >= end_ts:
+                already_cached += 1
+                continue
+            need_fetch.append(ticker)
+
+        self.logger.info(
+            f"[{granularity}] 预热：{len(tickers)}只中{already_cached}只本地已覆盖"
+            f"（跳过），{len(need_fetch)}只需要请求（每批{batch_size}只）"
+        )
+
+        batches = [need_fetch[i:i + batch_size] for i in range(0, len(need_fetch), batch_size)]
+        fetched_ok = fetched_fail = 0
+        processed_batches = 0
+        consecutive_full_batch_fail = 0
+        circuit_broken = False
+        circuit_break_message = None
+        time_budget_stopped = False
+        start_time = time.time()
+
+        for bi, batch in enumerate(batches):
+            if max_minutes is not None and (time.time() - start_time) / 60 >= max_minutes:
+                self.logger.info(
+                    f"[{granularity}] 达到时间预算({max_minutes}分钟)，提前结束，"
+                    f"已处理{processed_batches}/{len(batches)}批，下次原样重跑会"
+                    f"自动跳过已覆盖的部分，接着补剩下的"
+                )
+                time_budget_stopped = True
+                break
+
+            results = self._fetch_batch_from_yf(batch, granularity, start, end)
+
+            batch_ok = 0
+            for ticker in batch:
+                fresh = results.get(ticker)
+                cached = self._read_cached(ticker, granularity)
+                self._merge_and_save(ticker, granularity, cached, fresh)
+                if fresh is not None and not fresh.empty:
+                    fetched_ok += 1
+                    batch_ok += 1
+                else:
+                    fetched_fail += 1
+
+            processed_batches += 1
+            consecutive_full_batch_fail = 0 if batch_ok > 0 else consecutive_full_batch_fail + 1
+
+            if consecutive_full_batch_fail >= max_consecutive_batch_failures:
+                circuit_break_message = (
+                    f"[{granularity}] 连续{consecutive_full_batch_fail}批"
+                    f"（每批{batch_size}只，每批内部已重试{self.max_retries}次）"
+                    f"全部拉取失败——单只股票偶尔没数据是正常现象，但连续好几批"
+                    f"整批50只全部失败的概率极低，大概率是网络/yfinance整体"
+                    f"出问题，已提前停止，不再继续空转浪费时间。已处理"
+                    f"{processed_batches}/{len(batches)}批，原样重跑会自动跳过"
+                    f"已成功的部分"
+                )
+                self.logger.critical(circuit_break_message)
+                circuit_broken = True
+                break
+
+            if processed_batches % progress_every_n_batches == 0:
+                elapsed = time.time() - start_time
+                self.logger.info(
+                    f"[{granularity}] 批次进度 {processed_batches}/{len(batches)}，"
+                    f"已用{elapsed/60:.1f}分钟 | 成功{fetched_ok}/失败{fetched_fail}"
+                )
+
+            time.sleep(1.0)  # 批次之间轻微限速，比逐票的0.3秒间隔更宽松，
+                              # 因为每批已经是50只股票打包成一次请求
+
+        return {
+            "total": len(tickers), "already_cached": already_cached,
+            "fetched_ok": fetched_ok, "fetched_fail": fetched_fail,
+            "processed_batches": processed_batches, "total_batches": len(batches),
+            "circuit_broken": circuit_broken, "circuit_break_message": circuit_break_message,
+            "time_budget_stopped": time_budget_stopped,
+        }
+
+    def _fetch_batch_from_yf(self, tickers: list[str], granularity: str,
+                             start: str, end: str) -> dict:
+        """
+        一次yf.download()请求多只股票，返回 {ticker: DataFrame或None}。
+
+        重试策略跟单只请求的_fetch_from_yf()不同：这里只对"整个批次
+        请求本身失败"（HTTP/网络异常，或者yfinance返回完全空的结果）
+        重试，不对"批次请求成功、但批内某几只股票没有数据"这种情况
+        重试整个批次——后者是正常的个股噪音（对应此前实测的15分钟
+        颗粒度背景失败率），重试整批只会让已经成功的那些股票被
+        无意义地重新请求一遍，不会让本来没数据的股票变得有数据。
+        """
+        cfg = GRANULARITY_CONFIG[granularity]
+        interval = cfg["interval"]
+        max_days = cfg["max_history_days"]
+
+        if max_days is not None:
+            earliest_allowed = pd.Timestamp.now().normalize() - pd.Timedelta(days=max_days)
+            if pd.Timestamp(start) < earliest_allowed:
+                self.logger.warning(
+                    f"[{granularity}] 批量请求起点{start}早于该颗粒度约"
+                    f"{max_days}天的可用窗口（约从{earliest_allowed.date()}起），"
+                    f"更早的部分yfinance不提供——数据源本身的硬限制"
+                )
+
+        results: dict = {t: None for t in tickers}
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                raw = yf.download(
+                    tickers, start=start, end=end, interval=interval,
+                    auto_adjust=True, progress=False, threads=False,
+                    group_by="ticker",
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"[{granularity}] 批量拉取异常 attempt={attempt}/{self.max_retries} "
+                    f"批次大小={len(tickers)} error={e}"
+                )
+                time.sleep(self._backoff_seconds(attempt))
+                continue
+
+            if raw is None or raw.empty:
+                self.logger.debug(
+                    f"[{granularity}] 批量拉取整批返回空 "
+                    f"attempt={attempt}/{self.max_retries} 批次大小={len(tickers)}"
+                )
+                time.sleep(self._backoff_seconds(attempt))
+                continue
+
+            # 批次整体请求成功（哪怕批内个别股票没有数据）——不再重试，
+            # 直接解析当前结果并返回
+            if len(tickers) == 1:
+                sub_frames = {tickers[0]: raw}
+            else:
+                sub_frames = {}
+                for t in tickers:
+                    try:
+                        sub_frames[t] = raw[t]
+                    except Exception:
+                        continue  # 这只股票在这批返回结果里没有对应的列，跳过
+
+            for t, tdf in sub_frames.items():
+                try:
+                    tdf = tdf.dropna(how="all")
+                    if tdf.empty:
+                        continue
+                    if isinstance(tdf.columns, pd.MultiIndex):
+                        tdf.columns = tdf.columns.get_level_values(0)
+                    tdf = tdf[~tdf.index.duplicated(keep="first")]
+                    tdf = tdf.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+
+                    if granularity == "daily":
+                        bad = tdf["Close"].pct_change().abs() > 0.80
+                        if bad.sum() > 0:
+                            tdf = tdf[~bad]
+                    else:
+                        if tdf.index.tz is None:
+                            tdf.index = tdf.index.tz_localize("UTC").tz_convert(SYD_TZ).tz_localize(None)
+                        else:
+                            tdf.index = tdf.index.tz_convert(SYD_TZ).tz_localize(None)
+
+                    if not tdf.empty:
+                        results[t] = tdf
+                except Exception as e:
+                    self.logger.debug(f"[{granularity}] 批内单只解析异常 [{t}]: {e}")
+                    continue
+
+            return results
+
+        self.logger.error(
+            f"[{granularity}] 批量拉取{self.max_retries}次重试后仍失败，"
+            f"这批{len(tickers)}只全部跳过"
+        )
+        return results
+
+    # ────────────────────────────────────────────────────────
     # 核心：查缓存 → 补缺口 → 存 → 返回
     # ────────────────────────────────────────────────────────
 
