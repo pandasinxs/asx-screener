@@ -84,12 +84,11 @@ STANDARD_WINDOW_DAYS = 700
 STANDARD_WARMUP_DAYS = 365
 HOURLY_MAX_HISTORY_DAYS = 729
 
-# yfinance 15分钟颗粒度实际上限约60天，但实测59天就会被Yahoo拒绝
-# （报错里的"60天"上限似乎按精确UTC时间点计算，跟日历天数有偏差），
-# 留5天安全余量更稳妥，跟market_data_cache.py里15m的max_history_days
-# 保持一致（两处务必同步改，避免"窗口本身没问题、但内部校验又报警"
-# 这种自相矛盾的日志）
-WEEKLY_15M_WINDOW_DAYS = 55
+# yfinance 15分钟颗粒度实际上限约60天，留1天安全余量。曾经短暂收窄到
+# 55天，是把"部分股票15m颗粒度本身没数据"误判成"窗口边界问题"——后经
+# 交叉验证（同一59天窗口下仍有714只成功、失败股票的daily/60m数据都完好）
+# 证实与窗口宽度无关，改回59天，跟market_data_cache.py的15m配置保持一致
+WEEKLY_15M_WINDOW_DAYS = 59
 
 
 def setup_logging(log_path: str) -> logging.Logger:
