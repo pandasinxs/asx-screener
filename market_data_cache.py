@@ -79,7 +79,10 @@ DEFAULT_CACHE_DIR = os.path.join(_MODULE_DIR, "market_data_cache")
 GRANULARITY_CONFIG = {
     "daily": {"interval": "1d", "max_history_days": None},
     "60m":   {"interval": "60m", "max_history_days": 729},
-    "15m":   {"interval": "15m", "max_history_days": 59},  # 留1天安全余量，文档写60天
+    "15m":   {"interval": "15m", "max_history_days": 55},  # 实测59天仍会被Yahoo拒绝
+                                                              # （报错里的"60天"上限似乎是按
+                                                              # 精确UTC时间点算的，跟日历天数
+                                                              # 有偏差），留5天安全余量更稳妥
 }
 
 MANIFEST_SCHEMA_SQL = """
@@ -277,6 +280,18 @@ class MarketDataCache:
                     f"累积，没法一次性回补历史。"
                 )
 
+        # 空结果（yfinance成功查询但返回0行）和网络异常，用两套不同的重试预算：
+        #   - 网络异常（超时/连接失败等）更可能是瞬时问题，值得用完整的
+        #     max_retries次退避重试
+        #   - 空结果更可能代表"这只股票在这个颗粒度上确实没有数据"（停牌/
+        #     极低流动性/yfinance数据源缺口），重试更多次大概率还是空——
+        #     实测中这类情况在15m颗粒度上占比不低，如果跟异常用同一套
+        #     max_retries=5的退避预算，会在明知大概率无解的请求上浪费
+        #     大量时间（每只失败的股票要消耗约93秒的累计退避等待）。
+        #     这里单独限制空结果最多重试empty_max_retries次就提前放弃。
+        empty_max_retries = min(2, self.max_retries)
+        empty_retry_count = 0
+
         for attempt in range(1, self.max_retries + 1):
             try:
                 df = yf.download(
@@ -284,10 +299,20 @@ class MarketDataCache:
                     auto_adjust=True, progress=False, threads=False,
                 )
                 if df is None or df.empty:
+                    empty_retry_count += 1
                     self.logger.debug(
                         f"{ticker}/{granularity}: 返回空数据 "
                         f"attempt={attempt}/{self.max_retries}"
                     )
+                    if empty_retry_count >= empty_max_retries:
+                        self.logger.info(
+                            f"{ticker}/{granularity}: 连续{empty_retry_count}次查询"
+                            f"成功但返回空结果，大概率是这只股票在该颗粒度上确实"
+                            f"没有数据（yfinance对'请求超出可用窗口'和'纯粹没有"
+                            f"数据'这两种完全不同的情况会打印同一句报错文字，没法"
+                            f"直接从文字区分），提前放弃，不再消耗剩余重试次数"
+                        )
+                        return None
                     time.sleep(self._backoff_seconds(attempt))
                     continue
 
