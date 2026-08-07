@@ -22,8 +22,39 @@
 #      被两个不同的止损距离各自套用了一遍）。v3在触发信号的当下，
 #      用这个模式实际的止损距离重新算一次仓位，跟止损保持一致。
 #
+# v3.1改动（本轮，量化审查后修复）：
+#   4. 系统性成交量基准修正：Mode1兜底/Mode2/Mode3三处"单根K线平均
+#      成交量"基准此前都用avg_vol_20d/26，这个26是9:30开盘（6.5小时=
+#      26根15分钟K线）年代的遗留值，MARKET_OPEN改成10:00之后没有
+#      同步更新——当前交易时段10:00-16:00实际是24根K线，用26做分母
+#      会把这个基准系统性低估约8%，导致三个模式的放量/缩量判断门槛
+#      都比设计时想的更松。改用共享常量BARS_PER_DAY_15M=24，三处
+#      倍数阈值（VOL_SPIKE_RATIO_M1等）本身暂不调整。
+#   5. 模式1改成两阶段确认：v2及之前，detect_breakout_confirmation()
+#      这个"突破确认/证伪"判断函数写好了但从未接入主流程，Mode1
+#      实际是"这根K线一过前高、量能达标就立即触发"，确认逻辑是孤儿
+#      代码。v3.1把它真正接入：本次轮询检测到疑似突破时，先把状态
+#      持久化到watchlist（跨cron进程存活），不立即触发信号；下一次
+#      轮询用detect_breakout_confirmation()判断最新K线是否仍在前高
+#      之上——confirmed才真正触发买入信号（入场价用确认那根K线的
+#      收盘价，不是疑似突破那根，因为那根已经走完，实际能下单的
+#      只有"现在"）；failed（跌破前高超过BREAKOUT_FAILURE_PCT）则
+#      证伪，清除状态；超过MODE1_CONFIRM_MAX_BARS_WAIT根K线仍未
+#      confirm/fail则视为等待超时，同样清除，避免无限期占用判断
+#      资格。疑似突破状态限定同一交易日内有效，跨天自动过期清除。
+#   6. 模式2补上"自last_breakout_date以来的区间最大回撤"校验：
+#      原来的pullback_depth_pct只看"前一根15分钟K线的low"，看不到
+#      突破之后、今天之前那几天内是否发生过更深的回撤（比如突破后
+#      第2天深跌8%、第3天反弹回接近前高，单看最新K线会误判成"很浅
+#      的回踩"）。新增lock_daily_reference()里按日线数据算好的
+#      mode2_breakout_max_dd_pct（自last_breakout_date次日起到昨天
+#      收盘为止的区间最大回撤，跟pullback_depth_pct用同一个prior_high
+#      参照基准），两个深度只要有一个超过MODE2_PULLBACK_MAX_DEPTH_PCT
+#      就拒绝，不再只凭单根K线判断"这是浅回踩"。
+#
 # 四种模式（均为15分钟K线级别的"代理判断"，非逐笔tick级）：
 #   模式1 突破瞬间买：15分钟K线收盘突破prior_high_20d + 放量 + 未被砸回
+#                     （v3.1起改成两阶段：疑似突破→下一根K线确认）
 #   模式2 回踩确认买：突破后（可跨天）回踩缩量企稳，重新拉升的那一根K线
 #   模式3 尾盘确认买（T+1）：15:30-15:45时段维持强势，次日开盘附近了结
 #   模式4 回调确认买：健康回调触底反弹后，当日延续确认
@@ -97,6 +128,20 @@ BREAKOUT_LOOKBACK_DAYS   = 20
 VOL_SPIKE_RATIO_M1       = 1.8
 VOL_SPIKE_RATIO_HIST     = 1.5
 BREAKOUT_FAILURE_PCT     = -0.3
+
+# 15分钟K线单日理论根数：10:00-16:00=6小时=24根。Mode1兜底/Mode2/Mode3
+# 三处"单根K线平均成交量"基准此前用的是26（9:30开盘、6.5小时的年代
+# 遗留值，MARKET_OPEN改成10:00之后没有同步更新），导致这三处基准被
+# 系统性低估约8%（26/24≈1.083），所有依赖它的放量/缩量判断门槛都比
+# 设计时想的更松。改成用同一个常量三处共享，避免以后再和交易时段
+# 配置脱节。三处原有的倍数阈值（VOL_SPIKE_RATIO_M1等）暂不调整，
+# 先看这个修正本身对信号频率的影响，再决定要不要相应重新校准。
+BARS_PER_DAY_15M = 24
+
+# v3.1新增：模式1两阶段确认。疑似突破后最多等待这么多根15分钟K线
+# （30分钟）确认，超过仍未confirm/fail就视为等待超时，清除待确认
+# 状态，不再无限期占用这只股票的模式1判断资格。
+MODE1_CONFIRM_MAX_BARS_WAIT = 2
 
 # 模式2专属（此前叫PULLBACK_MAX_DEPTH_PCT/PULLBACK_VOL_SHRINK_RATIO，
 # v2改名加MODE2_前缀——因为模式4也要用"回调深度/缩量比"这类概念，
@@ -328,6 +373,60 @@ def compute_pullback_reference(high: pd.Series, low: pd.Series,
     return {"recent_high": recent_high, "recent_low": recent_low, "depth_pct": depth_pct}
 
 
+def compute_breakout_max_drawdown(high: pd.Series, low: pd.Series,
+                                   breakout_date_str: Optional[str],
+                                   prior_high: float) -> Optional[float]:
+    """
+    模式2专用（v3.1新增）：自last_breakout_date次日起、到昨天收盘为止，
+    这段区间内日线最低价相对今天prior_high的最大回撤百分比。
+
+    背景：detect_mode2_pullback_crossday()原来的"pullback_depth_pct"
+    只看"前一根15分钟K线的low"，看不到breakout之后、今天之前那几天
+    内曾经发生过的更深回撤（比如breakout后第2天深跌8%，第3天反弹回
+    接近前高——此时单看"最新一根K线"会误判为"很浅的回踩"）。这个函数
+    补上这段历史区间的真实最大回撤，供调用方跟"单根K线深度"一起
+    判断，两者只要有一个超过MODE2_PULLBACK_MAX_DEPTH_PCT就应该拒绝，
+    不能只看当下这一根K线。
+
+    用今天重新计算的prior_high做分母（不是突破当天的价格），跟
+    detect_mode2_pullback_crossday()里pullback_depth_pct用的是同一个
+    参照基准，两个深度指标口径一致，可以直接比较取最大值判断。
+
+    只统计"次日起到昨天"（不含突破当天本身、不含今天），因为：
+      - 突破当天的日内波动理应以突破价附近为主，混进当天的日内低点
+        会引入跟"突破后走弱"完全不同的另一种噪音（比如反复触及但
+        未能有效站稳前高的锯齿走势）
+      - 今天的走势由调用方直接用当日15分钟bars实时判断（单根K线
+        深度检查），不需要靠这个日线区间函数补，两者是互补关系
+
+    返回None：没有last_breakout_date、日期解析失败，或区间内无有效
+    交易日数据（比如breakout就发生在昨天，次日起到昨天的区间是空的）
+    ——这种情况下调用方应该跳过这道额外校验，不阻断模式2判断
+    （避免因为数据暂时缺失而误伤合法信号）。
+    """
+    if not breakout_date_str or prior_high is None or prior_high <= 0:
+        return None
+    try:
+        breakout_date = date.fromisoformat(breakout_date_str)
+    except (TypeError, ValueError):
+        return None
+
+    if low is None or len(low) == 0:
+        return None
+
+    since = pd.Timestamp(breakout_date) + pd.Timedelta(days=1)
+    mask = low.index >= since
+    if not mask.any():
+        return None
+
+    window_low = float(low[mask].min())
+    if window_low <= 0:
+        return None
+
+    dd_pct = round((prior_high - window_low) / prior_high * 100, 2)
+    return dd_pct
+
+
 def calc_atr14(high: pd.Series, low: pd.Series, close: pd.Series,
                 period: int = ATR_PERIOD) -> Optional[float]:
     """
@@ -396,7 +495,8 @@ def lock_daily_reference(item: dict) -> Optional[dict]:
     """
     锁定当日基准位：突破轨道用的prior_high_20d/prior_low_20d/
     avg_vol_20d，以及v2新增的回调轨道用的pullback_recent_low/
-    pullback_depth_pct。两组基准位共用同一次daily_df下载，
+    pullback_depth_pct，以及v3.1新增的模式2区间最大回撤
+    mode2_breakout_max_dd_pct。这几组基准位共用同一次daily_df下载，
     每个交易日只算一次，全天不变（防未来函数），后续15分钟轮询
     直接复用缓存（不再重新下载）。
     """
@@ -431,6 +531,10 @@ def lock_daily_reference(item: dict) -> Optional[dict]:
         pullback_ref = compute_pullback_reference(high, low, close)
         atr14 = calc_atr14(high, low, close)
 
+        breakout_max_dd_pct = compute_breakout_max_drawdown(
+            high, low, item.get("last_breakout_date"), prior_high,
+        )
+
         wdb.update_daily_reference(ticker, today, prior_high, prior_low, avg_vol)
         wdb.update_pullback_reference(
             ticker, today,
@@ -438,6 +542,7 @@ def lock_daily_reference(item: dict) -> Optional[dict]:
             pullback_ref["depth_pct"] if pullback_ref else None,
         )
         wdb.update_atr_reference(ticker, today, atr14)
+        wdb.update_mode2_breakout_drawdown(ticker, today, breakout_max_dd_pct)
         item.update({
             "ref_date": today, "prior_high_20d": prior_high,
             "prior_low_20d": prior_low, "avg_vol_20d": avg_vol,
@@ -445,6 +550,7 @@ def lock_daily_reference(item: dict) -> Optional[dict]:
             "pullback_depth_pct": pullback_ref["depth_pct"] if pullback_ref else None,
             "_pullback_ref": pullback_ref,
             "atr14": atr14,
+            "mode2_breakout_max_dd_pct": breakout_max_dd_pct,
         })
         log.info(
             f"基准锁定 [{ticker}]：前高{prior_high:.3f} 前低{prior_low:.3f} 均量{avg_vol:,.0f}"
@@ -452,6 +558,8 @@ def lock_daily_reference(item: dict) -> Optional[dict]:
             + (f" | 回调参考：低点{pullback_ref['recent_low']:.3f}"
                f"（回撤{pullback_ref['depth_pct']}%）"
                if pullback_ref else " | 回调参考：不适用")
+            + (f" | 模式2区间最大回撤：{breakout_max_dd_pct}%"
+               if breakout_max_dd_pct is not None else "")
         )
         return item
     except Exception as e:
@@ -531,6 +639,17 @@ def calc_cumulative_vwap(bars: list) -> Optional[float]:
 
 def detect_mode1_breakout(bars: list, prior_high: float, avg_vol_20d: float,
                            min_dollar_vol: float) -> Optional[dict]:
+    """
+    模式1第一阶段：检测"疑似突破"（v3.1起不再直接判定为可交易信号，
+    只是识别这一刻的价格/量能形态是否符合突破特征）。
+
+    返回值语义变化说明：这个函数本身的判定逻辑没有变（收盘价刚过
+    前高 + 放量 + 流动性达标），变化的是调用方monitor_one_ticker()
+    如何处理这个返回值——v3.1之前拿到非None结果就直接触发买入信号，
+    v3.1起改成先标记"疑似突破"、等下一根K线走完后用
+    detect_breakout_confirmation()判断是否真正confirm，具体两阶段
+    编排逻辑在_process_mode1_two_stage()里。
+    """
     if len(bars) < 2 or not prior_high:
         return None
 
@@ -544,7 +663,7 @@ def detect_mode1_breakout(bars: list, prior_high: float, avg_vol_20d: float,
     if same_day_bars:
         intraday_avg_vol = sum(b["volume"] for b in same_day_bars) / len(same_day_bars)
     else:
-        intraday_avg_vol = avg_vol_20d / 26
+        intraday_avg_vol = avg_vol_20d / BARS_PER_DAY_15M
 
     dollar_vol = cur["close"] * cur["volume"]
     if dollar_vol < min_dollar_vol:
@@ -563,6 +682,17 @@ def detect_mode1_breakout(bars: list, prior_high: float, avg_vol_20d: float,
 
 
 def detect_breakout_confirmation(bars: list, prior_high: float) -> Optional[str]:
+    """
+    模式1第二阶段：判断"疑似突破"是否confirm/fail。v3.1起真正接入
+    主流程（此前定义了但从未被调用，属于孤儿代码）。
+
+    在_process_mode1_two_stage()里，这个函数用最新一根K线（不一定
+    是疑似突破那根，是之后的轮询里最新拿到的那根）相对prior_high
+    的位置判断：
+      "confirmed"：仍在前高之上，突破有效
+      "failed"：跌破前高超过BREAKOUT_FAILURE_PCT，视为假突破
+      None：处于两者之间的模糊区间，需要再等下一根K线
+    """
     if len(bars) < 2:
         return None
     cur = bars[-1]
@@ -574,10 +704,99 @@ def detect_breakout_confirmation(bars: list, prior_high: float) -> Optional[str]
     return None
 
 
+def _process_mode1_two_stage(item: dict, bars: list, prior_high: float,
+                              avg_vol_20d: float, already_signaled_today: bool,
+                              today: str) -> Optional[dict]:
+    """
+    模式1两阶段确认编排逻辑（v3.1新增）。
+
+    v2及之前：detect_mode1_breakout()一返回非None结果就立即触发
+    买入信号，detect_breakout_confirmation()这个确认/证伪判断函数
+    写好了但从未接入，是孤儿代码。
+
+    v3.1改动：
+      阶段1（本次轮询检测到疑似突破）：只把状态持久化到watchlist
+      （pending_breakout_*字段，跨cron进程存活），不触发买入信号。
+      阶段2（后续轮询）：用detect_breakout_confirmation()判断最新
+      K线相对prior_high的位置——
+        "confirmed"：确认突破有效，此时才真正触发模式1买入信号。
+                     入场价用本次确认K线的收盘价，不是疑似突破那根
+                     K线的价格——那根K线已经走完，实际能下单的
+                     价位只能是"现在"这一刻。
+        "failed"：证伪，清除待确认状态，不触发信号
+        None（模糊区间）：继续等待，但最多等
+        MODE1_CONFIRM_MAX_BARS_WAIT根K线，超过仍未confirm/fail
+        则视为等待超时，同样清除，避免无限期占用这只股票的模式1
+        判断资格
+
+    同一交易日内的状态隔离：如果pending_breakout_date跟今天不一致
+    （比如疑似突破发生在收盘前最后一根K线，当天没有更多轮询能
+    confirm/fail，状态跨到了第二天），直接视为过期清除，不用昨天
+    的疑似突破状态去匹配今天全新的prior_high/K线序列。
+    """
+    ticker = item["ticker"]
+    pending_date = item.get("pending_breakout_date")
+
+    if pending_date == today and item.get("pending_breakout_time"):
+        # 阶段2：已有待确认的疑似突破，判断confirm/fail/expire
+        result = detect_breakout_confirmation(bars, prior_high)
+        bars_waited = (item.get("pending_breakout_bars_waited") or 0) + 1
+
+        if result == "confirmed":
+            wdb.clear_pending_breakout(ticker)
+            if already_signaled_today:
+                return None
+            cur = bars[-1]
+            return {
+                "mode": "模式1-突破瞬间买", "state": "breaking",
+                "price": cur["close"],
+                "vol_ratio": item.get("pending_breakout_vol_ratio"),
+                "breakout_level": prior_high,
+                "time": cur["time"],
+                "execution_window": "当前/今日内尽快（突破已确认，确认窗口很短）",
+            }
+
+        if result == "failed" or bars_waited >= MODE1_CONFIRM_MAX_BARS_WAIT:
+            log.info(
+                f"[{ticker}] 疑似突破未能确认"
+                f"（{'价格跌破证伪' if result == 'failed' else f'等待{bars_waited}根K线超时'}），"
+                f"清除待确认状态，本轮不触发模式1"
+            )
+            wdb.clear_pending_breakout(ticker)
+            return None
+
+        # 仍处于模糊区间（未confirm也未fail），继续等待下一次轮询
+        wdb.set_pending_breakout(
+            ticker, item["pending_breakout_time"], item["pending_breakout_price"],
+            item.get("pending_breakout_vol_ratio"), bars_waited,
+        )
+        return None
+
+    # 阶段1：尚无待确认的疑似突破。先清掉可能跨天遗留的陈旧状态，
+    # 再检测这次轮询有没有出现新的疑似突破。
+    if pending_date and pending_date != today:
+        log.info(f"[{ticker}] 昨天遗留的疑似突破状态已跨天过期，清除"
+                 f"（未能在当天完成确认）")
+        wdb.clear_pending_breakout(ticker)
+
+    suspected = detect_mode1_breakout(bars, prior_high, avg_vol_20d, MIN_DOLLAR_VOLUME_INTRADAY)
+    if suspected:
+        log.info(
+            f"[{ticker}] 疑似突破 @ ${suspected['price']:.3f}"
+            f"（量比{suspected['vol_ratio']}x，前高${prior_high:.3f}），"
+            f"等待下一根K线确认（最多等{MODE1_CONFIRM_MAX_BARS_WAIT}根）"
+        )
+        wdb.set_pending_breakout(
+            ticker, suspected["time"].isoformat(), suspected["price"],
+            suspected["vol_ratio"], 0,
+        )
+    return None
+
+
 def detect_mode2_pullback_crossday(item: dict, bars: list,
                                     prior_high: float) -> Optional[dict]:
     """
-    模式2-回踩确认买（v2：跨天版）。
+    模式2-回踩确认买（v2：跨天版；v3.1：补上区间最大回撤校验）。
 
     v1的问题：download_intraday()每次只返回"今天"的K线，v1在这份
     today-only的bars里搜索"是否发生过突破"，导致只能捕捉"同一天内
@@ -595,12 +814,21 @@ def detect_mode2_pullback_crossday(item: dict, bars: list,
     最新值才是真正在测试的支撑位。
 
     量能判断退化为日线代理：因为拿不到历史突破那天的15分钟K线
-    量能数据（只有当天bars），用avg_vol_20d/26这个"单bar历史基准量"
-    做代理，跟模式3已经在用的代理方式保持一致。
+    量能数据（只有当天bars），用avg_vol_20d/BARS_PER_DAY_15M这个
+    "单bar历史基准量"做代理，跟模式3已经在用的代理方式保持一致。
 
     "确认反转"这一步的判断标准维持v1原样：当前bar收盘 > 上一bar
     收盘——按用户明确要求，这次不跟模式4的"收盘位置+放量"标准
     统一，避免影响已经在跑的实盘信号。
+
+    v3.1新增：单根K线的pullback_depth_pct只能看到"当下这一刻"的
+    回踩深度，看不到突破之后、今天之前这段时间内是否发生过更深的
+    回撤（比如第2天深跌8%、第3天反弹回接近前高——单看最新K线会
+    误判成"很浅的回踩"）。现在额外用
+    item["mode2_breakout_max_dd_pct"]（lock_daily_reference()按日线
+    数据算好、跟pullback_depth_pct同一个prior_high基准）做区间层面
+    的深度校验，两个深度只要有一个超过MODE2_PULLBACK_MAX_DEPTH_PCT
+    就拒绝，不再只凭单根K线判断"这是浅回踩"。
     """
     if len(bars) < 2 or not prior_high:
         return None
@@ -621,6 +849,12 @@ def detect_mode2_pullback_crossday(item: dict, bars: list,
         #        用这个过旧的"突破事件"触发模式2意义不大
         return None
 
+    # v3.1新增：区间最大回撤校验，补单根K线看不到的历史深度盲区。
+    # 为None（没有该数据）时不阻断，避免因为数据暂时缺失误伤合法信号。
+    breakout_max_dd_pct = item.get("mode2_breakout_max_dd_pct")
+    if breakout_max_dd_pct is not None and breakout_max_dd_pct > MODE2_PULLBACK_MAX_DEPTH_PCT:
+        return None
+
     cur, prev = bars[-1], bars[-2]
     pullback_depth_pct = (prior_high - prev["low"]) / prior_high * 100
 
@@ -632,7 +866,7 @@ def detect_mode2_pullback_crossday(item: dict, bars: list,
         return None
 
     avg_vol_20d = item.get("avg_vol_20d") or 0
-    bar_avg_vol_baseline = avg_vol_20d / 26 if avg_vol_20d else 0
+    bar_avg_vol_baseline = avg_vol_20d / BARS_PER_DAY_15M if avg_vol_20d else 0
     if (bar_avg_vol_baseline > 0
             and cur["volume"] > bar_avg_vol_baseline * MODE2_PULLBACK_VOL_SHRINK_RATIO * 1.5):
         return None
@@ -643,6 +877,7 @@ def detect_mode2_pullback_crossday(item: dict, bars: list,
     return {
         "mode": "模式2-回踩确认买", "state": "confirmed",
         "price": cur["close"], "pullback_depth_pct": round(pullback_depth_pct, 2),
+        "breakout_max_dd_pct": breakout_max_dd_pct,
         "breakout_level": prior_high, "days_since_breakout": days_since_breakout,
         "time": cur["time"],
     }
@@ -702,7 +937,7 @@ def detect_mode3_late_session(bars: list, day_high: float,
     if dist_from_high_pct > LATE_SESSION_NEAR_HIGH_PCT:
         return None
 
-    bar_avg_vol = avg_vol_20d / 26 if avg_vol_20d else 0
+    bar_avg_vol = avg_vol_20d / BARS_PER_DAY_15M if avg_vol_20d else 0
     is_red_bar = cur["close"] < cur["open"]
     if is_red_bar and bar_avg_vol > 0 and cur["volume"] > bar_avg_vol * 1.5:
         return None
@@ -832,10 +1067,10 @@ def monitor_one_ticker(item: dict) -> None:
     signal = None
 
     if run_breakout_modes:
-        m1 = detect_mode1_breakout(bars, prior_high, avg_vol_20d, MIN_DOLLAR_VOLUME_INTRADAY)
-        if m1 and not already_signaled_today:
+        m1 = _process_mode1_two_stage(item, bars, prior_high, avg_vol_20d,
+                                       already_signaled_today, today)
+        if m1:
             signal = m1
-            signal["execution_window"] = "当前/今日内尽快（突破刚发生，确认窗口很短）"
 
         if signal is None:
             m2 = detect_mode2_pullback_crossday(item, bars, prior_high)
@@ -969,11 +1204,13 @@ def monitor_one_ticker(item: dict) -> None:
     )
 
     extra_lines = []
-    if "vol_ratio" in signal:
+    if "vol_ratio" in signal and signal["vol_ratio"] is not None:
         extra_lines.append(f"量比：{signal['vol_ratio']}x（vs当日均量）")
     if "pullback_depth_pct" in signal:
         depth_label = "回调深度" if signal["mode"] == "模式4-回调确认买" else "回踩深度"
         extra_lines.append(f"{depth_label}：{signal['pullback_depth_pct']}%")
+    if "breakout_max_dd_pct" in signal and signal["breakout_max_dd_pct"] is not None:
+        extra_lines.append(f"区间最大回撤（突破以来）：{signal['breakout_max_dd_pct']}%")
     if "dist_from_high_pct" in signal:
         extra_lines.append(f"距今日高点：{signal['dist_from_high_pct']}%")
     if "close_pos" in signal:
