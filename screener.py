@@ -2485,52 +2485,100 @@ def select_top3(all_data: dict, market_snap: dict,
     xjo_s     = market_snap.get("xjo_series")
     today_ann = fetch_today_announcements()
 
-    log.info("分级筛选（T1-T4全部扫描，合并排序）...")
+    log.info("分级筛选（每只股票技术指标只算一次，按T1→T4顺序尝试，先到先得）...")
     seen_tickers = {}
+    tier_counts  = {t["level"]: 0 for t in TIERS}
 
-    for tier in TIERS:
-        log.info(f"  {tier['level']} ({tier['label']})...")
-        count = 0
-        for ticker, df in all_data.items():
-            if ticker in seen_tickers:
-                continue
+    today_str = date.today().isoformat()
+    week_ago  = (date.today() - timedelta(days=7)).isoformat()
+    month_ago = (date.today() - timedelta(days=30)).isoformat()
+
+    # v18.6性能修复：原实现是"for tier: for ticker"两层循环，
+    # build_tech_summary()对同一只股票同一天完全不受tier影响
+    # （只有_passes_tier()内部的阈值/权重锚点才依赖tier），但旧代码
+    # 会让一只股票在T1未通过后，到T2循环里重新完整调用一次
+    # build_tech_summary()——全市场~2000只股票，最多被重复计算4遍
+    # 完全一样的技术指标（ADX/RSI/VWAP/ATR等）。
+    # 改成对每只股票只调用一次build_tech_summary()，按TIERS顺序
+    # （T1→T2→T3→T4）依次尝试_passes_tier()，第一个通过的tier获胜，
+    # 后续tier不再尝试——"先到先得、T1优先"的语义与原实现完全一致。
+    # 这个模式跟backtest_engine.py v2.1的scan_day()是同一套逻辑
+    # （那边已经用相同结构跑通并验证过），这里回填到screener.py，
+    # 让线上生产环境和离线回测引擎在这一点上保持同一套实现。
+    for ticker, df in all_data.items():
+        if len(df) < 60:
+            continue
+        try:
+            tech = build_tech_summary(df, xjo_s)
+        except Exception as e:
+            log.debug(f"build_tech_summary异常 [{ticker}]: {e}")
+            continue
+
+        passed_tier  = None
+        tier_errored = False
+        for tier in TIERS:
             try:
-                if len(df) < 60:
-                    continue
-                tech = build_tech_summary(df, xjo_s)
-                if _passes_tier(tech, tier):
-                    tech["ticker"]     = ticker
-                    tech["tier_level"] = tier["level"]
-                    tech["tier_label"] = tier["label"]
-
-                    tech["persistence_score"] = _check_trend_persistence(
-                        tech["_close"], tech["_adx_s"],
-                        tech["_pdi_s"], tech["_mdi_s"],
-                    )
-
-                    tech["hh_hl"]      = _check_higher_highs_lows(tech["_high"], tech["_low"])
-                    tech["ma_aligned"] = _check_ma_alignment(tech, tier["level"])
-
-                    code      = ticker.replace(".AX", "")
-                    ann       = today_ann.get(code, {})
-                    ann_date  = ann.get("date", "") if ann else ""
-                    today_str = date.today().isoformat()
-                    week_ago  = (date.today() - timedelta(days=7)).isoformat()
-                    month_ago = (date.today() - timedelta(days=30)).isoformat()
-                    if ann.get("sensitive") and ann_date == today_str:
-                        tech["catalyst"] = 1.0
-                    elif ann.get("sensitive") and ann_date >= week_ago:
-                        tech["catalyst"] = 0.7
-                    elif ann_date >= month_ago:
-                        tech["catalyst"] = 0.3
-                    else:
-                        tech["catalyst"] = 0.0
-
-                    seen_tickers[ticker] = tech
-                    count += 1
+                passed = _passes_tier(tech, tier)
             except Exception as e:
-                log.debug(f"筛选异常 [{ticker}]: {e}")
-        log.info(f"    → 本层新增 {count} 个（累计 {len(seen_tickers)} 个）")
+                log.debug(f"_passes_tier异常 [{ticker}] tier={tier['level']}: {e}")
+                tier_errored = True
+                break  # 同一份tech数据，其余tier大概率遇到同样的异常，不再重试
+            if passed:
+                passed_tier = tier
+                break
+
+        if tier_errored or passed_tier is None:
+            continue
+
+        tech["ticker"]     = ticker
+        tech["tier_level"] = passed_tier["level"]
+        tech["tier_label"] = passed_tier["label"]
+
+        # 与原实现保持同样的容错哲学：这几项衍生计算此前和
+        # build_tech_summary/_passes_tier共享同一个try块，任何一项
+        # 异常都会让整只股票在"当前tier尝试"里被丢弃、下一个tier
+        # 重新来过。既然这几项不依赖tier，重试不会改变结果，原实现
+        # 实际上等价于"这只股票被无声排除在所有tier之外"。改成各自
+        # 独立try/except、失败时退化为安全默认值，避免因为一项
+        # 非核心衍生指标算不出来就丢掉整个候选，跟backtest_engine.py
+        # 的处理方式一致。
+        try:
+            tech["persistence_score"] = _check_trend_persistence(
+                tech["_close"], tech["_adx_s"],
+                tech["_pdi_s"], tech["_mdi_s"],
+            )
+        except Exception as e:
+            log.debug(f"_check_trend_persistence异常 [{ticker}]: {e}")
+            tech["persistence_score"] = 0.0
+
+        try:
+            tech["hh_hl"]      = _check_higher_highs_lows(tech["_high"], tech["_low"])
+            tech["ma_aligned"] = _check_ma_alignment(tech, passed_tier["level"])
+        except Exception as e:
+            log.debug(f"结构检查异常 [{ticker}]: {e}")
+            tech["hh_hl"]      = False
+            tech["ma_aligned"] = False
+
+        code     = ticker.replace(".AX", "")
+        ann      = today_ann.get(code, {})
+        ann_date = ann.get("date", "") if ann else ""
+        if ann.get("sensitive") and ann_date == today_str:
+            tech["catalyst"] = 1.0
+        elif ann.get("sensitive") and ann_date >= week_ago:
+            tech["catalyst"] = 0.7
+        elif ann_date >= month_ago:
+            tech["catalyst"] = 0.3
+        else:
+            tech["catalyst"] = 0.0
+
+        seen_tickers[ticker] = tech
+        tier_counts[passed_tier["level"]] += 1
+
+    cumulative = 0
+    for tier in TIERS:
+        cumulative += tier_counts[tier["level"]]
+        log.info(f"  {tier['level']} ({tier['label']})：本层 {tier_counts[tier['level']]} 个"
+                 f"（累计 {cumulative} 个）")
 
     raw_signals = list(seen_tickers.values())
 
