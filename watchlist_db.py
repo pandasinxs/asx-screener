@@ -92,6 +92,26 @@ def init_watchlist_db() -> None:
                     -- 跟prior_high_20d/pullback_recent_low共用同一次
                     -- 日线下载算出，避免多打一次yfinance请求
                     atr14 REAL,
+                    -- v3新增：模式2用，自last_breakout_date以来（不含突破
+                    -- 当天，从次日起到昨天收盘为止）日线区间的最大回撤
+                    -- 百分比（分母用当天重新计算的prior_high，跟
+                    -- detect_mode2_pullback_crossday()里pullback_depth_pct
+                    -- 是同一个参照基准）。补上"只看单根15分钟K线看不到的
+                    -- 历史深度盲区"——比如突破后第2天深跌8%、第3天反弹
+                    -- 回接近前高，只看最新一根K线会误判成"很浅的回踩"。
+                    mode2_breakout_max_dd_pct REAL,
+                    -- v3新增：模式1两阶段确认机制。"疑似突破"状态需要
+                    -- 跨轮询（跨cron进程）持久化，同一交易日内最多等待
+                    -- MODE1_CONFIRM_MAX_BARS_WAIT根K线确认，超时或
+                    -- 证伪则清除。跟last_breakout_date/last_breakout_price
+                    -- 不同——那两个字段只在模式1真正confirm触发信号后
+                    -- 才写入（供模式2使用），这里记录的是"还没confirm、
+                    -- 正在等确认"的中间状态。
+                    pending_breakout_time        TEXT,
+                    pending_breakout_price       REAL,
+                    pending_breakout_vol_ratio   REAL,
+                    pending_breakout_date        TEXT,
+                    pending_breakout_bars_waited INTEGER DEFAULT 0,
                     -- daily_analysis.py盘前分析写入的当日跨日状态，
                     -- 供intraday_monitor.py读取，决定是否对该股票
                     -- 运行三种日内模式判断（只对today_status='ready'的股票判断）
@@ -121,6 +141,18 @@ def init_watchlist_db() -> None:
                 conn.execute("ALTER TABLE watchlist ADD COLUMN pullback_depth_pct REAL")
             if "atr14" not in cols:
                 conn.execute("ALTER TABLE watchlist ADD COLUMN atr14 REAL")
+            if "mode2_breakout_max_dd_pct" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN mode2_breakout_max_dd_pct REAL")
+            if "pending_breakout_time" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN pending_breakout_time TEXT")
+            if "pending_breakout_price" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN pending_breakout_price REAL")
+            if "pending_breakout_vol_ratio" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN pending_breakout_vol_ratio REAL")
+            if "pending_breakout_date" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN pending_breakout_date TEXT")
+            if "pending_breakout_bars_waited" not in cols:
+                conn.execute("ALTER TABLE watchlist ADD COLUMN pending_breakout_bars_waited INTEGER DEFAULT 0")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS intraday_snapshots (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -348,7 +380,11 @@ def get_active_watchlist() -> list:
                        last_signal_mode, last_signal_date, last_signal_price, stop_loss_price,
                        today_status, today_status_date, today_signal_count,
                        last_breakout_date, last_breakout_price,
-                       pullback_recent_low, pullback_depth_pct, atr14
+                       pullback_recent_low, pullback_depth_pct, atr14,
+                       mode2_breakout_max_dd_pct,
+                       pending_breakout_time, pending_breakout_price,
+                       pending_breakout_vol_ratio, pending_breakout_date,
+                       pending_breakout_bars_waited
                 FROM watchlist
                 WHERE status = 'active' AND days_elapsed < total_days
                 ORDER BY composite_score DESC
@@ -359,7 +395,11 @@ def get_active_watchlist() -> list:
                 "last_signal_mode", "last_signal_date", "last_signal_price", "stop_loss_price",
                 "today_status", "today_status_date", "today_signal_count",
                 "last_breakout_date", "last_breakout_price",
-                "pullback_recent_low", "pullback_depth_pct", "atr14"]
+                "pullback_recent_low", "pullback_depth_pct", "atr14",
+                "mode2_breakout_max_dd_pct",
+                "pending_breakout_time", "pending_breakout_price",
+                "pending_breakout_vol_ratio", "pending_breakout_date",
+                "pending_breakout_bars_waited"]
         return [dict(zip(cols, r)) for r in rows]
     except Exception as e:
         log.error(f"读取监测队列失败: {e}")
@@ -418,6 +458,71 @@ def update_atr_reference(ticker: str, ref_date: str, atr14: Optional[float]) -> 
             conn.commit()
     except Exception as e:
         log.error(f"更新ATR14失败 [{ticker}]: {e}")
+
+
+def update_mode2_breakout_drawdown(ticker: str, ref_date: str,
+                                    breakout_max_dd_pct: Optional[float]) -> None:
+    """
+    v3新增：模式2专用，跟update_daily_reference()/update_atr_reference()
+    在lock_daily_reference()同一次日线下载里一起算，缓存"自
+    last_breakout_date以来（不含突破当天）区间的最大回撤"，避免每
+    15分钟轮询都重新算一遍。传None表示没有last_breakout_date可参照，
+    或该区间内无有效数据（比如突破就发生在昨天，次日起到昨天的
+    区间是空的）。
+    """
+    try:
+        with sqlite3.connect(WATCHLIST_DB_PATH) as conn:
+            conn.execute(
+                "UPDATE watchlist SET mode2_breakout_max_dd_pct = ? WHERE ticker = ?",
+                (breakout_max_dd_pct, ticker)
+            )
+            conn.commit()
+    except Exception as e:
+        log.error(f"更新模式2区间最大回撤失败 [{ticker}]: {e}")
+
+
+def set_pending_breakout(ticker: str, breakout_time: str, price: float,
+                          vol_ratio: Optional[float], bars_waited: int) -> None:
+    """
+    v3新增（模式1两阶段确认）：记录"疑似突破"待确认状态，供下一次
+    轮询判断confirm/fail/expire。今天日期自动写入pending_breakout_date，
+    供跨天过期判断使用——如果疑似突破发生在收盘前最后一根K线，当天
+    没有更多轮询能confirm/fail，下一次轮询已经是第二天，
+    intraday_monitor.py会发现pending_breakout_date不是今天，视为
+    过期清除，不会拿昨天的疑似突破状态去匹配今天全新的prior_high。
+    """
+    today = date.today().isoformat()
+    try:
+        with sqlite3.connect(WATCHLIST_DB_PATH) as conn:
+            conn.execute("""
+                UPDATE watchlist
+                SET pending_breakout_time = ?, pending_breakout_price = ?,
+                    pending_breakout_vol_ratio = ?, pending_breakout_date = ?,
+                    pending_breakout_bars_waited = ?
+                WHERE ticker = ?
+            """, (breakout_time, price, vol_ratio, today, bars_waited, ticker))
+            conn.commit()
+    except Exception as e:
+        log.error(f"记录疑似突破状态失败 [{ticker}]: {e}")
+
+
+def clear_pending_breakout(ticker: str) -> None:
+    """
+    v3新增：清除"疑似突破"待确认状态（确认触发/证伪/等待超时/
+    跨天过期时调用）。
+    """
+    try:
+        with sqlite3.connect(WATCHLIST_DB_PATH) as conn:
+            conn.execute("""
+                UPDATE watchlist
+                SET pending_breakout_time = NULL, pending_breakout_price = NULL,
+                    pending_breakout_vol_ratio = NULL, pending_breakout_date = NULL,
+                    pending_breakout_bars_waited = 0
+                WHERE ticker = ?
+            """, (ticker,))
+            conn.commit()
+    except Exception as e:
+        log.error(f"清除疑似突破状态失败 [{ticker}]: {e}")
 
 
 def append_signal_log(ticker: str, company_name: str, mode: str,
