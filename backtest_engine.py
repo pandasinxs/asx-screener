@@ -2,7 +2,7 @@
 """
 backtest_engine.py
 ====================
-ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.2：复用screener.py真实逻辑版）
+ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.3：小时级近似策略默认停用）
 
 核心设计:
     本脚本不重新实现打分逻辑，而是直接 `import screener`，复用其中的
@@ -13,7 +13,25 @@ ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.2：复用scre
     这意味着回测用的止盈止损/超时规则和你线上 signals_history 表完全一致，
     两者理论上可以合并统计（本脚本提供 --merge-live 选项做这件事）。
 
-v2.2改动（本轮，数据层与回测逻辑解耦）：
+v2.3改动（本轮，intraday验证工具切换）：
+    include_hourly_intraday（HourlyIntradayApprox，60分钟线近似
+    intraday_monitor.py四模式的独立研究性策略）默认值从True改为False，
+    CLI flag从"--disable-hourly-intraday"改成"--enable-hourly-intraday"
+    （opt-in，语义随默认值反转跟着变）。
+
+    原因：新增的backtest_intraday.py直接调用intraday_monitor.py真实的
+    15分钟检测函数（detect_mode1_breakout等），跑在market_data_cache.py
+    按周累积的真实15分钟历史数据上，能真正回答"intraday_monitor.py
+    现在这套设计好不好"——这正是60分钟近似策略从设计之初就回答不了
+    的问题（见HourlyIntradayApprox类文档的边界声明）。backtest_intraday.py
+    才是现在验证intraday_monitor.py的正式工具。
+
+    不删代码、不删intraday_htf_signals表：已经跑过的历史实验（比如
+    htf_tighten_late_session_v1）数据不会因为这次决定丢失，仍然可以
+    用--enable-hourly-intraday显式打开复现旧行为，或者对比新旧两种
+    方法的结果，但新的回测不应该再默认依赖它。
+
+v2.2改动（数据层与回测逻辑解耦）：
     DataLayer不再直接调用yfinance，改为通过market_data_cache.py这个
     本地Parquet缓存层读取——本地已经覆盖的区间完全不碰网络，只有真正
     缺口的部分才会实际请求。建议在跑本脚本之前先执行一次
@@ -22,7 +40,7 @@ v2.2改动（本轮，数据层与回测逻辑解耦）：
     再碰网络。没有提前预热也完全不影响正确性，只是第一次跑会慢一些
     （跟v2.1之前的行为等价，只是顺手把拿到的数据存起来供下次用）。
 
-v2.1改动（本轮修复，正式全市场700天回测前的检查中发现）：
+v2.1改动（正式全市场700天回测前的检查中发现）：
     1) 修复健康度评估的小时线日期对齐bug：原来用"hourly_full.index <= day"
        比较，hourly_full的index是当天挂钟时间（如10:00/11:00），day是
        日线index当天0点的时间戳，这个比较恒为False，导致"今天"这一天的
@@ -260,8 +278,8 @@ def send_telegram_document(file_path: str, caption: str = "",
 # 统一规则：不再手动传--start/--end，一律自动算成"今天倒推700天"，
 # 加上再往前365天（1年）的热身缓冲用于计算MA200/52周高点这些长窗口
 # 指标的初始值。700天留了30天余量在yfinance 60m数据~729天的硬上限
-# 内，所以--use-hourly-vol-ratio/--include-hourly-intraday这两个
-# 现在默认开启的功能不会因为标准窗口本身而触发2年上限报错。
+# 内，所以--use-hourly-vol-ratio这个默认开启的功能不会因为标准窗口
+# 本身而触发2年上限报错。
 #
 # 这样做的目的：让所有实验的"测试范围"完全一致，只有参数在变，
 # 排行榜/对比才有意义——如果每次连测试区间都不一样，胜率差异到底是
@@ -330,16 +348,28 @@ class BacktestConfig:
     # ── 60分钟线相关（yfinance对60m颗粒度的历史深度上限约730天，
     # 明显宽于15m/30m等更细颗粒度的60天上限）────────────────────────
     # 现在是标准测试方法论的一部分，默认开启（不再是可选的实验性flag）。
-    # 用60分钟线数据精确化health层的"尾盘时段量比"。
+    # 用60分钟线数据精确化health层的"尾盘时段量比"。这一项跟下面的
+    # include_hourly_intraday是两回事：这个只是给health_status的
+    # 量比因子做精度提升，不涉及任何"小时级择时策略"，保持默认开启。
     use_hourly_vol_ratio: bool = True
     yf_60m_max_days: int = 729  # yfinance 60m颗粒度的实际上限是730天，留1天安全余量
 
-    # ── 小时级变种策略（近似intraday_monitor.py的三种入场模式，但用60分钟线
-    # 而不是真实的15分钟线）——这是一个全新的、独立的研究性回测，
-    # 不是对intraday_monitor.py本身的验证。现在默认开启（标准测试方法论
-    # 的一部分），结果始终写入独立的intraday_htf_signals表，跟核心EOD
-    # 回测结果物理隔离，不会混在一起。
-    include_hourly_intraday: bool = True
+    # ── [已废弃，v2.3起默认关闭] 小时级变种策略（近似intraday_monitor.py
+    # 的三种入场模式，但用60分钟线而不是真实的15分钟线）——这是一个
+    # 独立的研究性回测，不是对intraday_monitor.py本身的验证。
+    #
+    # 已被backtest_intraday.py取代：那边直接调用intraday_monitor.py
+    # 真实的15分钟检测函数（detect_mode1_breakout等），跑在market_
+    # data_cache.py按周累积的真实15分钟历史数据上，能够真正回答
+    # "intraday_monitor.py现在这套设计好不好"——这正是这个60分钟
+    # 近似策略从设计之初就回答不了的问题（详见下面HourlyIntradayApprox
+    # 类文档里的边界声明）。
+    #
+    # 保留这个类、这组参数、intraday_htf_signals表，不删代码——已经
+    # 跑过的历史实验（比如htf_tighten_late_session_v1）数据不应该
+    # 因为这次决定而丢失，仍然可以用--enable-hourly-intraday显式
+    # 打开复现旧行为，但新的回测不应该再默认依赖它，故默认值改为False。
+    include_hourly_intraday: bool = False
     htf_breakout_lookback_days: int = 20       # 对应intraday_monitor.py的BREAKOUT_LOOKBACK_DAYS
     htf_vol_spike_ratio: float = 1.5           # 对应VOL_SPIKE_RATIO_M1(1.8)，小时线成交量分布不同，起点估计值
     # 模式2专属（浅回踩+跨天，配合模式1突破——不是health层那种8%-25%深回调判断，
@@ -472,11 +502,12 @@ class DataLayer:
 
     def fetch_15m(self, ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
         """
-        15分钟线读取接口（v2.2新增，供未来对intraday_monitor.py做更贴近
-        真实颗粒度的验证时使用）。yfinance该颗粒度只能看最近~60天，
-        更长的历史需要靠data_fetcher.py --mode weekly15m按周持续累积，
-        这里只是把market_data_cache里已经攒下来的部分读出来，本身
-        不负责"从头补全多年历史"（那件事做不到，是数据源硬限制）。
+        15分钟线读取接口，供未来对intraday_monitor.py做更贴近
+        真实颗粒度的验证时使用（现在backtest_intraday.py就是这个用途）。
+        yfinance该颗粒度只能看最近~60天，更长的历史需要靠
+        data_fetcher.py --mode weekly15m按周持续累积，这里只是把
+        market_data_cache里已经攒下来的部分读出来，本身不负责
+        "从头补全多年历史"（那件事做不到，是数据源硬限制）。
         """
         key = f"15m|{ticker}|{start}|{end}"
         if key in self._cache:
@@ -1141,6 +1172,15 @@ class OutcomeSimulator:
 # ════════════════════════════════════════════════════════════
 # 小时级变种策略 —— 用60分钟线近似intraday_monitor.py v3的四种入场模式
 #
+# [已废弃，v2.3起默认停用，见BacktestConfig.include_hourly_intraday]
+# 已被backtest_intraday.py取代——那边直接调用intraday_monitor.py真实的
+# 15分钟检测函数，跑在真实历史15分钟数据上，能回答"intraday_monitor.py
+# 现在这套设计好不好"，这正是下面这个60分钟近似策略从设计之初就
+# 回答不了的问题（见下方边界声明）。这个类连同intraday_htf_signals表
+# 都保留不删，只是不再默认运行——已经跑过的历史实验（比如
+# htf_tighten_late_session_v1）数据不会因此丢失，仍可用
+# --enable-hourly-intraday显式打开复现旧行为。
+#
 # ⚠️ 极其重要的边界声明（在这里、在所有输出、在报告里都会反复出现）：
 # 这不是对intraday_monitor.py的验证。intraday_monitor.py的四种模式
 # 是按15分钟颗粒度设计的（突破瞬间买要求"这一根15分钟K线"放量突破，
@@ -1428,18 +1468,12 @@ CREATE TABLE IF NOT EXISTS signals_history_backtest (
 )
 """
 
-# 用于判断现有表是不是"跟得上最新schema"的必需列集合。任何一次给
-# signals_history_backtest加新字段（比如这次的health_*），都应该把
-# 新列名加进这个集合——_init_db()靠这个集合决定要不要把旧表重命名备份。
 REQUIRED_COLUMNS = {
     "param_set", "health_status", "health_data_days",
     "health_signal_count", "health_warn_count",
     "trend_strength_score", "trend_sub_relative_strength",
 }
 
-# 小时级变种策略结果 —— 独立的表，独立的schema，跟signals_history_backtest
-# 完全不共享任何迁移逻辑，物理上分开存放，避免这个明确标注为"非验证性
-# 研究"的实验性数据，和EOD核心回测结果混在一次查询里被误读。
 HTF_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS intraday_htf_signals (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1460,11 +1494,6 @@ CREATE TABLE IF NOT EXISTS intraday_htf_signals (
 )
 """
 
-# 断点续跑进度表：记录"这一天已经完整跑过"，与signals_history_backtest
-# 分开存储的原因——某一天完全没有候选信号是合法结果（T1-T4全部为空），
-# 这种情况signals_history_backtest不会写入任何行，如果只靠这张表判断
-# "这天有没有跑过"，会把"跑过但无信号"和"还没跑"搞混，导致断点续跑
-# 时把已经跑过的空信号日重新跑一遍。
 PROGRESS_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS backtest_progress (
     run_key     TEXT NOT NULL,
@@ -1473,14 +1502,6 @@ CREATE TABLE IF NOT EXISTS backtest_progress (
 )
 """
 
-# 跨天突破记忆持久化表（v2.1新增）——HourlyIntradayApprox._breakout_memory
-# 原来只是一个进程内存字典，模式2（跨天回踩确认）依赖它记住"哪只股票哪天
-# 触发过模式1"。全市场+700天+小时线默认开启，大概率要分多个session
-# （--max-minutes）才能跑完，每次进程重启这个字典都会被重新初始化成空的，
-# 导致跨进程边界附近的模式2信号被静默漏掉（不报错，只是样本变少）。
-# 这张表按run_key（同backtest_progress的隔离粒度）持久化每只股票最近一次
-# 模式1触发的日期和价格，引擎启动时加载进内存，模式1触发时写回DB，
-# 让断点续跑不再丢失这部分状态。
 BREAKOUT_MEMORY_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS backtest_breakout_memory (
     run_key         TEXT NOT NULL,
@@ -1590,8 +1611,6 @@ class BacktestEngine:
                           f"{self.cfg.end_date} universe={self.cfg.universe_source}"
                           f"({len(tickers)}只) ===")
 
-        # 下载起点往前多拉warmup_calendar_days天，保证信号生成的第一天
-        # MA200/52周高点等长窗口指标已经"热身"完毕，不是从零开始累积
         download_start = str((pd.Timestamp(self.cfg.start_date)
                                - pd.Timedelta(days=self.cfg.warmup_calendar_days)).date())
         self.logger.info(f"数据下载起点(含热身缓冲): {download_start}（正式信号仍从"
@@ -1622,7 +1641,7 @@ class BacktestEngine:
         run_ts = datetime.now().isoformat()
         run_key = self._run_key()
 
-        # ── 恢复跨天突破记忆（模式2需要，v2.1新增）：如果这个run_key之前
+        # ── 恢复跨天突破记忆（模式2需要）：如果这个run_key之前
         # 跑过部分交易日（断点续跑场景），把之前session里记录的"哪只股票
         # 哪天突破过"读回内存，避免进程重启导致模式2在续跑的头几天里
         # 静默失效 ──────────────────────────────────────────────
@@ -1763,15 +1782,6 @@ class BacktestEngine:
                     if self.cfg.use_hourly_vol_ratio:
                         full_hourly = self._get_hourly(ticker)
                         if full_hourly is not None:
-                            # v2.1修复：full_hourly的index是当天挂钟时间（如10:00/
-                            # 11:00/.../16:00），而day是日线index，是当天0点的
-                            # 时间戳。原来"<= day"的比较是"10:00:00 <= 00:00:00"，
-                            # 恒为False——导致"今天"这一天的小时线K线永远被排除在
-                            # 健康度评估之外，_build_hourly_vol_ratio()里最关键的
-                            # recent_ratio.tail(3)吃不到当天数据，60分钟线精确化
-                            # 尾盘量比这个功能对"今天"从未真正生效过，静默回退到
-                            # 粗糙的日总量比例代理，且不报错、不留痕。改成按日期
-                            # （而非精确时间戳）比较，正确包含当天全部小时线K线。
                             hourly_for_health = full_hourly[full_hourly.index.normalize() <= day]
                     health = self.health_eval.evaluate(pit_for_health, day, hourly_for_health)
                 except Exception as e:
@@ -1862,7 +1872,9 @@ class BacktestEngine:
                 total_written += len(rows)
                 total_selected += len(selected)
 
-            # ── 小时级变种策略检测（仅对Top3精选信号跑，独立写入
+            # ── 小时级变种策略检测（v2.3起默认停用，只在
+            # cfg.include_hourly_intraday=True——即--enable-hourly-intraday
+            # 显式打开时才跑；仅对Top3精选信号跑，独立写入
             # intraday_htf_signals表，不进signals_history_backtest）──────
             if self.cfg.include_hourly_intraday:
                 htf_rows = []
@@ -1886,7 +1898,7 @@ class BacktestEngine:
                         if sig is None:
                             continue
 
-                        # v2.1新增：模式1（突破）触发时，HourlyIntradayApprox.
+                        # 模式1（突破）触发时，HourlyIntradayApprox.
                         # detect()内部已经把这次突破写进了self.htf_approx.
                         # _breakout_memory这个内存字典（供模式2跨天回踩使用）。
                         # 这里同步落盘，让下次进程重启（--max-minutes断点续跑）
@@ -1962,36 +1974,6 @@ class BacktestEngine:
         return summary
 
 
-# ════════════════════════════════════════════════════════════
-# 参数覆盖系统 —— 让"改参数重跑"不需要碰screener.py这个生产文件
-# ════════════════════════════════════════════════════════════
-#
-# 设计动机：SCORE_WEIGHTS/TIERS/TREND_SCORE_THRESHOLD这些参数硬编码在
-# screener.py里，你要测试新参数组合，理论上得去改这个正在生产环境跑的
-# 文件——风险高（改错一个逗号线上就崩），也没法保留每次实验的记录做对比。
-#
-# 这里用"猴子补丁"（运行时给screener模块的属性重新赋值）解决：
-#   - 完全不碰screener.py这个文件本身，磁盘上的文件一个字节都不会变
-#   - 只在backtest_engine.py这个独立进程的内存里生效，不影响任何正在
-#     跑的screener.py / daily_analysis.py / intraday_monitor.py 生产进程
-#   - screener.py里所有函数（_passes_tier / calc_composite_score等）
-#     引用这些常量时都是"调用时从模块里现查"，不是"定义时就写死"，
-#     所以运行时改了之后，后续调用会自动用上新值——这是Python的正常
-#     行为，不是什么特殊技巧
-#
-# 使用方式（对应你说的"改参数→重跑→出结果→再改"这个循环）：
-#   1. 先导出一份当前默认参数模板：
-#        python3 backtest_engine.py --export-params baseline_params.json
-#   2. 复制一份改名（比如 exp1_higher_adx.json），只改你想测的字段
-#   3. 跑：
-#        python3 backtest_engine.py --start ... --end ... \
-#            --params-file exp1_higher_adx.json --param-set-name exp1_higher_adx
-#   4. 反复第2-3步，每次换个--param-set-name，结果都存在同一个
-#      backtest_results.db里，互不覆盖
-#   5. 跑完多轮后：
-#        python3 backtest_engine.py --stats-only --leaderboard
-#      一次性看到所有实验的胜率/盈亏对比排行榜
-
 def export_default_params(path: str, cfg: BacktestConfig, logger: logging.Logger) -> None:
     """导出screener.py当前的默认参数 + 健康度层默认参数，作为JSON模板供你复制修改。"""
     payload = {
@@ -2021,11 +2003,10 @@ def export_default_params(path: str, cfg: BacktestConfig, logger: logging.Logger
             "BOTTOM_CLOSE_POS_MIN": cfg.health_bottom_close_pos_min,
             "BOTTOM_VOL_UPTICK_MIN": cfg.health_bottom_vol_uptick_min,
         },
-        # v2.1新增：HTF（小时级变种策略）参数——之前这组cfg字段没有接入
-        # 覆盖系统，params.json完全改不动它们。补上后跟DAILY_HEALTH是
-        # 同一套机制：JSON里的HTF字段名对应intraday_monitor.py的真实
-        # 常量名（方便你对照两边），apply_param_overrides()内部再映射回
-        # cfg.htf_*这些实际字段。
+        # HTF（小时级变种策略，v2.3起默认停用）参数——依然接入了params.json
+        # 覆盖系统，供--enable-hourly-intraday显式打开时使用。JSON里的HTF
+        # 字段名对应intraday_monitor.py的真实常量名（方便你对照两边），
+        # apply_param_overrides()内部再映射回cfg.htf_*这些实际字段。
         "HTF": {
             "BREAKOUT_LOOKBACK_DAYS": cfg.htf_breakout_lookback_days,
             "VOL_SPIKE_RATIO": cfg.htf_vol_spike_ratio,
@@ -2255,6 +2236,10 @@ class StatsReporter:
         故意不并入report()里的主统计——这是一个明确标注为"非验证性
         研究"的独立数据集，混在核心报告里容易让人误以为这是
         intraday_monitor.py的验证结果。
+
+        [v2.3提醒] 这个策略已被backtest_intraday.py取代，本函数只对
+        --enable-hourly-intraday显式打开这个功能时才有新数据可看；
+        历史上跑过的实验结果依然可以照常查询。
         """
         buffer: list[str] = []
 
@@ -2275,7 +2260,7 @@ class StatsReporter:
                 WHERE outcome != 'PENDING' AND param_set = ?
             """, conn, params=[self.cfg.param_set])
         except Exception as e:
-            emit(f"查询失败（可能还没跑过--include-hourly-intraday）: {e}")
+            emit(f"查询失败（可能还没跑过--enable-hourly-intraday）: {e}")
             conn.close()
             if push_telegram:
                 send_telegram("\n".join(buffer), self.logger)
@@ -2288,6 +2273,8 @@ class StatsReporter:
         emit("⚠️ 这不是intraday_monitor.py的验证结果。这是用60分钟线做的")
         emit("一个反应速度慢得多的粗颗粒度变种策略，独立研究性质，")
         emit("不能用来评判intraday_monitor.py现在的设计是否正确。")
+        emit("[v2.3起默认停用] 如果需要真正验证intraday_monitor.py，")
+        emit("请用backtest_intraday.py（直接调用真实15分钟检测函数）。")
         emit("-" * 58)
 
         if df.empty:
@@ -2837,9 +2824,11 @@ def main():
     parser.add_argument("--disable-hourly-vol-ratio", action="store_true",
                         help="关闭健康度层的60分钟线尾盘量比精确化（默认是标准方法论的一部分，"
                              "始终开启；这个flag只在你明确想临时排除60分钟数据时使用）")
-    parser.add_argument("--disable-hourly-intraday", action="store_true",
-                        help="关闭小时级变种策略检测（默认是标准方法论的一部分，始终开启；"
-                             "这个flag只在你明确想临时跳过这部分时使用）")
+    parser.add_argument("--enable-hourly-intraday", action="store_true",
+                        help="[v2.3起默认关闭] 开启小时级变种策略检测——这是已被"
+                             "backtest_intraday.py取代的60分钟近似策略，独立研究性质，"
+                             "不是intraday_monitor.py的验证。只在你明确想临时复现旧行为、"
+                             "或者对比新旧两种方法时才需要打开这个flag。")
     args = parser.parse_args()
 
     cfg = BacktestConfig(
@@ -2847,7 +2836,7 @@ def main():
         universe_source=args.universe, universe_file=args.universe_file,
         push_telegram=not args.no_telegram,
         use_hourly_vol_ratio=not args.disable_hourly_vol_ratio,
-        include_hourly_intraday=not args.disable_hourly_intraday,
+        include_hourly_intraday=args.enable_hourly_intraday,
     )
     logger = setup_logging(cfg.log_path)
 
@@ -2859,10 +2848,11 @@ def main():
         if pd.Timestamp(cfg.start_date) < earliest_allowed:
             msg = (f"🔴 --start={cfg.start_date} 早于60分钟线可用窗口"
                    f"({earliest_allowed.date()}起)。当前开启了60分钟线相关功能"
-                   f"（默认开启，标准方法论的一部分），只在最近~{cfg.yf_60m_max_days}天内"
+                   f"，只在最近~{cfg.yf_60m_max_days}天内"
                    f"有60分钟数据，请把--start改到{earliest_allowed.date()}或更晚，"
-                   f"或者加 --disable-hourly-vol-ratio --disable-hourly-intraday"
-                   f"只跑纯日线回测")
+                   f"或者加 --disable-hourly-vol-ratio"
+                   f"只跑纯日线回测（如果加了--enable-hourly-intraday，"
+                   f"也要一并去掉才能完全避开60分钟数据）")
             logger.error(msg)
             if cfg.push_telegram:
                 send_telegram(msg, logger)
