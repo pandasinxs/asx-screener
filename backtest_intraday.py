@@ -2,12 +2,12 @@
 """
 backtest_intraday.py
 =====================
-15分钟颗粒度日内策略回测引擎 —— Stage 1（本轮）：真实还原watchlist的
+15分钟颗粒度日内策略回测引擎 —— Stage 1：真实还原watchlist的
 "谁在哪几天被实际监测"这个状态机 + 逐日跨日健康度（health_status）回测。
 
 背景与目的：
     backtest_engine.py里原有的HourlyIntradayApprox（60分钟线近似策略）
-    已废弃（本轮决定）。本模块的目标是彻底不再"近似"——直接调用
+    已废弃（v2.3起默认停用）。本模块的目标是彻底不再"近似"——直接调用
     intraday_monitor.py里真实生产代码的检测函数（模式1-4），跑在
     真实历史15分钟数据（market_data_cache.py按周累积的Parquet缓存）
     上，让回测结果能直接回答"intraday_monitor.py现在这套设计好不好"，
@@ -56,6 +56,27 @@ backtest_intraday.py
     才是你想要的行为，那是watchlist_db.py的_upsert_core()需要改的
     另一个话题，跟这次回测无关，你决定要不要另开一轮处理。
 ============================================================
+本轮修复：健康度参数不再各算各的，自动跟EOD实验对齐
+============================================================
+    signals_history_backtest里少数几天（原始raw_top10命中那几天）的
+    health_status，是用EOD跑那一刻实际生效的DAILY_HEALTH参数算出来的
+    ——如果那次EOD跑用了自定义params.json（比如调过PULLBACK_*阈值），
+    这些少数几天的health_status反映的是那组自定义参数。
+
+    Stage1要给同一只股票补算"监测窗口内、但当天不在Top10"的其余
+    交易日的health_status（这是Plan B的核心工作），如果这里用的
+    DAILY_HEALTH参数跟EOD跑那次不一致，会导致同一只股票、同一个
+    param_set下，不同日期的health_status用了两套不同的阈值算出来，
+    产生一个虚假的、看似逻辑矛盾的不一致。
+
+    修复：不要求你手动再传一次--params-file（那样只是把"忘了传/
+    传错文件"这个人为失误的风险转移了一次，没有消除）。改成
+    load_experiment_overrides()自动从backtest_results.db的
+    experiment_metadata表读取--eod-param-set当时实际用的完整参数
+    内容，自动应用其中的DAILY_HEALTH部分（复用backtest_engine.py
+    自己的apply_param_overrides()，不重复实现一份映射逻辑）。你不
+    需要在跑backtest_intraday.py时手动传params.json，也不可能传错
+    ——健康度口径由数据库记录的真实历史保证一致，不依赖你的记忆。
 
 已实现（Stage 1）：
     - 从signals_history_backtest（某个已跑过的EOD param_set）重建
@@ -70,8 +91,10 @@ backtest_intraday.py
     - 对每个active区间内的每个交易日，用backtest_engine.py已经
       验证过的DailyHealthEvaluator重新计算health_status（不含
       60分钟线精确化——同一天多算这个划不来，价值也小，已在此前
-      的对话中明确接受这个简化），写入intraday_health_backtest，
-      供Stage 2判断当天该跑哪条轨道（突破轨道/回调轨道/跳过）
+      的对话中明确接受这个简化），DAILY_HEALTH参数自动跟--eod-
+      param-set对应的实验保持一致（见上），写入
+      intraday_health_backtest，供Stage 2判断当天该跑哪条轨道
+      （突破轨道/回调轨道/跳过）
 
 尚未实现（Stage 2，等这一层验证过再做）：
     - 逐15分钟bar真正调用intraday_monitor.py的模式1-4检测函数
@@ -94,18 +117,26 @@ import intraday_monitor的副作用说明：
     这些内部都没有调用log.*，不会有实际内容写进那个文件，但文件
     本身会被创建/追加一个空壳。可以忽略，或者在.gitignore里加一条。
 
-用法:
-    # 先跑一次Stage1（来源EOD回测的param_set必须已经用backtest_engine.py跑过）
-    python3 backtest_intraday.py --eod-param-set baseline_v1_full_market \\
-        --param-set-name intraday_v1_health_backtest
+运行顺序（完整一次回测）：
+    1. 先跑EOD回测，产出signals_history_backtest（如果还没跑过这个
+       param_set，或者想用新参数重跑）：
+        python3 backtest_engine.py --universe full \\
+            --params-file params.json --param-set-name my_experiment_v1
 
-    # 查看Stage1统计（覆盖率/health_status分布/永久沉寂比例），
-    # 不重跑，供动手写Stage2之前先核对这一层结果是否符合预期
-    python3 backtest_intraday.py --stats-only \\
-        --param-set-name intraday_v1_health_backtest
+    2. 再跑本文件Stage1，--eod-param-set传上面用的同一个名字：
+        python3 backtest_intraday.py --eod-param-set my_experiment_v1 \\
+            --param-set-name my_experiment_v1_intraday
+
+       DAILY_HEALTH参数会自动从第1步记录的experiment_metadata里同步，
+       不需要（也不应该）再传一次--params-file。
+
+    3. 查看Stage1统计，决定要不要往下做Stage2：
+        python3 backtest_intraday.py --stats-only \\
+            --param-set-name my_experiment_v1_intraday
 """
 
 import argparse
+import json
 import logging
 import os
 import sqlite3
@@ -131,7 +162,9 @@ except ImportError as e:
     sys.exit(1)
 
 try:
-    import backtest_engine as bte  # noqa: E402  复用DataLayer/DailyHealthEvaluator/BacktestConfig
+    import backtest_engine as bte  # noqa: E402  复用DataLayer/DailyHealthEvaluator/
+                                     # BacktestConfig/apply_param_overrides/
+                                     # reset_screener_to_defaults
 except ImportError as e:
     print(f"无法 import backtest_engine: {e}")
     sys.exit(1)
@@ -243,6 +276,61 @@ CREATE TABLE IF NOT EXISTS intraday_backtest_progress (
     PRIMARY KEY (run_key, ticker)
 )
 """
+
+
+def load_experiment_overrides(db_path: str, param_set: str, logger: logging.Logger) -> dict:
+    """
+    从experiment_metadata表读取eod_param_set当时实际用的完整参数内容
+    （backtest_engine.py每次跑新param_set都会自动记录这个），返回可以
+    直接传给bte.apply_param_overrides()的overrides字典。
+
+    为什么不让调用方单独传--params-file：signals_history_backtest里
+    少数几天（raw_top10命中那几天）的health_status，是用EOD跑那一刻
+    实际生效的DAILY_HEALTH参数算出来的；本文件还要给同一只股票补算
+    "监测窗口内、但当天不在Top10"的其余交易日的health_status（Plan B
+    核心工作），如果这里用的DAILY_HEALTH参数跟EOD跑那次不一致（比如
+    手滑传了个不同的params.json，或者忘了传），会导致同一只股票、
+    同一个param_set下，不同日期的health_status用了两套不同的阈值
+    算出来——从experiment_metadata自动读取，从根源上排除这种人为
+    对不齐的可能，你不需要记得"这个param_set当时用的是哪份params.json"。
+
+    返回空字典的两种正常情况（不是错误，调用方会自然回退到默认参数）：
+      - 这个param_set是baseline（EOD跑的时候没传--params-file），
+        params_json存的是占位字符串"(baseline，未传--params-file)"，
+        不是合法JSON，属于预期
+      - experiment_metadata表里没有这个param_set的记录（比如这张表
+        上线之前就已经跑过的很旧的实验）
+    两种情况都应该用screener.py/BacktestConfig的默认值，这本身就是
+    正确行为。
+    """
+    if not os.path.exists(db_path):
+        return {}
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT params_json FROM experiment_metadata WHERE param_set = ?",
+            (param_set,),
+        ).fetchone()
+    except Exception as e:
+        logger.warning(f"读取experiment_metadata失败（将使用默认DAILY_HEALTH参数）: {e}")
+        conn.close()
+        return {}
+    conn.close()
+
+    if not row or not row[0]:
+        logger.info(f"experiment_metadata里没有param_set={param_set}的记录，"
+                     f"使用默认DAILY_HEALTH参数")
+        return {}
+    try:
+        overrides = json.loads(row[0])
+        if not isinstance(overrides, dict):
+            return {}
+        return overrides
+    except (json.JSONDecodeError, TypeError):
+        # baseline的占位字符串解析失败，属于预期情况
+        logger.info(f"param_set={param_set}是baseline（未使用过--params-file），"
+                     f"使用默认DAILY_HEALTH参数")
+        return {}
 
 
 def check_health_backtest(close_pit: Optional[pd.Series]) -> tuple:
@@ -451,7 +539,24 @@ def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> str
         return msg
 
     data_layer = bte.DataLayer(logger)
+
+    # ── 健康度参数自动跟EOD实验对齐（本轮修复）：不要求手动再传一次
+    # --params-file，从experiment_metadata自动读取--eod-param-set
+    # 当时实际用的DAILY_HEALTH参数，确保同一只股票在同一个param_set下
+    # 不会出现"部分天数用A组阈值、部分天数用B组阈值"这种口径不一致。
+    # bte.reset_screener_to_defaults()先重置，避免同进程内如果之前
+    # 调用过别的实验残留了screener全局状态（虽然Stage1本身不用
+    # screener的这些全局值，但apply_param_overrides()会顺带mutate它们，
+    # 保持这个复位习惯跟backtest_engine.py自己的run_queue()一致）──
+    bte.reset_screener_to_defaults()
     health_cfg = bte.BacktestConfig(use_hourly_vol_ratio=False)
+    exp_overrides = load_experiment_overrides(cfg.db_path, cfg.eod_param_set, logger)
+    if exp_overrides:
+        bte.apply_param_overrides(exp_overrides, health_cfg, logger)
+        logger.info(
+            f"已从EOD实验[{cfg.eod_param_set}]的experiment_metadata自动同步"
+            f"DAILY_HEALTH参数，确保健康度计算口径跟那次EOD跑的一致"
+        )
     health_eval = bte.DailyHealthEvaluator(health_cfg, logger)
 
     earliest = min(min(d.keys()) for d in candidates.values())
@@ -660,7 +765,9 @@ def main() -> None:
         description="15分钟颗粒度日内策略回测 Stage1：watchlist状态机+健康度回测"
     )
     parser.add_argument("--eod-param-set", default="",
-                        help="来源EOD回测的param_set（必须已经跑过backtest_engine.py）")
+                        help="来源EOD回测的param_set（必须已经跑过backtest_engine.py）。"
+                             "DAILY_HEALTH参数会自动从这个param_set的experiment_metadata"
+                             "同步，不需要（也不应该）再单独传--params-file")
     parser.add_argument("--param-set-name", default="intraday_baseline",
                         help="本次intraday回测的标签")
     parser.add_argument("--disable-ma50-gate", action="store_true",
