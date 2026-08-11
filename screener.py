@@ -2009,9 +2009,8 @@ BACKTEST BEFORE FINAL OUTPUT (MANDATORY EXECUTION)
    If not, draft another one and repeat this step.
 3. Verify the text logically coherent and concise, avoiding redundant descriptions.
 4. Verify the format meets the criteria of md files and output exactly one EN article + one ZH article + one slug.
-5. Verify every marker above is spelled exactly as specified.
-6. Skip any explanation of this process — output ONLY the final version, using the exact
-   marker format in OUTPUT FORMAT session above."""
+5. （last step before output）Verify every marker above is existing and spelled exactly as specified in OUTPUT FORMAT session.
+6. Skip any explanation of this process — output ONLY the final version. """
 
 
 def _parse_seo_article_response(raw_text: str, ticker: str,
@@ -2332,7 +2331,7 @@ D. Do not explain your process—output only the final version of the copy.
 ━━━━━━━━━━━━━━
 一、标题
 
-类似“今天用token抽取的盲盒”的一句话
+类似“花光了今天的token额度抽取的盲盒”的一句话
 （仅作参考，类似表达即可，但必须包含“token“和“盲盒”）
 
 ━━━━━━━━━━━━━━
@@ -2353,8 +2352,7 @@ D. Do not explain your process—output only the final version of the copy.
 
 要求：
 
-- 参考表达“我上月看它发生哪一件事，因为什么，结果是怎么样，然后今天发生了什么事，有什么变化”
-
+- 参考表达“我什么时候看见它发生了什么事情，是因为什么，然后今天发生了什么事，有什么变化”
 - 像“持续观察者视角”，不是一次性解读
 
 --------------------------------
@@ -2367,31 +2365,25 @@ D. Do not explain your process—output only the final version of the copy.
 -不追，不买，不看好
 
 ━━━━━━━━━━━━━━
-备注1、盲盒数量规则
-- 最多3个
-- 按当天筛选结果（上面的输入数据）决定
-
-━━━━━━━━━━━━━━
-备注2、开头，结尾规则
+备注1、开头，结尾规则
 不单独写开头总结段和结尾总结段
 
 ━━━━━━━━━━━━━━
-备注3、风格要求
+备注2、风格要求
 - 用人话叙事
 - 有情绪
 - 像交易日记而不是报告
-- 有IP开场锚点
 - 有观察者视角连续性
 - 不拆分结构
 - 信息高密度但自然流动
 
 ━━━━━━━━━━━━━━
-三、回测再二次输出（必须执行）
+三、先回测再输出（必须执行）
 
 1、先出一版文案草稿给自己回测，看是否符合prompt的要求。
-2、每一个盲盒（股票）用200字以内的字数，按照备注3的语言风格，以主观的视角复述一次草稿，作为输出的文案。
-3、筛选出文案里面所有关于股票和投资和市场和赌博的相关用词，然后替换成合法合规的生活化用词。
-4、检查文章是否有强烈个人观点，没有就加上观点。
+2、每一个盲盒（股票）用250字以内的字数，按照备注2的语言风格，以主观的视角复述一次草稿，作为输出的文案。
+3、筛选出文案里面所有关于股票，投资和赌博的相关用词，然后替换成合法合规的生活化用词。
+4、检查文章是否有强烈个人观点，没有就必须要加上观点。
 5、检查文章是否有逻辑错误。
 6、检查字数限制是否正确，超过10%就返回步骤2。
 7、不用交代过程，只给出最终版文案。
@@ -2421,6 +2413,10 @@ D. Do not explain your process—output only the final version of the copy.
 
 === Top 3 精选股票数据包（含技术面+新闻+公告+PDF关键段落）===
 {stocks_block}
+
+=== 补全TOP 3 数据包 ===
+根据上述3只精选股票，搜索他们各自的公司背景，行业背景，近期新闻。
+尽可能全面地掌握你做分析需要的相关资料。
 
 === 输出任务 ===
 {instruction}
