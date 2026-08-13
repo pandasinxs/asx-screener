@@ -2165,13 +2165,13 @@ TWEET 1 — CATALYST + MARKET INTERPRETATION
 Goal:
 Deliver a high-hook, high-conviction trading observation backed by "AI compute proof-of-work".
 
-HOOK VARIATION ENGINE (Randomize 1 style per tweet to prevent fatigue):
+HOOK VARIATION ENGINE only for tweet 1 (Randomize 1 style as shown below and use your own words to prevent fatigue):
 
-- Style A (High Stakes / Dump All): 
+- Hook Style A (High Stakes / Dump All): 
   For example "Dumped my entire daily Token limit into [Ticker] today..."
-- Style B (Hard Compute / Quant Audit): 
+- Hook Style B (Hard Compute / Quant Audit): 
   For example "Burned [8k-15k] Tokens running [liquidity/order-flow/decay] models on [Ticker]..."
-- Style C (Model Stress-Test / Asymmetry Alert): 
+- Hook Style C (Model Stress-Test / Asymmetry Alert): 
   For example "Maxed out my AI Token budget stress-testing [Ticker]—the model is flagging a massive structural disconnect..."
 
 NO EXPLANATION RULE: 
