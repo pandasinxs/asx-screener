@@ -2009,7 +2009,7 @@ BACKTEST BEFORE FINAL OUTPUT (MANDATORY EXECUTION)
    If not, draft another one and repeat this step.
 3. Verify the text logically coherent and concise, avoiding redundant descriptions.
 4. Verify the format meets the criteria of md files and output exactly one EN article + one ZH article + one slug.
-5. （last step before output）Verify every marker above is existing and spelled exactly as specified in OUTPUT FORMAT session.
+5. Verify every marker in OUTPUT FORMAT section （5 in total）is existing and spelled exactly as specified in OUTPUT FORMAT section.
 6. Skip any explanation of this process — output ONLY the final version. """
 
 
