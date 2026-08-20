@@ -133,6 +133,21 @@ import intraday_monitor的副作用说明：
     3. 查看Stage1统计，决定要不要往下做Stage2：
         python3 backtest_intraday.py --stats-only \\
             --param-set-name my_experiment_v1_intraday
+
+============================================================
+CHANGELOG
+============================================================
+    - [Stage2 fix] process_ticker_stage2(): pending_breakout状态
+      跨天过期清零。修复前：如果疑似突破发生在某交易日最后一两次
+      轮询、当天剩余轮询次数不足MODE1_CONFIRM_MAX_BARS_WAIT(2)根K线
+      去confirm/fail，pending_breakout会带着旧日期存活到下一个
+      health_days里的交易日；由于"pending_breakout['date'] == day_str"
+      和"pending_breakout is None"两个分支条件都不满足，代码既不会
+      去confirm这个陈旧状态，也不会检测新的疑似突破——这只股票的
+      模式1从此永久失效，直到Stage2处理完这只股票。跟
+      intraday_monitor.py"疑似突破状态限定同一交易日有效，跨天自动
+      过期清除"的真实行为不符。修复：进入每个交易日处理前，先判断
+      pending_breakout是否属于当天，不属于就清零。
 """
 
 import argparse
@@ -1087,6 +1102,11 @@ def process_ticker_stage2(ticker: str, health_days: list, data_layer: "bte.DataL
 
     for day_str, health_status in health_days:
         day = pd.Timestamp(day_str)
+
+        if pending_breakout is not None and pending_breakout["date"] != day_str:
+            # 跨天过期清零，对齐intraday_monitor.py"疑似突破状态限定
+            # 同一交易日有效"的真实行为。见文件头CHANGELOG。
+            pending_breakout = None
 
         # 跟lock_daily_reference()完全一致：不含当天，用"今天之前"的
         # 20个交易日算prior_high/avg_vol_20d/ATR14/回调参考/区间最大
