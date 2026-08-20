@@ -2,152 +2,150 @@
 """
 backtest_intraday.py
 =====================
-15分钟颗粒度日内策略回测引擎 —— Stage 1：真实还原watchlist的
-"谁在哪几天被实际监测"这个状态机 + 逐日跨日健康度（health_status）回测。
+15分钟颗粒度日内策略回测引擎。直接调用intraday_monitor.py里真实生产
+代码的检测函数（模式1-4），跑在真实历史15分钟数据（market_data_
+cache.py按周累积的Parquet缓存）上——不是近似策略；backtest_engine.py
+里原有的HourlyIntradayApprox（60分钟线近似）已废弃（v2.3起默认停用）。
 
-背景与目的：
-    backtest_engine.py里原有的HourlyIntradayApprox（60分钟线近似策略）
-    已废弃（v2.3起默认停用）。本模块的目标是彻底不再"近似"——直接调用
-    intraday_monitor.py里真实生产代码的检测函数（模式1-4），跑在
-    真实历史15分钟数据（market_data_cache.py按周累积的Parquet缓存）
-    上，让回测结果能直接回答"intraday_monitor.py现在这套设计好不好"，
-    而不是回答一个近似策略的问题。
+分两个阶段，串联方式见下方"运行方式"：
 
-    本文件是Stage 1：只做"重建谁在哪几天被真实监测、每天的
-    health_status是什么"这一层——这是Stage 2（真正跑模式1-4检测、
-    模拟WIN/LOSS/TIMEOUT）的地基。Stage 1产出可以独立用SQL核对，
-    验证过再往上叠Stage 2，避免一次性写完一个大而复杂的系统、
-    出了问题不知道错在哪一层。
+  Stage 1（watchlist状态机 + 跨日健康度）
+      重建"谁在哪几天被真实监测、每天health_status是什么"。产出可以
+      独立用SQL核对，是Stage 2的地基。
+
+  Stage 2（真实15分钟信号检测 + 出场模拟）
+      对Stage 1产出的ready/pullback_bottoming候选日，逐日逐bar真实
+      调用intraday_monitor.py的模式1-4检测函数，触发信号后模拟
+      WIN/LOSS/TIMEOUT出场。
 
 ============================================================
-本轮审查中发现的一个重要生产系统行为（必读，直接决定了下面的实现）
+运行方式
 ============================================================
-    watchlist表的PRIMARY KEY是ticker，也就是说每只股票在这张表里
-    终其一生只有一行记录。_upsert_core()的UPDATE分支（重选路径）
-    只更新total_days/reselect_count/status/tier_level等字段，
-    **从不touch days_elapsed**。days_elapsed只在
-    run_end_of_day_maintenance()里对当前status='active'的股票逐日+1，
-    status一旦变成'exited'，days_elapsed就冻结在当时的值，不会归零。
+    A. 全新的EOD param_set，第一次端到端测试：
+        python3 backtest_intraday.py --run-all \\
+            --eod-param-set my_experiment_v1 \\
+            --param-set-name my_experiment_v1_intraday
 
-    结果：一只股票如果被反复重选（这次T3入选、隔几周又被T2选中、
-    再隔几个月又入选……），它的days_elapsed是跨越这些重选事件
-    累积计算的"这只股票有生之年被active监测过的总天数"，不是
-    "这一轮监测的第几天"。total_days同理累积（每次重选都加，
-    但封顶60）。
+       一条命令顺序跑完Stage1和Stage2。Stage1在--max-minutes预算内
+       没跑完就不会进入Stage2，原样重跑同一条命令会自动从断点续上，
+       Stage1真正"全部完成"的那次才会接着自动跑Stage2。Stage2自己
+       的param_set会自动取"<--param-set-name>_stage2"。
 
-    隐藏行为：一旦某只股票累积的days_elapsed达到60（total_days的
-    硬顶），即使之后再被重选、total_days尝试被延长也已经顶到60
-    加不动了，get_active_watchlist()的WHERE子句(days_elapsed <
-    total_days)会让它永久无法再真正被监测——status字段可能显示
-    'active'，但intraday_monitor.py实际上再也不会处理它。这不是
-    bug报告，只是如实记录这个真实存在的行为，backtest必须原样
-    复刻才能匹配真实系统。
+    B. 只重跑Stage2（不动Stage1的结果）：
+       典型场景是本地15分钟数据覆盖率随data_fetcher.py每周累积后，
+       隔一段时间想用更多数据重新评估同一批候选：
+        python3 backtest_intraday.py --run-stage2 \\
+            --stage1-param-set my_experiment_v1_intraday \\
+            --param-set-name my_experiment_v1_intraday_recheck_1
 
-    另一处实现细节（写代码时对照原文自查发现，第一版草稿漏了）：
-    真实run_end_of_day_maintenance()里wdb.increment_day_elapsed()是
-    无条件执行的（不管当天健康度检查结果如何），健康度检查失败会
-    直接exit_watchlist()并continue跳过天数耗尽判断——也就是说健康度
-    不达标的退出原因优先于天数耗尽，但天数计数本身每个active交易日
-    照常+1。process_ticker()据此实现：days_elapsed无条件+1，健康度
-    检查失败时天数耗尽判断被跳过（不代表没有+1）。
+       ⚠️ --param-set-name必须换一个新名字，不能复用上次Stage2用过
+       的名字——intraday_stage2_progress按(run_key, ticker)记录断点，
+       run_key里包含这个名字，复用旧名字会导致上次因为没有15分钟
+       数据被跳过的股票被直接当作"已完成"，不会因为数据变多了而
+       重新尝试。换新名字后旧结果不会丢（按param_set区分，新旧两次
+       的信号分别保留在intraday_signals_backtest里，可以对比着看）。
 
-    这个发现同时也值得你在生产系统层面知道（不属于这次backtest
-    工作范围，这轮不改production代码）：如果"重选=重新给满60天"
-    才是你想要的行为，那是watchlist_db.py的_upsert_core()需要改的
-    另一个话题，跟这次回测无关，你决定要不要另开一轮处理。
-============================================================
-本轮修复：健康度参数不再各算各的，自动跟EOD实验对齐
-============================================================
-    signals_history_backtest里少数几天（原始raw_top10命中那几天）的
-    health_status，是用EOD跑那一刻实际生效的DAILY_HEALTH参数算出来的
-    ——如果那次EOD跑用了自定义params.json（比如调过PULLBACK_*阈值），
-    这些少数几天的health_status反映的是那组自定义参数。
-
-    Stage1要给同一只股票补算"监测窗口内、但当天不在Top10"的其余
-    交易日的health_status（这是Plan B的核心工作），如果这里用的
-    DAILY_HEALTH参数跟EOD跑那次不一致，会导致同一只股票、同一个
-    param_set下，不同日期的health_status用了两套不同的阈值算出来，
-    产生一个虚假的、看似逻辑矛盾的不一致。
-
-    修复：不要求你手动再传一次--params-file（那样只是把"忘了传/
-    传错文件"这个人为失误的风险转移了一次，没有消除）。改成
-    load_experiment_overrides()自动从backtest_results.db的
-    experiment_metadata表读取--eod-param-set当时实际用的完整参数
-    内容，自动应用其中的DAILY_HEALTH部分（复用backtest_engine.py
-    自己的apply_param_overrides()，不重复实现一份映射逻辑）。你不
-    需要在跑backtest_intraday.py时手动传params.json，也不可能传错
-    ——健康度口径由数据库记录的真实历史保证一致，不依赖你的记忆。
-
-已实现（Stage 1）：
-    - 从signals_history_backtest（某个已跑过的EOD param_set）重建
-      "这只股票哪天第一次入选、之后哪几天被重选"的原始事件序列
-      （market_cap_m IS NOT NULL做过滤，还原真实filtered_pool，
-      不只是Top3——真实wdb.upsert_watchlist()对filtered_pool全体
-      调用，跟backtest_engine.py同一套代码判定市值门槛）
-    - 逐交易日回放真实的watchlist状态机（累积days_elapsed/
-      total_days，重选延长、重选可撤销当天的健康度/天数耗尽退出
-      判定、60天硬顶导致永久不再监测），产出"实际处于active监测
-      状态"的连续区间（intraday_active_intervals_backtest）
-    - 对每个active区间内的每个交易日，用backtest_engine.py已经
-      验证过的DailyHealthEvaluator重新计算health_status（不含
-      60分钟线精确化——同一天多算这个划不来，价值也小，已在此前
-      的对话中明确接受这个简化），DAILY_HEALTH参数自动跟--eod-
-      param-set对应的实验保持一致（见上），写入
-      intraday_health_backtest，供Stage 2判断当天该跑哪条轨道
-      （突破轨道/回调轨道/跳过）
-
-尚未实现（Stage 2，等这一层验证过再做）：
-    - 逐15分钟bar真正调用intraday_monitor.py的模式1-4检测函数
-    - 模式1两阶段确认的状态机（回测专用持久化，不写生产watchlist.db）
-    - WIN/LOSS/TIMEOUT出场模拟（含模式3专属的"次日开盘了结"规则，
-      模式1/2/4止损公式在回测里复刻intraday_monitor.py.
-      monitor_one_ticker()内联的公式，需要手动跟那边保持同步）
-
-依赖:
-    必须跟backtest_engine.py/market_data_cache.py/intraday_monitor.py/
-    watchlist_db.py/screener.py同目录运行。
-
-import intraday_monitor的副作用说明：
-    intraday_monitor.py在模块顶层调用了logging.basicConfig(handlers=
-    [...FileHandler("intraday_monitor.log")...])，import它会在当前
-    工作目录下产生一个intraday_monitor.log文件（相对路径，不会像
-    daily_analysis.py那样因为写死绝对路径导致FileNotFoundError崩溃，
-    只是个无害的副作用）。本文件只调用intraday_monitor.py里不写库、
-    不发Telegram的纯函数/常量（HEALTH_BELOW_MA50_GRACE_DAYS等），
-    这些内部都没有调用log.*，不会有实际内容写进那个文件，但文件
-    本身会被创建/追加一个空壳。可以忽略，或者在.gitignore里加一条。
-
-运行顺序（完整一次回测）：
-    1. 先跑EOD回测，产出signals_history_backtest（如果还没跑过这个
-       param_set，或者想用新参数重跑）：
-        python3 backtest_engine.py --universe full \\
-            --params-file params.json --param-set-name my_experiment_v1
-
-    2. 再跑本文件Stage1，--eod-param-set传上面用的同一个名字：
+    C. 分步跑（等价于A，拆成两条命令，方便Stage1跑完先自己看一眼
+       --stats-only再决定要不要继续）：
         python3 backtest_intraday.py --eod-param-set my_experiment_v1 \\
             --param-set-name my_experiment_v1_intraday
-
-       DAILY_HEALTH参数会自动从第1步记录的experiment_metadata里同步，
-       不需要（也不应该）再传一次--params-file。
-
-    3. 查看Stage1统计，决定要不要往下做Stage2：
         python3 backtest_intraday.py --stats-only \\
             --param-set-name my_experiment_v1_intraday
+        python3 backtest_intraday.py --run-stage2 \\
+            --stage1-param-set my_experiment_v1_intraday \\
+            --param-set-name my_experiment_v1_stage2
+        python3 backtest_intraday.py --run-stage2 --stats-only \\
+            --param-set-name my_experiment_v1_stage2
+
+============================================================
+必须原样复刻的生产系统行为（改代码前务必先读）
+============================================================
+    1. watchlist表PRIMARY KEY是ticker，每只股票终生只有一行记录。
+       重选（_upsert_core()的UPDATE分支）只更新total_days/
+       reselect_count/status/tier_level，不touch days_elapsed。
+       days_elapsed只在run_end_of_day_maintenance()里对active股票
+       逐日+1，exited后冻结，不归零——一只股票反复被重选，
+       days_elapsed是跨重选事件累积的"有生之年被监测总天数"，不是
+       "这一轮第几天"。累积到60天硬顶后即使再被重选也无法解除，
+       status可能显示active，但实际上永远不会再被处理
+       （permanently_dormant）。这不是bug，是真实生产行为，
+       process_ticker()原样复刻。是否要改成"重选=重新计满60天"是
+       production层面watchlist_db.py的话题，跟这次回测无关。
+
+    2. 健康度检查失败的退出优先于天数耗尽，但days_elapsed本身每个
+       active交易日无条件+1（对齐wdb.increment_day_elapsed()）——
+       process_ticker()据此实现。
+
+    3. DAILY_HEALTH参数自动从EOD实验的experiment_metadata同步
+       （load_experiment_overrides()），不需要（也不应该）手动再传
+       --params-file——避免同一只股票同一个param_set下，不同日期
+       用了两套不同阈值算出health_status这种口径不一致。
+
+    4. 模式1两阶段确认：疑似突破先持久化到pending_breakout（回测内
+       存，不写生产watchlist.db），下一次轮询判断confirmed/failed，
+       超过MODE1_CONFIRM_MAX_BARS_WAIT根K线未决出也清除。
+       pending_breakout限定同一交易日有效，process_ticker_stage2()
+       在进入每个候选交易日前会先检查并清除跨天残留的状态（否则
+       疑似突破一旦发生在交易日最后一两次轮询、当天剩余轮询次数不够
+       confirm/fail，这只股票的模式1会永久失效——已修复，见文件末尾
+       CHANGELOG）。
+
+    5. "今天是否已出过信号"的判断，模式1和模式2/3不是同一套逻辑：
+       模式1检查"今天有没有任何模式已发过信号"
+       （already_signaled_today），模式2/3检查"上一次记录的信号
+       是不是同一个模式"（last_signal_mode）。结果是模式1早上触发
+       过，模式3下午仍可能独立触发——生产代码本来的行为，原样复刻，
+       不做"一天只能一个信号"的简化。
+
+    6. 所有基准位（prior_high/avg_vol_20d/ATR14/回调参考/区间最大
+       回撤）都用"不含当天"的历史数据（daily_df.index < day），跟
+       lock_daily_reference()的point-in-time行为逐行对齐，避免
+       未来函数。
+
+    7. 出场模拟不预设2倍还是3倍风险止盈更合理，两个都独立追踪、
+       都记下来——生产的monitor_one_ticker()本身也是同时展示两条
+       参考线，没有替交易者选定"自动止盈在哪"。模式3（尾盘确认买）
+       例外：T+1次日开盘价固定了结，不套用止损/止盈框架，对齐生产
+       "不追、次日附近了结"的设计意图。
+
+    8. 止损公式（compute_stop_loss_stage2()）是本文件里唯一没有
+       直接import intraday_monitor.py代码、而是手动复刻的部分——
+       因为原公式写在monitor_one_ticker()函数体内部，不是独立函数，
+       没法直接复用。以后改monitor_one_ticker()里这几个止损公式，
+       这里必须手动跟着改。
+
+============================================================
+已知限制（不是这个阶段要解决的，记录在案）
+============================================================
+    - 断点续跑粒度是"整只股票"，不做"待重试/等数据够了自动补上"这
+      套状态机——已经明确决定用"换新param_set名字重跑"代替，见上方
+      "运行方式B"
+    - commission_pct/slippage_bps在BacktestConfig里定义了但出场模拟
+      没有使用，当前是完美成交假设
+    - 没有账户级别资金曲线模拟（仓位重叠、同一时间多信号占用资金
+      不建模），每个信号独立算胜率
+    - intraday_monitor.py模式1-4的常量（VOL_SPIKE_RATIO_M1/
+      MODE2_PULLBACK_MAX_DEPTH_PCT等）不接入params覆盖系统，只能
+      回答"现在这套设计好不好"，回答不了"哪组参数更好"
+
+============================================================
+依赖 & import副作用
+============================================================
+    必须跟backtest_engine.py/market_data_cache.py/intraday_monitor.py/
+    watchlist_db.py/screener.py同目录运行。import intraday_monitor
+    会在当前工作目录下产生一个无害的空intraday_monitor.log文件（该
+    模块顶层有logging.basicConfig，本文件只用它的纯函数/常量，不会
+    有内容真正写进那个文件）。
 
 ============================================================
 CHANGELOG
 ============================================================
-    - [Stage2 fix] process_ticker_stage2(): pending_breakout状态
-      跨天过期清零。修复前：如果疑似突破发生在某交易日最后一两次
-      轮询、当天剩余轮询次数不足MODE1_CONFIRM_MAX_BARS_WAIT(2)根K线
-      去confirm/fail，pending_breakout会带着旧日期存活到下一个
-      health_days里的交易日；由于"pending_breakout['date'] == day_str"
-      和"pending_breakout is None"两个分支条件都不满足，代码既不会
-      去confirm这个陈旧状态，也不会检测新的疑似突破——这只股票的
-      模式1从此永久失效，直到Stage2处理完这只股票。跟
-      intraday_monitor.py"疑似突破状态限定同一交易日有效，跨天自动
-      过期清除"的真实行为不符。修复：进入每个交易日处理前，先判断
-      pending_breakout是否属于当天，不属于就清零。
+    - process_ticker_stage2()：pending_breakout状态补上跨天过期
+      清零（见上方生产行为第4点）
+    - main()新增--run-all：Stage1+Stage2一条命令跑完，Stage1未在
+      本次--max-minutes预算内完成不会自动进入Stage2
+    - 断点续跑改用统一的_progress_done()/_progress_mark_done()（原来
+      Stage1/Stage2各自一份几乎相同的代码，表结构完全一致，去重合并）
 """
 
 import argparse
@@ -413,17 +411,21 @@ def load_eod_candidates(cfg: IntradayBacktestConfig, logger: logging.Logger) -> 
     return result
 
 
-def _already_done(conn: sqlite3.Connection, run_key: str, ticker: str) -> bool:
+def _progress_done(conn: sqlite3.Connection, table: str, run_key: str, ticker: str) -> bool:
+    """Stage1(intraday_backtest_progress)/Stage2(intraday_stage2_progress)共用的
+    断点续跑查询——两张表结构完全一致(run_key, ticker)，只是分属不同阶段，
+    没必要各写一份重复的查询/写入函数。table只在代码内部以硬编码字面量
+    传入，不接受外部输入，没有拼接风险。"""
     row = conn.execute(
-        "SELECT 1 FROM intraday_backtest_progress WHERE run_key = ? AND ticker = ?",
+        f"SELECT 1 FROM {table} WHERE run_key = ? AND ticker = ?",
         (run_key, ticker),
     ).fetchone()
     return row is not None
 
 
-def _mark_done(conn: sqlite3.Connection, run_key: str, ticker: str) -> None:
+def _progress_mark_done(conn: sqlite3.Connection, table: str, run_key: str, ticker: str) -> None:
     conn.execute(
-        "INSERT OR IGNORE INTO intraday_backtest_progress (run_key, ticker) VALUES (?, ?)",
+        f"INSERT OR IGNORE INTO {table} (run_key, ticker) VALUES (?, ?)",
         (run_key, ticker),
     )
 
@@ -538,7 +540,10 @@ def process_ticker(ticker: str, appearances: dict, data_layer: "bte.DataLayer",
     }
 
 
-def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> str:
+def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> tuple:
+    """运行Stage1。返回(summary: str, completed: bool)——completed=True表示
+    这批股票在本次调用里已经全部处理完（不含熔断/时间预算用完的情况），
+    main()的--run-all逻辑用这个布尔值判断能不能接着自动跑Stage2。"""
     logger = setup_logging(cfg.log_path)
     logger.info(
         f"=== backtest_intraday.py Stage1 启动 [{cfg.param_set}] "
@@ -552,7 +557,7 @@ def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> str
         logger.error(msg)
         if cfg.push_telegram:
             send_telegram(msg, logger)
-        return msg
+        return msg, False
 
     data_layer = bte.DataLayer(logger)
 
@@ -584,7 +589,7 @@ def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> str
         logger.error(msg)
         if cfg.push_telegram:
             send_telegram(msg, logger)
-        return msg
+        return msg, False
     master_trading_days = list(xjo_df.index)
     logger.info(
         f"交易日历：{len(master_trading_days)}个交易日"
@@ -601,7 +606,8 @@ def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> str
     run_key = f"{cfg.eod_param_set}|{cfg.param_set}|ma50gate={cfg.implement_ma50_exit_gate}"
 
     tickers = sorted(candidates.keys())
-    remaining = [t for t in tickers if not _already_done(conn, run_key, t)]
+    remaining = [t for t in tickers
+                 if not _progress_done(conn, "intraday_backtest_progress", run_key, t)]
     if len(remaining) < len(tickers):
         logger.info(
             f"检测到断点：{len(tickers) - len(remaining)}只已完成，"
@@ -648,7 +654,7 @@ def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> str
 
         if result is None:
             skipped_no_data += 1
-            _mark_done(conn, run_key, ticker)
+            _progress_mark_done(conn, "intraday_backtest_progress", run_key, ticker)
             conn.commit()
             processed += 1
             continue
@@ -678,7 +684,7 @@ def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> str
               1 if result["permanently_dormant"] else 0,
               pd.Timestamp.now().isoformat()))
 
-        _mark_done(conn, run_key, ticker)
+        _progress_mark_done(conn, "intraday_backtest_progress", run_key, ticker)
         conn.commit()
         processed += 1
 
@@ -689,20 +695,21 @@ def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> str
     conn.close()
 
     total_done = len(tickers) - len(remaining) + processed
+    completed = (not circuit_broken) and (total_done >= len(tickers))
     status_line = (
         "🛑 因熔断提前停止" if circuit_broken else
-        ("✅ 全部完成" if total_done >= len(tickers) else "⏸ 已按时间预算暂停")
+        ("✅ 全部完成" if completed else "⏸ 已按时间预算暂停")
     )
     summary = (
         f"{status_line} backtest_intraday Stage1 [{cfg.param_set}]\n"
         f"本次处理: {processed}只（数据不足跳过{skipped_no_data}只）\n"
         f"累计总进度: {total_done}/{len(tickers)}只"
-        + (f"，下次重跑相同参数会自动续上" if total_done < len(tickers) else "")
+        + (f"，下次重跑相同参数会自动续上" if not completed else "")
     )
     logger.info("=== " + summary.replace("\n", " | ") + " ===")
     if cfg.push_telegram:
         send_telegram(summary, logger)
-    return summary
+    return summary, completed
 
 
 def show_stats(cfg: IntradayBacktestConfig) -> None:
@@ -888,21 +895,6 @@ def load_stage2_candidates(cfg: IntradayBacktestConfig, logger: logging.Logger) 
         f"ready/pullback_bottoming候选日序列"
     )
     return result
-
-
-def _stage2_already_done(conn: sqlite3.Connection, run_key: str, ticker: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM intraday_stage2_progress WHERE run_key = ? AND ticker = ?",
-        (run_key, ticker),
-    ).fetchone()
-    return row is not None
-
-
-def _stage2_mark_done(conn: sqlite3.Connection, run_key: str, ticker: str) -> None:
-    conn.execute(
-        "INSERT OR IGNORE INTO intraday_stage2_progress (run_key, ticker) VALUES (?, ?)",
-        (run_key, ticker),
-    )
 
 
 def compute_stop_loss_stage2(mode: str, prior_high: float, atr14: Optional[float],
@@ -1270,7 +1262,8 @@ def process_ticker_stage2(ticker: str, health_days: list, data_layer: "bte.DataL
     return {"signals": signals, "skipped": False}
 
 
-def run_stage2(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> str:
+def run_stage2(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> tuple:
+    """运行Stage2。返回(summary: str, completed: bool)，跟run()同样的约定。"""
     logger = setup_logging(cfg.log_path)
     logger.info(f"=== backtest_intraday.py Stage2 启动 [{cfg.param_set}] "
                f"来源Stage1={cfg.stage1_param_set} ===")
@@ -1281,7 +1274,7 @@ def run_stage2(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None)
         logger.error(msg)
         if cfg.push_telegram:
             send_telegram(msg, logger)
-        return msg
+        return msg, False
 
     data_layer = bte.DataLayer(logger)
 
@@ -1292,7 +1285,8 @@ def run_stage2(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None)
 
     run_key = f"{cfg.stage1_param_set}|{cfg.param_set}"
     tickers = sorted(candidates.keys())
-    remaining = [t for t in tickers if not _stage2_already_done(conn, run_key, t)]
+    remaining = [t for t in tickers
+                 if not _progress_done(conn, "intraday_stage2_progress", run_key, t)]
     if len(remaining) < len(tickers):
         logger.info(f"检测到断点：{len(tickers) - len(remaining)}只已完成，"
                    f"本次继续剩余{len(remaining)}只")
@@ -1356,7 +1350,7 @@ def run_stage2(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None)
             """, rows)
             total_signals += len(rows)
 
-        _stage2_mark_done(conn, run_key, ticker)
+        _progress_mark_done(conn, "intraday_stage2_progress", run_key, ticker)
         conn.commit()
         processed += 1
 
@@ -1368,21 +1362,22 @@ def run_stage2(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None)
     conn.close()
 
     total_done = len(tickers) - len(remaining) + processed
+    completed = (not circuit_broken) and (total_done >= len(tickers))
     status_line = (
         "🛑 因熔断提前停止" if circuit_broken else
-        ("✅ 全部完成" if total_done >= len(tickers) else "⏸ 已按时间预算暂停")
+        ("✅ 全部完成" if completed else "⏸ 已按时间预算暂停")
     )
     summary = (
         f"{status_line} Stage2 [{cfg.param_set}]\n"
         f"本次处理: {processed}只（数据不足跳过{skipped}只）\n"
         f"本次新增信号: {total_signals}笔\n"
         f"累计总进度: {total_done}/{len(tickers)}只"
-        + (f"，下次重跑相同参数会自动续上" if total_done < len(tickers) else "")
+        + (f"，下次重跑相同参数会自动续上" if not completed else "")
     )
     logger.info("=== " + summary.replace("\n", " | ") + " ===")
     if cfg.push_telegram:
         send_telegram(summary, logger)
-    return summary
+    return summary, completed
 
 
 def show_stage2_stats(cfg: IntradayBacktestConfig) -> None:
@@ -1462,24 +1457,35 @@ def show_stage2_stats(cfg: IntradayBacktestConfig) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="15分钟颗粒度日内策略回测：Stage1（watchlist状态机+健康度）"
-                     "/ Stage2（真实15分钟信号检测+出场模拟，需加--run-stage2）"
+        description="15分钟颗粒度日内策略回测：--run-all（一条命令跑完Stage1+Stage2）"
+                     "/ 分步跑Stage1（默认）/ --run-stage2（单独跑Stage2）"
     )
     parser.add_argument("--eod-param-set", default="",
-                        help="[Stage1] 来源EOD回测的param_set（必须已经跑过backtest_engine.py）。"
-                             "DAILY_HEALTH参数会自动从这个param_set的experiment_metadata"
-                             "同步，不需要（也不应该）再单独传--params-file")
+                        help="[Stage1 / --run-all] 来源EOD回测的param_set（必须已经跑过"
+                             "backtest_engine.py）。DAILY_HEALTH参数会自动从这个param_set的"
+                             "experiment_metadata同步，不需要（也不应该）再单独传--params-file")
     parser.add_argument("--stage1-param-set", default="",
-                        help="[Stage2专用] 来源Stage1的--param-set-name")
+                        help="[--run-stage2专用，--run-all不需要] 来源Stage1的--param-set-name")
     parser.add_argument("--run-stage2", action="store_true",
-                        help="运行Stage2（真实15分钟信号检测+出场模拟），"
-                             "需要先跑完对应的Stage1（--stage1-param-set指向的那次）")
+                        help="只运行Stage2，需要先跑完对应的Stage1（--stage1-param-set指向的"
+                             "那次）。本地15分钟数据覆盖率随data_fetcher.py每周累积后，隔一段"
+                             "时间想用更多数据重新评估同一批Stage1候选时用这个，不需要重新跑"
+                             "Stage1——但--param-set-name必须换成没用过的新名字，见文件头"
+                             "docstring'运行方式B'")
+    parser.add_argument("--run-all", action="store_true",
+                        help="一条命令顺序跑完Stage1+Stage2：用--eod-param-set/--param-set-name"
+                             "跑Stage1，全部完成后自动以'<--param-set-name>_stage2'为名接着跑"
+                             "Stage2。Stage1没在本次--max-minutes预算内跑完就不会进入Stage2，"
+                             "原样重跑同一条命令即可续上")
     parser.add_argument("--param-set-name", default="intraday_baseline",
-                        help="本次运行（Stage1或Stage2）自己的标签")
+                        help="Stage1（或--run-all里Stage1那部分）的标签；单独跑--run-stage2时"
+                             "是Stage2自己的标签")
     parser.add_argument("--disable-ma50-gate", action="store_true",
                         help="[仅Stage1] 关闭MA50提前退出门槛的复刻（默认开启，"
                              "是标准方法论的一部分）")
-    parser.add_argument("--max-minutes", type=float, default=None)
+    parser.add_argument("--max-minutes", type=float, default=None,
+                        help="每个阶段各自的时间预算（--run-all时Stage1和Stage2分别可用"
+                             "这么多分钟，不是两段共享一个预算）")
     parser.add_argument("--stats-only", action="store_true",
                         help="不重跑，只汇总已有结果（配合--run-stage2看Stage2的统计，"
                              "不加则看Stage1的统计）")
@@ -1499,6 +1505,50 @@ def main() -> None:
             show_stage2_stats(cfg)
         else:
             show_stats(cfg)
+        return
+
+    if args.run_all:
+        if not cfg.eod_param_set:
+            print("必须指定 --eod-param-set（--run-all需要先跑Stage1）")
+            return
+        try:
+            _summary1, completed1 = run(cfg, max_minutes=args.max_minutes)
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"顶层未捕获异常(Stage1): {e}\n{tb}")
+            if cfg.push_telegram:
+                send_telegram(
+                    f"🔴 backtest_intraday.py --run-all Stage1阶段崩溃\n"
+                    f"参数集: {cfg.param_set}\n错误: {e}\n\ntraceback(截断):\n{tb[-1500:]}",
+                    logging.getLogger("backtest_intraday"),
+                )
+            sys.exit(1)
+
+        if not completed1:
+            print(
+                "\nStage1本次未全部完成（时间预算用完或熔断），--run-all不会自动进入"
+                "Stage2。原样重跑同一条命令即可从断点续上；Stage1真正'全部完成'的那次"
+                "会自动接着跑Stage2。"
+            )
+            return
+
+        cfg2 = IntradayBacktestConfig(
+            stage1_param_set=cfg.param_set,
+            param_set=f"{cfg.param_set}_stage2",
+            push_telegram=cfg.push_telegram,
+        )
+        try:
+            run_stage2(cfg2, max_minutes=args.max_minutes)
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"顶层未捕获异常(Stage2): {e}\n{tb}")
+            if cfg2.push_telegram:
+                send_telegram(
+                    f"🔴 backtest_intraday.py --run-all Stage2阶段崩溃\n"
+                    f"参数集: {cfg2.param_set}\n错误: {e}\n\ntraceback(截断):\n{tb[-1500:]}",
+                    logging.getLogger("backtest_intraday"),
+                )
+            sys.exit(1)
         return
 
     if args.run_stage2:
