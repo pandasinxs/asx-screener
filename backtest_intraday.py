@@ -81,7 +81,18 @@ cache.py按周累积的Parquet缓存）上——不是近似策略；backtest_en
        --params-file——避免同一只股票同一个param_set下，不同日期
        用了两套不同阈值算出health_status这种口径不一致。
 
-    4. 模式1两阶段确认：疑似突破先持久化到pending_breakout（回测内
+    4. Stage1健康度评估用60分钟线精确化"尾盘时段量比"，对齐
+       backtest_engine.py的标准方法论（use_hourly_vol_ratio=True，
+       baseline_v1_full_market等正式EOD回测都是在这个精度下跑的，
+       不是可选项）。process_ticker()为每只股票只拉一次60分钟线
+       （跟daily_df一样，不是每天单独请求），逐日point-in-time切片
+       喂给DailyHealthEvaluator；覆盖不到的日期（60分钟颗粒度约729天
+       硬上限）自动回退到全天成交量比例代理，不报错、不跳过整只股票。
+       早期版本这里传的是hourly_df=None，Stage1候选池的量能判断口径
+       比正规EOD回测更粗糙，两边不完全一致——已对齐，见文件末尾
+       CHANGELOG。
+
+    5. 模式1两阶段确认：疑似突破先持久化到pending_breakout（回测内
        存，不写生产watchlist.db），下一次轮询判断confirmed/failed，
        超过MODE1_CONFIRM_MAX_BARS_WAIT根K线未决出也清除。
        pending_breakout限定同一交易日有效，process_ticker_stage2()
@@ -90,25 +101,25 @@ cache.py按周累积的Parquet缓存）上——不是近似策略；backtest_en
        confirm/fail，这只股票的模式1会永久失效——已修复，见文件末尾
        CHANGELOG）。
 
-    5. "今天是否已出过信号"的判断，模式1和模式2/3不是同一套逻辑：
+    6. "今天是否已出过信号"的判断，模式1和模式2/3不是同一套逻辑：
        模式1检查"今天有没有任何模式已发过信号"
        （already_signaled_today），模式2/3检查"上一次记录的信号
        是不是同一个模式"（last_signal_mode）。结果是模式1早上触发
        过，模式3下午仍可能独立触发——生产代码本来的行为，原样复刻，
        不做"一天只能一个信号"的简化。
 
-    6. 所有基准位（prior_high/avg_vol_20d/ATR14/回调参考/区间最大
+    7. 所有基准位（prior_high/avg_vol_20d/ATR14/回调参考/区间最大
        回撤）都用"不含当天"的历史数据（daily_df.index < day），跟
        lock_daily_reference()的point-in-time行为逐行对齐，避免
        未来函数。
 
-    7. 出场模拟不预设2倍还是3倍风险止盈更合理，两个都独立追踪、
+    8. 出场模拟不预设2倍还是3倍风险止盈更合理，两个都独立追踪、
        都记下来——生产的monitor_one_ticker()本身也是同时展示两条
        参考线，没有替交易者选定"自动止盈在哪"。模式3（尾盘确认买）
        例外：T+1次日开盘价固定了结，不套用止损/止盈框架，对齐生产
        "不追、次日附近了结"的设计意图。
 
-    8. 止损公式（compute_stop_loss_stage2()）是本文件里唯一没有
+    9. 止损公式（compute_stop_loss_stage2()）是本文件里唯一没有
        直接import intraday_monitor.py代码、而是手动复刻的部分——
        因为原公式写在monitor_one_ticker()函数体内部，不是独立函数，
        没法直接复用。以后改monitor_one_ticker()里这几个止损公式，
@@ -127,6 +138,12 @@ cache.py按周累积的Parquet缓存）上——不是近似策略；backtest_en
     - intraday_monitor.py模式1-4的常量（VOL_SPIKE_RATIO_M1/
       MODE2_PULLBACK_MAX_DEPTH_PCT等）不接入params覆盖系统，只能
       回答"现在这套设计好不好"，回答不了"哪组参数更好"
+    - Stage1为对齐EOD标准方法论新增了60分钟线拉取（见上方生产行为
+      第4点），对~500只股票、每只覆盖其完整监测窗口，比之前多一层
+      数据获取成本；本地若已有backtest_engine.py之前跑EOD实验时
+      顺手缓存下来的60分钟线Parquet（EOD回测对Top10候选每天都会拉
+      60分钟线），Stage1这里很可能命中不少缓存，但没有实测验证过
+      命中率，不确定这个假设的准确性
 
 ============================================================
 依赖 & import副作用
@@ -140,8 +157,18 @@ cache.py按周累积的Parquet缓存）上——不是近似策略；backtest_en
 ============================================================
 CHANGELOG
 ============================================================
+    - Stage1健康度评估接入60分钟线精确化（use_hourly_vol_ratio=True，
+      process_ticker()为每只股票拉取60分钟线并逐日point-in-time切片），
+      对齐backtest_engine.py的EOD标准方法论。此前Stage1这里固定传
+      hourly_df=None，候选池的量能判断口径比正规EOD回测更粗糙。
+      ⚠️ 这个改动会让同一只股票同一天的health_status可能跟旧版本算
+      出来的不一样（不是bug，是精度提升）——用旧的Stage1 param_set
+      名字重新运行不会触发重算：run_key只由eod_param_set/param_set/
+      ma50gate三者组成，这三者都没变的话intraday_backtest_progress
+      会把所有股票当成"已完成"直接跳过，磁盘上还是旧的粗糙结果。
+      必须用一个全新的--param-set-name才能让这次精度提升真正生效。
     - process_ticker_stage2()：pending_breakout状态补上跨天过期
-      清零（见上方生产行为第4点）
+      清零（见上方生产行为第5点）
     - main()新增--run-all：Stage1+Stage2一条命令跑完，Stage1未在
       本次--max-minutes预算内完成不会自动进入Stage2
     - 断点续跑改用统一的_progress_done()/_progress_mark_done()（原来
@@ -455,6 +482,18 @@ def process_ticker(ticker: str, appearances: dict, data_layer: "bte.DataLayer",
         return None
     close_s = daily_df["Close"].squeeze()
 
+    # 健康度精确化，对齐EOD标准方法论：backtest_engine.py的
+    # DailyHealthEvaluator默认用60分钟线精确化"尾盘时段量比"这个近似
+    # 字段（use_hourly_vol_ratio=True是"标准测试方法论的一部分"，不是
+    # 可选项，baseline_v1_full_market等正式EOD回测都是在这个精度下
+    # 跑的）。跟daily_df一样，只在这里拉一次（不是每个交易日单独发
+    # 请求），下面逐日point-in-time切片复用。60分钟颗粒度yfinance
+    # 约729天硬上限，覆盖不到的日期（比如first_entry很早、超出这个
+    # 窗口）由DailyHealthEvaluator.evaluate()内部自动回退到全天成交量
+    # 比例代理，不会报错、不会跳过整只股票——市值/数据获取层面的
+    # 截断处理已经在market_data_cache内部统一做了，这里不重复判断。
+    hourly_df = data_layer.fetch_60m(ticker, download_start, today_str)
+
     trading_days = [d for d in master_trading_days if str(d.date()) >= first_entry]
     if not trading_days:
         return None
@@ -476,8 +515,10 @@ def process_ticker(ticker: str, appearances: dict, data_layer: "bte.DataLayer",
 
         if status_active:
             pit_df = daily_df[daily_df.index <= day]
+            hourly_pit = (hourly_df[hourly_df.index.normalize() <= day]
+                          if hourly_df is not None else None)
             try:
-                health_result = health_eval.evaluate(pit_df, day, hourly_df=None)
+                health_result = health_eval.evaluate(pit_df, day, hourly_df=hourly_pit)
                 health_status = health_result.get("health_status")
             except Exception as e:
                 logger.warning(f"健康度回测异常 [{ticker}] {day_str}: {e}")
@@ -548,7 +589,8 @@ def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> tup
     logger.info(
         f"=== backtest_intraday.py Stage1 启动 [{cfg.param_set}] "
         f"来源EOD={cfg.eod_param_set} "
-        f"MA50早退门槛={'开启' if cfg.implement_ma50_exit_gate else '关闭'} ==="
+        f"MA50早退门槛={'开启' if cfg.implement_ma50_exit_gate else '关闭'} "
+        f"60分钟线健康度精确化=开启（对齐EOD标准方法论） ==="
     )
 
     candidates = load_eod_candidates(cfg, logger)
@@ -570,7 +612,15 @@ def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> tup
     # screener的这些全局值，但apply_param_overrides()会顺带mutate它们，
     # 保持这个复位习惯跟backtest_engine.py自己的run_queue()一致）──
     bte.reset_screener_to_defaults()
-    health_cfg = bte.BacktestConfig(use_hourly_vol_ratio=False)
+    # use_hourly_vol_ratio=True：对齐EOD标准方法论（backtest_engine.py
+    # 里这是"标准测试方法论的一部分，默认开启"，baseline_v1_full_market
+    # 等正式EOD回测都在这个精度下跑）。这个开关本身只控制
+    # DailyHealthEvaluator.evaluate()"要不要尝试用传入的hourly_df覆盖
+    # 全天成交量比例代理"——真正的60分钟线获取+逐日point-in-time切片
+    # 在process_ticker()里做（每只股票只拉一次，不是每天单独请求）。
+    # 此前这里传的是False，Stage1健康度用的是比正规EOD回测更粗糙的
+    # 量能代理，两边候选池的口径不一致；现已对齐，见文件头CHANGELOG。
+    health_cfg = bte.BacktestConfig(use_hourly_vol_ratio=True)
     exp_overrides = load_experiment_overrides(cfg.db_path, cfg.eod_param_set, logger)
     if exp_overrides:
         bte.apply_param_overrides(exp_overrides, health_cfg, logger)
