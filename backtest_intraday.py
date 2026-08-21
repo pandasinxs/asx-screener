@@ -157,6 +157,12 @@ cache.py按周累积的Parquet缓存）上——不是近似策略；backtest_en
 ============================================================
 CHANGELOG
 ============================================================
+    - Stage1/Stage2的run()/run_stage2()新增启动时的Telegram推送
+      （🚀 ...启动），此前只有完成/熔断/崩溃才推送，中途不知道
+      有没有真的跑起来。对齐backtest_engine.py的BacktestEngine.run()
+      已有的做法。中途出错的两层覆盖（单只股票连续失败达到
+      max_consecutive_errors触发熔断推送；任何逃过这层的意外崩溃
+      冒泡到main()顶层try/except推送）本来就存在，不是这次新增的。
     - Stage1健康度评估接入60分钟线精确化（use_hourly_vol_ratio=True，
       process_ticker()为每只股票拉取60分钟线并逐日point-in-time切片），
       对齐backtest_engine.py的EOD标准方法论。此前Stage1这里固定传
@@ -600,6 +606,18 @@ def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> tup
         if cfg.push_telegram:
             send_telegram(msg, logger)
         return msg, False
+
+    start_msg = (
+        f"🚀 backtest_intraday Stage1启动 [{cfg.param_set}]\n"
+        f"来源EOD: {cfg.eod_param_set}\n"
+        f"候选股票: {len(candidates)}只\n"
+        f"MA50早退门槛: {'开启' if cfg.implement_ma50_exit_gate else '关闭'}\n"
+        f"60分钟线健康度精确化: 开启\n"
+        f"时间预算: {max_minutes if max_minutes else '不限'}分钟"
+    )
+    logger.info(start_msg.replace("\n", " | "))
+    if cfg.push_telegram:
+        send_telegram(start_msg, logger)
 
     data_layer = bte.DataLayer(logger)
 
@@ -1325,6 +1343,16 @@ def run_stage2(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None)
         if cfg.push_telegram:
             send_telegram(msg, logger)
         return msg, False
+
+    start_msg = (
+        f"🚀 backtest_intraday Stage2启动 [{cfg.param_set}]\n"
+        f"来源Stage1: {cfg.stage1_param_set}\n"
+        f"候选股票: {len(candidates)}只\n"
+        f"时间预算: {max_minutes if max_minutes else '不限'}分钟"
+    )
+    logger.info(start_msg.replace("\n", " | "))
+    if cfg.push_telegram:
+        send_telegram(start_msg, logger)
 
     data_layer = bte.DataLayer(logger)
 
