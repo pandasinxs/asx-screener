@@ -52,6 +52,22 @@
 #      参照基准），两个深度只要有一个超过MODE2_PULLBACK_MAX_DEPTH_PCT
 #      就拒绝，不再只凭单根K线判断"这是浅回踩"。
 #
+# v3.2改动（本轮，量化审查后修复第二轮）：
+#   7. 日期来源统一为悉尼时区显式时钟（now_syd()），不再混用
+#      date.today()：此前lock_daily_reference()/monitor_one_ticker()/
+#      detect_mode2_pullback_crossday()三处仍在用date.today()（依赖
+#      系统本地时区配置），跟is_trading_day_and_time()/
+#      is_late_session_window()等函数已经在用的now_syd()（显式
+#      ZoneInfo("Australia/Sydney")，跟系统配置无关）是两套不同的
+#      日期来源。VM当前系统时区=Melbourne=Sydney（同一AET时区组），
+#      两套日期来源现在恰好算出一样的结果，没有实际错误——但这是
+#      "配置对了就正常、配置一旦漂移就静默出错"的脆弱模式：如果VM
+#      系统时区将来被改成别的（比如迁移到其他云主机、默认装成UTC），
+#      这三处会立刻跟其余用now_syd()的地方产生日期不一致，且不会
+#      报错，只会在悉尼时间0点附近这段窗口出现难以察觉的错位。
+#      统一改成now_syd().date()，消除这个隐患，跟系统本地时区配置
+#      完全脱钩。
+#
 # 四种模式（均为15分钟K线级别的"代理判断"，非逐笔tick级）：
 #   模式1 突破瞬间买：15分钟K线收盘突破prior_high_20d + 放量 + 未被砸回
 #                     （v3.1起改成两阶段：疑似突破→下一根K线确认）
@@ -501,7 +517,7 @@ def lock_daily_reference(item: dict) -> Optional[dict]:
     直接复用缓存（不再重新下载）。
     """
     ticker = item["ticker"]
-    today  = date.today().isoformat()
+    today  = now_syd().date().isoformat()
 
     if item.get("ref_date") == today and item.get("prior_high_20d"):
         item["_pullback_ref"] = (
@@ -839,7 +855,7 @@ def detect_mode2_pullback_crossday(item: dict, bars: list,
         return None
 
     try:
-        days_since_breakout = (date.today() - date.fromisoformat(last_breakout_date)).days
+        days_since_breakout = (now_syd().date() - date.fromisoformat(last_breakout_date)).days
     except (TypeError, ValueError):
         return None
 
@@ -959,7 +975,7 @@ def detect_mode3_late_session(bars: list, day_high: float,
 
 def monitor_one_ticker(item: dict) -> None:
     ticker = item["ticker"]
-    today  = date.today().isoformat()
+    today  = now_syd().date().isoformat()
 
     item = lock_daily_reference(item)
     if item is None:
