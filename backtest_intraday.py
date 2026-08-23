@@ -780,11 +780,22 @@ def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> tup
     return summary, completed
 
 
-def show_stats(cfg: IntradayBacktestConfig) -> None:
+def show_stats(cfg: IntradayBacktestConfig, export_csv: Optional[str] = None) -> None:
     """
     --stats-only：不重跑，只汇总已经产出的Stage1数据，供你在开始写
     Stage2之前先核对这一层结果是否符合预期（覆盖率、health_status
     分布、有多少股票撞到60天永久沉寂上限等）。
+
+    export_csv：给一个路径时，额外导出三份完整明细CSV（Stage1有三张
+    有意义的表，不像EOD/Stage2那样"一行一笔交易"能塞进一个文件）：
+      <path>_state.csv     —— 每只股票的最终累积状态（一行一只股票）
+      <path>_intervals.csv —— active监测区间列表（一行一个区间）
+      <path>_health.csv    —— 逐日health_status明细（一行一个
+                              ticker+交易日，是这三份里信息量最大的一份，
+                              适合做覆盖率/分布这类更细的分析）
+    只写本地文件，不像EOD的--export-csv那样额外推送Telegram文档
+    （Stage1/Stage2目前没有对应的发送文件到Telegram的功能，只是打印
+    确认信息）。
     """
     if not os.path.exists(cfg.db_path):
         print(f"数据库不存在: {cfg.db_path}")
@@ -847,6 +858,33 @@ def show_stats(cfg: IntradayBacktestConfig) -> None:
             f"（Stage2会真正跑15分钟检测的天数）: "
             f"{ready_pullback}天 ({ready_pullback/total_health*100:.1f}%)"
         )
+
+    if export_csv:
+        try:
+            base, ext = os.path.splitext(export_csv)
+            ext = ext or ".csv"
+            state_path = f"{base}_state{ext}"
+            intervals_path = f"{base}_intervals{ext}"
+            health_path = f"{base}_health{ext}"
+
+            state_df.to_csv(state_path, index=False, encoding="utf-8-sig")
+            intervals_df.to_csv(intervals_path, index=False, encoding="utf-8-sig")
+
+            # 导出用的health明细是逐行(ticker, trading_date, health_status)，
+            # 不是上面print用的聚合版本(health_status, n)——这里单独查一次
+            # 完整明细，是这三份CSV里信息量最大、最适合做覆盖率/分布分析的一份。
+            health_full_df = pd.read_sql_query(
+                "SELECT * FROM intraday_health_backtest WHERE param_set = ?",
+                conn, params=[cfg.param_set],
+            )
+            health_full_df.to_csv(health_path, index=False, encoding="utf-8-sig")
+
+            print(f"\n📄 CSV已导出（3份，Stage1有三张有意义的表，不是单一交易明细）：")
+            print(f"  {state_path}（{len(state_df)}行，每只股票的最终累积状态）")
+            print(f"  {intervals_path}（{len(intervals_df)}行，active监测区间列表）")
+            print(f"  {health_path}（{len(health_full_df)}行，逐日health_status明细）")
+        except Exception as e:
+            print(f"⚠️ CSV导出失败: {e}")
 
     conn.close()
 
@@ -1458,12 +1496,17 @@ def run_stage2(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None)
     return summary, completed
 
 
-def show_stage2_stats(cfg: IntradayBacktestConfig) -> None:
+def show_stage2_stats(cfg: IntradayBacktestConfig, export_csv: Optional[str] = None) -> None:
     """
     --stats-only --run-stage2：模式拆解 + 2倍/3倍两套出场纪律各自的
     胜率 + 模式4专属的止损距离提醒（对话里讨论过：模式4止损没有ATR
     缓冲，是四个模式里止损天然最紧的一个，命中目标是不是噪音驱动
     要专门看这个数字）。
+
+    export_csv：给一个路径时导出完整信号明细CSV（一行一笔信号，
+    跟EOD的--export-csv是同一种"一行一笔交易"模式，不像Stage1那样
+    要拆成三份——Stage2本来就只有intraday_signals_backtest这一张
+    有意义的表）。
     """
     if not os.path.exists(cfg.db_path):
         print(f"数据库不存在: {cfg.db_path}")
@@ -1531,6 +1574,13 @@ def show_stage2_stats(cfg: IntradayBacktestConfig) -> None:
          "不是两批不同的信号，不能简单相加。样本量小于30笔的分组，"
          "结论仅供参考，不要下结论。")
 
+    if export_csv:
+        try:
+            df.to_csv(export_csv, index=False, encoding="utf-8-sig")
+            print(f"\n📄 CSV已导出: {export_csv}（{len(df)}行，"
+                 f"包含每笔信号的完整字段，适合做进一步定量分析）")
+        except Exception as e:
+            print(f"⚠️ CSV导出失败: {e}")
 
 
 def main() -> None:
@@ -1567,6 +1617,11 @@ def main() -> None:
     parser.add_argument("--stats-only", action="store_true",
                         help="不重跑，只汇总已有结果（配合--run-stage2看Stage2的统计，"
                              "不加则看Stage1的统计）")
+    parser.add_argument("--export-csv", default="",
+                        help="配合--stats-only使用，导出完整明细CSV，对齐backtest_engine.py"
+                             "已有的--export-csv能力。Stage1（不加--run-stage2）会导出3份"
+                             "（<path>_state/_intervals/_health），因为Stage1有三张有意义的表；"
+                             "Stage2（加--run-stage2）导出1份，一行一笔信号")
     parser.add_argument("--no-telegram", action="store_true")
     args = parser.parse_args()
 
@@ -1580,9 +1635,9 @@ def main() -> None:
 
     if args.stats_only:
         if args.run_stage2:
-            show_stage2_stats(cfg)
+            show_stage2_stats(cfg, export_csv=args.export_csv or None)
         else:
-            show_stats(cfg)
+            show_stats(cfg, export_csv=args.export_csv or None)
         return
 
     if args.run_all:
