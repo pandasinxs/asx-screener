@@ -2,7 +2,7 @@
 """
 backtest_engine.py
 ====================
-ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.3：小时级近似策略默认停用）
+ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.4：参数覆盖体系扩展）
 
 核心设计:
     本脚本不重新实现打分逻辑，而是直接 `import screener`，复用其中的
@@ -13,7 +13,31 @@ ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.3：小时级�
     这意味着回测用的止盈止损/超时规则和你线上 signals_history 表完全一致，
     两者理论上可以合并统计（本脚本提供 --merge-live 选项做这件事）。
 
-v2.3改动（本轮，intraday验证工具切换）：
+v2.4改动（本轮，参数覆盖体系扩展）：
+    screener.py v18.6把此前散落在函数体内的几组字面量/局部字典抽成了
+    可覆盖的模块级常量（MIN_MARKET_CAP_AUD/MIN_LIQUIDITY_DOLLAR_VOL/
+    TREND_SUB_WEIGHTS/CONFIDENCE_PARAMS/PERSISTENCE_WEIGHTS/
+    PERSISTENCE_MA50_SLOPE_MIN_PCT），本轮把这几组接入
+    apply_param_overrides()和_SCREENER_PRISTINE_DEFAULTS快照/
+    reset_screener_to_defaults()，params.json现在能测试：
+      - 市值/流动性门槛
+      - trend_strength_score的7个子维度权重（composite_score里
+        占比最重的因子，此前完全锁死）
+      - calc_confidence()的基准分/加分公式
+      - persistence_score的三项权重分配 + MA50斜率显著性门槛
+    详见export_default_params()导出的模板、apply_param_overrides()
+    里对应的映射块。
+
+    同时修复D1：SignalGenerator.scan_day()此前没有计算hh_hl/
+    ma_aligned这两个字段（screener.py的select_top3()有算，但这两个
+    字段在screener.py当前代码里也没有被任何下游逻辑读取，属于遗留
+    孤儿字段）。这次补上计算是为了让scan_day()跟select_top3()在
+    "每只股票的tech字典里包含哪些字段"这一点上保持结构一致，不是
+    因为这两个字段现在有了新用途——如果以后screener.py给这两个字段
+    加上实际用途（比如接入_passes_tier()的判断条件），backtest这边
+    已经在算，不需要另外补。
+
+v2.3改动（intraday验证工具切换）：
     include_hourly_intraday（HourlyIntradayApprox，60分钟线近似
     intraday_monitor.py四模式的独立研究性策略）默认值从True改为False，
     CLI flag从"--disable-hourly-intraday"改成"--enable-hourly-intraday"
@@ -53,8 +77,8 @@ v2.1改动（正式全市场700天回测前的检查中发现）：
        切片和build_tech_summary()只算一次，四层tier共用同一份tech字典，
        "先到先得、T1优先"语义不变。
     3) HourlyIntradayApprox._breakout_memory（模式2依赖的跨天突破记忆）
-       原来只存在进程内存里，--max-minutes分session续跑时会在进程重启后
-       丢失，导致跨进程边界附近的模式2信号被静默漏掉。新增
+       原来只存在进程内存里，--max-minutes分session续跑时会在进程重启
+       后丢失，导致跨进程边界附近的模式2信号被静默漏掉。新增
        backtest_breakout_memory表持久化，引擎启动时按run_key恢复，
        模式1触发时同步落盘。
 
@@ -167,6 +191,13 @@ except ImportError as e:
 # apply_param_overrides()是在"当前值"上做局部覆盖，不是每次都从
 # 干净的默认值出发。单次运行（不用--run-queue）不受影响，因为
 # 每次调用都是全新的Python进程，screener模块本来就是干净的。
+#
+# v2.4新增：把screener.py v18.6新增的几组可覆盖常量
+# （MIN_MARKET_CAP_AUD/MIN_LIQUIDITY_DOLLAR_VOL/TREND_SUB_WEIGHTS/
+# CONFIDENCE_PARAMS/PERSISTENCE_WEIGHTS/PERSISTENCE_MA50_SLOPE_MIN_PCT）
+# 一并纳入快照——漏掉任何一个都会导致--run-queue模式下，这个字段的
+# 覆盖值从某个实验开始"泄漏"给后续没有显式覆盖它的实验，而且不会
+# 报错，表现为"结果莫名其妙跟预期不一致"，很难排查。
 # ────────────────────────────────────────────────────────────
 _SCREENER_PRISTINE_DEFAULTS = {
     "SCORE_WEIGHTS": dict(screener.SCORE_WEIGHTS),
@@ -176,6 +207,15 @@ _SCREENER_PRISTINE_DEFAULTS = {
     "BT_STOP_ATR_MULT": screener.BT_STOP_ATR_MULT,
     "BT_TARGET_ATR_MULT": screener.BT_TARGET_ATR_MULT,
     "BT_TIMEOUT_DAYS": screener.BT_TIMEOUT_DAYS,
+    "MIN_MARKET_CAP_AUD": screener.MIN_MARKET_CAP_AUD,
+    "MIN_LIQUIDITY_DOLLAR_VOL": screener.MIN_LIQUIDITY_DOLLAR_VOL,
+    "TREND_SUB_WEIGHTS": dict(screener.TREND_SUB_WEIGHTS),
+    "CONFIDENCE_PARAMS": {
+        k: (dict(v) if isinstance(v, dict) else v)
+        for k, v in screener.CONFIDENCE_PARAMS.items()
+    },
+    "PERSISTENCE_WEIGHTS": dict(screener.PERSISTENCE_WEIGHTS),
+    "PERSISTENCE_MA50_SLOPE_MIN_PCT": screener.PERSISTENCE_MA50_SLOPE_MIN_PCT,
 }
 
 
@@ -189,6 +229,15 @@ def reset_screener_to_defaults() -> None:
     screener.BT_STOP_ATR_MULT = d["BT_STOP_ATR_MULT"]
     screener.BT_TARGET_ATR_MULT = d["BT_TARGET_ATR_MULT"]
     screener.BT_TIMEOUT_DAYS = d["BT_TIMEOUT_DAYS"]
+    screener.MIN_MARKET_CAP_AUD = d["MIN_MARKET_CAP_AUD"]
+    screener.MIN_LIQUIDITY_DOLLAR_VOL = d["MIN_LIQUIDITY_DOLLAR_VOL"]
+    screener.TREND_SUB_WEIGHTS = dict(d["TREND_SUB_WEIGHTS"])
+    screener.CONFIDENCE_PARAMS = {
+        k: (dict(v) if isinstance(v, dict) else v)
+        for k, v in d["CONFIDENCE_PARAMS"].items()
+    }
+    screener.PERSISTENCE_WEIGHTS = dict(d["PERSISTENCE_WEIGHTS"])
+    screener.PERSISTENCE_MA50_SLOPE_MIN_PCT = d["PERSISTENCE_MA50_SLOPE_MIN_PCT"]
 
 
 # ════════════════════════════════════════════════════════════
@@ -673,6 +722,13 @@ class SignalGenerator:
         股票数，error_count=当天评估出错的股票数，语义上比旧口径更直接，
         "全部失败"这个熔断判断条件（error_count==attempted_count）在
         两种口径下都能正确触发。
+
+        v2.4新增（D1修复）：每只股票通过tier后新增计算hh_hl/ma_aligned
+        两个字段，跟screener.py的select_top3()保持结构一致（这两个
+        字段目前在screener.py里也没有被任何下游逻辑读取，是遗留的
+        孤儿字段——这里补算是为了两边tech字典结构对齐，不是因为发现
+        了新用途）。跟persistence_score一样用独立try/except，失败时
+        退化为False，不因为这一项非核心衍生指标算不出来就丢掉整个候选。
         """
         xjo_slice = xjo_full[xjo_full.index <= as_of] if xjo_full is not None else None
         seen: dict[str, dict] = {}
@@ -720,6 +776,13 @@ class SignalGenerator:
                 )
             except Exception:
                 tech["persistence_score"] = 0.0
+
+            try:
+                tech["hh_hl"] = screener._check_higher_highs_lows(tech["_high"], tech["_low"])
+                tech["ma_aligned"] = screener._check_ma_alignment(tech, passed_tier["level"])
+            except Exception:
+                tech["hh_hl"] = False
+                tech["ma_aligned"] = False
 
             tech["catalyst"] = 0.0  # 历史回测无法重建公告驱动因子，诚实置0
             seen[ticker] = tech
@@ -781,6 +844,18 @@ class DailyHealthEvaluator:
       放量"这个时间维度，只保留"这天有没有放量"这个更粗的信号。
       如果某天放量发生在开盘但尾盘已萎缩，这个代理会误判为recent_spike，
       真实系统不会——这是唯一的系统性偏差来源。
+
+    v2.4修复（D2）：sig_count此前是len(signals)（不筛选，全部计数），
+    跟daily_analysis.py真实的sig_count = len([s for s in signals if
+    "✅" in s or "🔥" in s])口径不一致——真实系统只数带✅/🔥标记的信号，
+    signals列表里"健康回调中"这一条是唯一不带标记的例外（因为它对应
+    的分支直接把status锁定为pullback_healthy，不会走到sig_count>=4
+    这个阈值判断，带不带标记不影响那个分支的结果）。此前两边巧合地
+    从未产生过实际分歧（因为唯一的口径差异恰好发生在不受影响的分支
+    里），但这是巧合，不是设计保证——如果daily_analysis.py以后新增
+    一条不带标记的正面signal文案，两边会静默产生分歧。现在把✅/🔥
+    标记逐条对齐到daily_analysis.py的真实文案，sig_count改用同样的
+    过滤表达式，两边口径变成结构性一致，不再依赖巧合。
     """
 
     def __init__(self, cfg: BacktestConfig, logger: logging.Logger):
@@ -956,6 +1031,12 @@ class DailyHealthEvaluator:
                 except Exception as e:
                     self.logger.debug(f"60分钟量比精确化失败，回退到日总量比例代理: {e}")
 
+            # v2.4修复（D2）：signals列表逐条对齐daily_analysis.py的真实
+            # ✅/🔥标记文案。唯一不带标记的例外是"健康回调中"（对应
+            # daily_analysis.py里"🔵 健康回调中(...)"这条，不带✅/🔥），
+            # 因为这个分支直接锁定status=pullback_healthy，不受
+            # sig_count阈值判断影响，标不标记不改变这个分支自己的结果，
+            # 但会影响sig_count这个数值本身是否跟真实系统一致。
             signals: list[str] = []
             warnings: list[str] = []
 
@@ -970,7 +1051,7 @@ class DailyHealthEvaluator:
                     break
 
             if vol_slope < cfg.health_vol_shrink_slope_max or shrink >= 3:
-                signals.append("量能缩量整理")
+                signals.append("量能缩量整理✅")
             else:
                 warnings.append("量能未见有效缩量")
 
@@ -986,7 +1067,7 @@ class DailyHealthEvaluator:
                     pos = (c - l) / rng
                     spike_direction = "up" if pos >= 0.6 else "down"
                 if spike_direction == "up":
-                    signals.append("近期向上放量")
+                    signals.append("近期向上放量✅")
                 elif spike_direction == "down":
                     warnings.append("近期向下放量(可能出货信号)")
 
@@ -994,7 +1075,7 @@ class DailyHealthEvaluator:
             amplitude = ((day_high - day_low) / close_proxy).dropna()
             amp_slope = round(self._linreg_slope(amplitude), 4)
             if amp_slope < cfg.health_amplitude_shrink_slope:
-                signals.append("振幅收窄整理")
+                signals.append("振幅收窄整理✅")
             else:
                 warnings.append("振幅未见收窄")
 
@@ -1006,8 +1087,12 @@ class DailyHealthEvaluator:
             pullback_result = self._calc_pullback_health(window)
 
             if pullback_result["is_bottoming"]:
-                signals.append(f"健康回调触底反弹信号(回撤{pullback_result['depth_pct']}%)")
+                signals.append(f"健康回调触底反弹信号✅(回撤{pullback_result['depth_pct']}%)")
             elif pullback_result["is_healthy"]:
+                # 唯一不带✅/🔥标记的分支，对齐daily_analysis.py的
+                # "🔵 健康回调中(...)"——不影响sig_count>=4这个阈值
+                # 判断，因为这个分支下面已经把status直接锁定为
+                # pullback_healthy（见本函数末尾状态判断部分）
                 signals.append(f"健康回调中(回撤{pullback_result['depth_pct']}%,缩量)")
             elif pullback_result["is_pullback"] and not pullback_result["is_healthy"]:
                 warnings.append(f"回调但非缩量(回撤{pullback_result['depth_pct']}%,非健康回调)")
@@ -1019,7 +1104,7 @@ class DailyHealthEvaluator:
                 # ── 价格结构因子（笼统判断，只在不处于回调状态时才用）──
                 price_slope = round(self._linreg_slope(close_proxy), 4)
                 if price_slope > 0:
-                    signals.append("价格重心上移")
+                    signals.append("价格重心上移✅")
                 else:
                     warnings.append("价格重心未见上移")
 
@@ -1029,7 +1114,7 @@ class DailyHealthEvaluator:
                 cp = ((close_proxy - day_low) / day_range)[valid]
                 above_pct = float((cp >= cfg.health_close_pos_min).sum() / len(cp))
                 if above_pct >= 0.6:
-                    signals.append("收盘持续偏强")
+                    signals.append("收盘持续偏强✅")
 
             if n_days >= cfg.health_min_days_exhaustion:
                 recent_high = float(day_high.max())
@@ -1039,7 +1124,7 @@ class DailyHealthEvaluator:
                     if h >= threshold and c < threshold
                 ))
                 if 2 <= tests <= 8:
-                    signals.append(f"压力位测试{tests}次")
+                    signals.append(f"压力位测试{tests}次✅")
                 elif tests > 8:
                     warnings.append(f"压力位测试次数过多({tests}次)")
 
@@ -1048,14 +1133,17 @@ class DailyHealthEvaluator:
                 base_vol = float(np.mean(vols[:-1])) if len(vols) > 1 else 0.0
                 if (base_vol > 0 and all(v <= base_vol * 1.2 for v in vols[:-1])
                         and vols[-1] > base_vol * cfg.health_vol_spike_threshold):
-                    signals.append("第一次放量")
+                    signals.append("🔥 第一次放量")
                 closes_arr = close_proxy.dropna().values
                 if len(closes_arr) >= 4:
                     d2 = np.diff(np.diff(closes_arr))
                     if len(d2) >= 2 and d2[-1] > 0 and d2[-2] > 0:
-                        signals.append("价格加速上涨")
+                        signals.append("价格加速上涨✅")
 
-            sig_count = len(signals)
+            # v2.4修复（D2）：只数带✅/🔥标记的signal，跟daily_analysis.py
+            # 的sig_count = len([s for s in signals if "✅" in s or "🔥" in s])
+            # 完全一致的过滤表达式，不再是len(signals)不加区分地全数。
+            sig_count = len([s for s in signals if "✅" in s or "🔥" in s])
             warn_count = len(warnings)
 
             # ── 状态判断：回调轨道优先于常规ready/watch/caution判断，
@@ -1987,6 +2075,18 @@ def export_default_params(path: str, cfg: BacktestConfig, logger: logging.Logger
         "BT_STOP_ATR_MULT": screener.BT_STOP_ATR_MULT,
         "BT_TARGET_ATR_MULT": screener.BT_TARGET_ATR_MULT,
         "BT_TIMEOUT_DAYS": screener.BT_TIMEOUT_DAYS,
+        # v2.4新增：screener.py v18.6把这几组参数从函数体内的字面量/
+        # 局部字典抽成了可覆盖的模块级常量，这里一并导出，模板里
+        # 默认已经带上，不需要你手写这些字段名。
+        "MIN_MARKET_CAP_AUD": screener.MIN_MARKET_CAP_AUD,
+        "MIN_LIQUIDITY_DOLLAR_VOL": screener.MIN_LIQUIDITY_DOLLAR_VOL,
+        "TREND_SUB_WEIGHTS": dict(screener.TREND_SUB_WEIGHTS),
+        "CONFIDENCE_PARAMS": {
+            k: (dict(v) if isinstance(v, dict) else v)
+            for k, v in screener.CONFIDENCE_PARAMS.items()
+        },
+        "PERSISTENCE_WEIGHTS": dict(screener.PERSISTENCE_WEIGHTS),
+        "PERSISTENCE_MA50_SLOPE_MIN_PCT": screener.PERSISTENCE_MA50_SLOPE_MIN_PCT,
         "DAILY_HEALTH": {
             "VOL_SPIKE_THRESHOLD": cfg.health_vol_spike_threshold,
             "VOL_SHRINK_SLOPE_MAX": cfg.health_vol_shrink_slope_max,
@@ -2061,6 +2161,50 @@ def apply_param_overrides(overrides: dict, cfg: BacktestConfig, logger: logging.
         if scalar_key in overrides:
             setattr(screener, scalar_key, overrides[scalar_key])
             logger.info(f"覆盖 {scalar_key} -> {overrides[scalar_key]}")
+
+    # v2.4新增：screener.py v18.6新增的可覆盖常量组 ──────────────────
+    if "MIN_MARKET_CAP_AUD" in overrides:
+        screener.MIN_MARKET_CAP_AUD = overrides["MIN_MARKET_CAP_AUD"]
+        # 同步覆盖cfg.min_market_cap：backtest_engine.py自己的市值过滤
+        # 在SignalGenerator.scan_day()里直接用cfg.min_market_cap判断
+        # （不经过screener.select_top3()，那个函数backtest不会调用），
+        # 只改screener模块的常量不会让回测本身的市值门槛真的变化。
+        cfg.min_market_cap = overrides["MIN_MARKET_CAP_AUD"]
+        logger.info(f"覆盖 MIN_MARKET_CAP_AUD -> {overrides['MIN_MARKET_CAP_AUD']}"
+                    f"（同步覆盖cfg.min_market_cap）")
+
+    if "MIN_LIQUIDITY_DOLLAR_VOL" in overrides:
+        screener.MIN_LIQUIDITY_DOLLAR_VOL = overrides["MIN_LIQUIDITY_DOLLAR_VOL"]
+        logger.info(f"覆盖 MIN_LIQUIDITY_DOLLAR_VOL -> {overrides['MIN_LIQUIDITY_DOLLAR_VOL']}"
+                    f"（直接生效于screener._passes_tier()，backtest_engine.py复用这个函数，"
+                    f"不需要额外同步cfg字段）")
+
+    if "TREND_SUB_WEIGHTS" in overrides:
+        screener.TREND_SUB_WEIGHTS = {**screener.TREND_SUB_WEIGHTS, **overrides["TREND_SUB_WEIGHTS"]}
+        logger.info(f"覆盖 TREND_SUB_WEIGHTS -> {screener.TREND_SUB_WEIGHTS}")
+
+    if "CONFIDENCE_PARAMS" in overrides:
+        # BASE_MAP是嵌套字典（按tier分T1-T4），浅层{**old,**new}会整个替换掉
+        # BASE_MAP这个key、丢失没在覆盖里提到的其他tier默认值——单独处理
+        # 这一层嵌套，只有"CONFIDENCE_PARAMS.BASE_MAP"里显式出现的tier才被
+        # 覆盖，跟TIERS覆盖"只patch提到的tier"是同一个原则。
+        new_conf = dict(screener.CONFIDENCE_PARAMS)
+        patch = overrides["CONFIDENCE_PARAMS"]
+        if "BASE_MAP" in patch:
+            new_conf["BASE_MAP"] = {**new_conf["BASE_MAP"], **patch["BASE_MAP"]}
+        for k, v in patch.items():
+            if k != "BASE_MAP":
+                new_conf[k] = v
+        screener.CONFIDENCE_PARAMS = new_conf
+        logger.info(f"覆盖 CONFIDENCE_PARAMS -> {screener.CONFIDENCE_PARAMS}")
+
+    if "PERSISTENCE_WEIGHTS" in overrides:
+        screener.PERSISTENCE_WEIGHTS = {**screener.PERSISTENCE_WEIGHTS, **overrides["PERSISTENCE_WEIGHTS"]}
+        logger.info(f"覆盖 PERSISTENCE_WEIGHTS -> {screener.PERSISTENCE_WEIGHTS}")
+
+    if "PERSISTENCE_MA50_SLOPE_MIN_PCT" in overrides:
+        screener.PERSISTENCE_MA50_SLOPE_MIN_PCT = overrides["PERSISTENCE_MA50_SLOPE_MIN_PCT"]
+        logger.info(f"覆盖 PERSISTENCE_MA50_SLOPE_MIN_PCT -> {overrides['PERSISTENCE_MA50_SLOPE_MIN_PCT']}")
 
     if "DAILY_HEALTH" in overrides:
         health_field_map = {
