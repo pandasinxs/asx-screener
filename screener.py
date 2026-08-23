@@ -54,6 +54,27 @@
 #          函数请求方式保持一致。
 #        - 同时在失败时记录HTTP状态码、Content-Type、正文前200字符，
 #          方便下次一旦再失败能立刻判断是"被拦截"还是"真断网"。
+#
+# v18.6改动（本轮，参数覆盖体系扩展 + 性能修复）：
+#   6) select_top3()性能修复：build_tech_summary()对同一只股票同一天
+#      不受tier影响，原实现"for tier: for ticker"两层循环会让每只股票
+#      在T1未通过后到T2循环里重新完整计算一次技术指标，全市场~2000只
+#      最多被重复算4遍。改成每只股票只算一次，按TIERS顺序依次尝试
+#      _passes_tier()，"先到先得、T1优先"语义不变。
+#   7) 新增可覆盖的模块级常量，此前是函数体内的字面量/局部字典，
+#      现在backtest_engine.py的params.json覆盖体系可以碰到：
+#        - MIN_MARKET_CAP_AUD（原select_top3()里硬编码的50_000_000）
+#        - MIN_LIQUIDITY_DOLLAR_VOL（原_passes_tier()里硬编码的300_000）
+#        - TREND_SUB_WEIGHTS（原calc_trend_strength_score()内联的
+#          7个子维度权重字典）
+#        - CONFIDENCE_PARAMS（原calc_confidence()里散落的基准分/加分
+#          公式参数）
+#        - PERSISTENCE_WEIGHTS / PERSISTENCE_MA50_SLOPE_MIN_PCT
+#          （原_check_trend_persistence()里的0.40/0.40/0.20权重分配
+#          + MA50斜率显著性门槛）
+#      全部是"把字面量换成同值的具名模块常量"，默认值完全不变，
+#      纯为了让回测能测试不同参数组合，不改变screener.py当前的
+#      实际运行行为。
 # ============================================================
 
 import os, io, re, sys, time, logging, json, subprocess
@@ -140,6 +161,12 @@ NEWS_MAX          = 5
 BT_STOP_ATR_MULT   = 2
 BT_TARGET_ATR_MULT = 4
 BT_TIMEOUT_DAYS    = 20
+
+# v18.6新增：EOD选股的市值/流动性门槛，此前是select_top3()/_passes_tier()
+# 里的字面量50_000_000/300_000，现在抽成具名模块常量，默认值不变，
+# 供backtest_engine.py的params.json覆盖体系测试不同门槛。
+MIN_MARKET_CAP_AUD = 50_000_000.0
+MIN_LIQUIDITY_DOLLAR_VOL = 300_000.0
 
 ANN_WHITELIST = {
     "Quarterly Activities Report", "Quarterly Cashflow Report",
@@ -348,6 +375,22 @@ def build_tech_summary(df: pd.DataFrame,
 
 TIER_BONUS = {"T1": 0.15, "T2": 0.10, "T3": 0.05, "T4": 0.0}
 
+# v18.6新增：trend_strength_score的7个子维度权重，原来是
+# calc_trend_strength_score()函数体内每次调用都重新构造的局部字典，
+# 现在抽成模块级常量，供params.json覆盖体系测试不同权重分配。
+# 这是composite_score里占比最重的因子（SCORE_WEIGHTS.trend_strength=0.50），
+# 默认值总和为1.0（不强制校验，改动后总和偏离1.0只是改变了分数量纲，
+# 不会报错——这跟SCORE_WEIGHTS/TIER_BONUS等其他覆盖字典的处理方式一致）。
+TREND_SUB_WEIGHTS = {
+    "volume_multiple":   0.20,
+    "near_52w_hi":       0.15,
+    "ma_alignment":      0.15,
+    "ma50_trend":        0.15,
+    "hh_hl_structure":   0.15,
+    "relative_strength": 0.10,
+    "vwap_position":     0.10,
+}
+
 def calc_composite_score(tech: dict) -> float:
     def norm(val, lo, hi):
         return max(0.0, min(1.0, (val - lo) / (hi - lo))) if hi > lo else 0.0
@@ -362,17 +405,35 @@ def calc_composite_score(tech: dict) -> float:
     bonus = TIER_BONUS.get(tech.get("tier_level", ""), 0.0)
     return round(base + bonus, 4)
 
+# v18.6新增：calc_confidence()原来的基准分/加分公式参数散落在函数体内
+# （base_map局部字典 + 若干内联字面量：ADX/RS锚点、各项加分上限、
+# 52周高点惩罚锚点、整体clamp范围），现在抽成一个模块级字典，
+# 供params.json覆盖体系测试不同的信心分数校准。这个分数只是展示给
+# 使用者参考，不参与T1-T4筛选/composite_score排序决策。
+CONFIDENCE_PARAMS = {
+    "BASE_MAP": {"T1": 0.85, "T2": 0.75, "T3": 0.65, "T4": 0.55},
+    "BASE_DEFAULT": 0.60,
+    "ADX_ANCHOR_LO": 25.0, "ADX_ANCHOR_HI": 40.0, "ADX_BONUS_MAX": 0.05,
+    "RS_ANCHOR": 1.0, "RS_RANGE": 0.2, "RS_BONUS_MAX": 0.05,
+    "VOL_BONUS": 0.02,
+    "DIST_ANCHOR": 20.0, "DIST_PEN_MAX": 0.05,
+    "CLAMP_MIN": 0.50, "CLAMP_MAX": 0.92,
+}
+
 def calc_confidence(tech: dict, tier_level: str) -> float:
-    base_map  = {"T1": 0.85, "T2": 0.75, "T3": 0.65, "T4": 0.55}
-    base      = base_map.get(tier_level, 0.60)
+    p = CONFIDENCE_PARAMS
+    base      = p["BASE_MAP"].get(tier_level, p["BASE_DEFAULT"])
     adx       = tech.get("adx14", 20)
     rs        = tech.get("rs_vs_xjo", 1.0)
-    adx_bonus = min(0.05, max(0.0, (adx - 25) / (40 - 25) * 0.05))
-    rs_bonus  = min(0.05, max(0.0, (rs - 1.0) / 0.2 * 0.05))
-    vol_bonus = 0.02 if tech.get("vol_consistency") else 0.0
+    adx_bonus = min(p["ADX_BONUS_MAX"], max(0.0,
+                    (adx - p["ADX_ANCHOR_LO"]) / (p["ADX_ANCHOR_HI"] - p["ADX_ANCHOR_LO"]) * p["ADX_BONUS_MAX"]))
+    rs_bonus  = min(p["RS_BONUS_MAX"], max(0.0,
+                    (rs - p["RS_ANCHOR"]) / p["RS_RANGE"] * p["RS_BONUS_MAX"]))
+    vol_bonus = p["VOL_BONUS"] if tech.get("vol_consistency") else 0.0
     dist      = abs(tech.get("dist_52w_hi_pct", -20))
-    dist_pen  = min(0.05, dist / 20 * 0.05)
-    return round(min(0.92, max(0.50, base + adx_bonus + rs_bonus + vol_bonus - dist_pen)), 2)
+    dist_pen  = min(p["DIST_PEN_MAX"], dist / p["DIST_ANCHOR"] * p["DIST_PEN_MAX"])
+    return round(min(p["CLAMP_MAX"], max(p["CLAMP_MIN"],
+                base + adx_bonus + rs_bonus + vol_bonus - dist_pen)), 2)
 
 
 def _check_volume_quality(volume_s: pd.Series) -> bool:
@@ -428,17 +489,27 @@ def _check_volume_quality(volume_s: pd.Series) -> bool:
     return True
 
 
+# v18.6新增：_check_trend_persistence()原来的0.40/0.40/0.20权重分配
+# 是内联在函数体内的字面量，现在抽成模块级字典，供params.json覆盖
+# 体系测试不同权重。MA50斜率显著性门槛(0.0005)同理抽成模块常量。
+# 注意：ADX>20这个"是否算趋势"的判断阈值、-10:/-20:这些回溯窗口长度
+# 不在这次参数化范围内——这次只做用户明确要的"三个权重"，不做范围
+# 之外的扩展，避免不必要的改动面。
+PERSISTENCE_WEIGHTS = {"adx": 0.40, "di": 0.40, "ma50_trend": 0.20}
+PERSISTENCE_MA50_SLOPE_MIN_PCT = 0.0005
+
 def _check_trend_persistence(close: pd.Series,
                               adx_s: pd.Series,
                               pdi_s: pd.Series,
                               mdi_s: pd.Series) -> float:
     score = 0.0
+    w = PERSISTENCE_WEIGHTS
 
     try:
         adx_10 = adx_s.iloc[-10:].dropna()
         if len(adx_10) >= 5:
             adx_persistence = float((adx_10 > 20).sum()) / len(adx_10)
-            score += adx_persistence * 0.40
+            score += adx_persistence * w["adx"]
     except Exception:
         pass
 
@@ -452,7 +523,7 @@ def _check_trend_persistence(close: pd.Series,
                     if float(pdi_10.iloc[-(min_len - i)]) >
                        float(mdi_10.iloc[-(min_len - i)]))
             ) / min_len
-            score += di_persistence * 0.40
+            score += di_persistence * w["di"]
     except Exception:
         pass
 
@@ -470,8 +541,8 @@ def _check_trend_persistence(close: pd.Series,
                 if den > 0:
                     slope     = num / den
                     slope_pct = slope / mean_y
-                    if slope > 0 and slope_pct > 0.0005:
-                        score += 0.20
+                    if slope > 0 and slope_pct > PERSISTENCE_MA50_SLOPE_MIN_PCT:
+                        score += w["ma50_trend"]
     except Exception:
         pass
 
@@ -575,17 +646,7 @@ def calc_trend_strength_score(tech: dict, tier: dict) -> dict:
     vwap_premium = (lc / vwap20 - 1) if vwap20 > 0 else 0
     scores["vwap_position"] = _norm(vwap_premium, -0.03, 0.05)
 
-    weights = {
-        "volume_multiple":   0.20,
-        "near_52w_hi":       0.15,
-        "ma_alignment":      0.15,
-        "ma50_trend":        0.15,
-        "hh_hl_structure":   0.15,
-        "relative_strength": 0.10,
-        "vwap_position":     0.10,
-    }
-
-    trend_strength_score = sum(scores[k] * weights[k] for k in weights)
+    trend_strength_score = sum(scores[k] * TREND_SUB_WEIGHTS[k] for k in TREND_SUB_WEIGHTS)
 
     return {
         "trend_strength_score": round(trend_strength_score, 4),
@@ -850,14 +911,9 @@ def get_asx_universe() -> list:
             else:
                 log.error(f"get_asx_universe HTTP错误达到{NET_RETRY_MAX}次重试上限")
         except Exception as e:
-            # 即使是pandas等解析异常，也把resp的诊断信息带出来，不再让
-            # "No columns to parse from file"这种通用消息吞掉现场信息。
             diag = ""
             if resp is not None:
                 try:
-                    # 注意：Python 3.12以前，f-string的{}表达式内部不允许
-                    # 出现反斜杠（如'\n'），所以先在f-string外面把转义处理
-                    # 好，再作为普通变量放进{}里，避免SyntaxError。
                     resp_text_raw = resp.text or ""
                     resp_snippet  = resp_text_raw[:300].replace("\n", "\\n")
                     diag = (f" status={resp.status_code} "
@@ -2442,7 +2498,7 @@ def _passes_tier(tech: dict, tier: dict) -> bool:
     high_s    = tech["_high"]
     low_s     = tech["_low"]
 
-    if float(volume_s.iloc[-20:].mean()) * lc < 300_000:
+    if float(volume_s.iloc[-20:].mean()) * lc < MIN_LIQUIDITY_DOLLAR_VOL:
         return False
 
     r15 = pd.concat([high_s, low_s], axis=1).iloc[-15:]
@@ -2590,7 +2646,7 @@ def select_top3(all_data: dict, market_snap: dict,
     filtered_pool = []
     for s in raw_signals:
         fund = fetch_fundamentals(s["ticker"])
-        if fund.get("market_cap_m", 0) * 1e6 < 50_000_000:
+        if fund.get("market_cap_m", 0) * 1e6 < MIN_MARKET_CAP_AUD:
             log.debug(f"市值过滤 [{s['ticker']}]")
             continue
         s.update(fund)
@@ -2719,7 +2775,7 @@ def _passes_tier_diagnostic(tech: dict, tier: dict) -> dict:
 
     checks["ma50_trend"] = (lc >= tech["ma50"] and tech["ma50_up"])
 
-    checks["liquidity"] = (float(volume_s.iloc[-20:].mean()) * lc >= 300_000)
+    checks["liquidity"] = (float(volume_s.iloc[-20:].mean()) * lc >= MIN_LIQUIDITY_DOLLAR_VOL)
 
     r15 = pd.concat([high_s, low_s], axis=1).iloc[-15:]
     pr  = (float(r15.iloc[:, 0].max()) - float(r15.iloc[:, 1].min())) / lc
