@@ -44,12 +44,25 @@ market_data_cache.py
       tz-naive比较时抛TypeError（这个坑backtest_engine.py v2.1修复
       时已经踩过一次，这里从源头上保证不会再发生）
 
-不依赖 backtest_engine.py 或 screener.py，可以被两边独立import，
-也可以被 data_fetcher.py 单独调用做批量预热/增量累积。
+v1.3改动（本轮，回测端性能修复）：
+    新增get_cached_only()——纯本地读取，不做任何缺口检测、不发任何
+    网络请求。背景：原有的_get()（get_daily/get_60m/get_15m内部调用）
+    里的_missing_ranges()，只要请求的end参数是"今天"，就会因为
+    yfinance的end参数是排他性的（永远不包含当天）而必然计算出一个
+    "今天"这1天的缺口——这个缺口本质上永远补不上（哪怕补上100次，
+    yfinance都不会真的给这一天的数据），但_missing_ranges()没有
+    "记住"这一点，每次调用都会重新触发一次真实的网络请求去尝试。
+    backtest_engine.py的标准测试窗口默认把end对齐到"今天"，全市场
+    ~1840只股票逐票请求（这条路径完全没走warm_batch()的批量优化），
+    是backtest_engine.py一次运行动辄数小时的主因之一（详见对话里
+    贴出的backtest.log分析）。
 
-依赖:
-    需要 pyarrow（或 fastparquet）才能读写Parquet文件，VM上如果还没装：
-        pip install pyarrow --break-system-packages
+    get_cached_only()从根源上绕开这个问题：回测只需要"尽量多的历史
+    数据"，不需要"精确到今天"，直接读Parquet里已经有的全部内容，
+    完全不触碰_missing_ranges()/_fetch_from_yf()这条会发网络请求的
+    路径。get_daily()/get_60m()/get_15m()这几个原有的"缺口检测+
+    自动补齐"接口不删除、不改行为——data_fetcher.py的warm_batch()
+    仍然依赖它们做增量抓取，这是这个模块另一个完全独立的用途。
 """
 
 import logging
@@ -116,7 +129,7 @@ class MarketDataCache:
         return min(60.0, 3.0 * (2 ** (attempt - 1)))
 
     # ────────────────────────────────────────────────────────
-    # 对外接口：三种颗粒度分别的get方法
+    # 对外接口：三种颗粒度分别的get方法（缺口检测+自动补齐，会发网络请求）
     # ────────────────────────────────────────────────────────
 
     def get_daily(self, ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
@@ -127,6 +140,26 @@ class MarketDataCache:
 
     def get_15m(self, ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
         return self._get(ticker, "15m", start, end)
+
+    def get_cached_only(self, ticker: str, granularity: str) -> Optional[pd.DataFrame]:
+        """
+        v1.3新增：纯本地读取，不做缺口检测、不发任何网络请求——直接
+        返回Parquet里这只股票当前已经缓存的全部内容，缓存覆盖到哪天
+        就是哪天，不尝试补齐到某个特定的start/end。
+
+        供backtest_engine.py用：回测只需要"尽量多的历史数据"，不需要
+        "精确覆盖到今天"，用这个接口能完全避开get_daily()/get_60m()/
+        get_15m()里_missing_ranges()因为yfinance的end参数排他性语义
+        而必然触发的"今天"缺口网络请求（这个缺口本质上永远补不上，
+        但没有'补不上'的记忆机制，每次调用都会重新尝试一次）。
+
+        返回None：本地完全没有这只股票这个颗粒度的缓存（还没被
+        data_fetcher.py --mode backfill/weekly15m抓取过），调用方
+        应该把这种情况当作"数据不足，跳过"处理，不应该在这里现场
+        触发网络请求去补——如果真的需要补，应该去跑data_fetcher.py，
+        不是在回测进程里现场发起。
+        """
+        return self._read_cached(ticker, granularity)
 
     def coverage_summary(self, granularity: Optional[str] = None) -> pd.DataFrame:
         """
@@ -455,6 +488,17 @@ class MarketDataCache:
         _merge_and_save()里会被去重（keep="last"，新拿到的数据覆盖
         旧的），这样处理比精确计算"下一个交易日"简单得多，也不会因为
         节假日/非交易日的边界情况出错。
+
+        ⚠️ 已知行为（本轮对话诊断确认，未修复，见get_cached_only()）：
+        当end恰好是"今天"时，只要本地缓存的cov_end是"昨天或更早"
+        （几乎总是如此，因为yfinance的end参数是排他的，永远不会返回
+        "今天"这一天本身），这里会计算出一个(cov_end, 今天)的1天缺口，
+        触发一次网络请求——但这个缺口本质上永远补不上（下一次调用，
+        哪怕就在几分钟后，cov_end依然停在昨天，同样的缺口会被重新
+        计算出来）。这不是bug修复的范围（改动_missing_ranges()本身
+        的语义会影响get_daily()/get_60m()/get_15m()这三个仍在被
+        data_fetcher.py使用的接口），而是新增了完全绕开这条路径的
+        get_cached_only()供backtest_engine.py使用。
         """
         if cached is None or cached.empty:
             return [(start, end)]
