@@ -2,7 +2,7 @@
 """
 backtest_engine.py
 ====================
-ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.4：参数覆盖体系扩展）
+ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.5：纯本地缓存，消除运行期网络请求）
 
 核心设计:
     本脚本不重新实现打分逻辑，而是直接 `import screener`，复用其中的
@@ -13,7 +13,55 @@ ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.4：参数覆�
     这意味着回测用的止盈止损/超时规则和你线上 signals_history 表完全一致，
     两者理论上可以合并统计（本脚本提供 --merge-live 选项做这件事）。
 
-v2.4改动（本轮，参数覆盖体系扩展）：
+v2.5改动（本轮，性能修复——回测运行期彻底消除网络请求）：
+    根因诊断（详见对话里贴出的backtest.log分析）：v2.4及之前的标准
+    测试窗口默认把end对齐到"今天"，而yfinance的end参数是排他性的
+    （永远不包含当天）。DataLayer.fetch()/fetch_60m()走的
+    market_data_cache.get_daily()/get_60m()内部的_missing_ranges()，
+    只要end是"今天"、本地缓存的cov_end是"昨天或更早"（几乎总是如此），
+    就会计算出一个(cov_end, 今天)这1天的"缺口"，触发一次网络请求——
+    但这个缺口本质上永远补不上，下次调用（哪怕几分钟后）会重新计算
+    出同样的缺口、重新发一次注定失败的请求。这条路径还是逐票循环
+    （从没走过data_fetcher.py的批量优化），全市场~1840只股票、每天
+    都要交一次这个"税"，是回测一次运行动辄数小时的主因。
+
+    修复思路：本地缓存本来就在被data_fetcher.py（--mode backfill +
+    --mode weekly15m）按周持续累积，"回测用尽量多的数据"这个目标不
+    需要靠"精确对齐到今天"来达成，直接读本地缓存实际覆盖到的全部
+    范围就够了。具体改动：
+      - market_data_cache.py新增get_cached_only()：纯本地读取，不做
+        缺口检测、不发任何网络请求
+      - DataLayer新增fetch_cached_only()/fetch_60m_cached_only()，
+        _run_inner()主数据加载循环和_get_hourly()都改用这两个方法
+      - BacktestConfig.start_date/end_date默认改为None（不再自动填
+        "今天倒推700天"），含义变成"不设限制，本地缓存有多少用多少"；
+        _run_inner()读取完缓存后，动态算出实际可评分区间（=全部股票
+        缓存的最早/最晚日期交集，扣除warmup_calendar_days热身缓冲）
+      - --start/--end依然可以手动传，作用变成"在本地缓存基础上再做
+        一次人工裁剪"，不再有"是否触发网络请求"的含义——不管传不传，
+        回测运行期都不会联网
+      - main()里原本会硬阻断"--start早于60分钟线可用窗口"的校验，
+        降级成软警告（原来的阻断是为了防止一次注定失败的网络请求，
+        现在这个前提已经不存在）
+      - StatsReporter._benchmark_return()改为显式接受start/end参数
+        （从cfg里手动指定的值，或combined实际的signal_date范围反推），
+        避免cfg.start_date/end_date为None时传给yf.download()退化成
+        "全部可得历史"这个没有意义的基准涨跌幅
+
+    对"跨实验公平对比"的影响：同一天内跑的多个不同参数实验，看到的
+    是同一份本地缓存快照，互相依然完全可比；跨天对比（这周跑的实验
+    vs下周跑的）会因为缓存持续增长而使用不同的实际数据范围——这是
+    刻意的设计取舍（用最多的数据换样本量），不是bug，但排行榜排出的
+    胜率差异跨天对比时要记得这一层。
+
+    一个连带的好处（不是刻意设计但值得记录）：同一个param_set默认
+    情况下run_key字符串不再随"今天"变化（start_date/end_date都是
+    None，不像以前每天都不一样），意味着同一个param_set可以"越跑
+    越新"——本地缓存这段时间新增的交易日会被断点续跑机制当作"剩余
+    待处理天数"自动继续处理，不需要手动改名字或者传新的--start/--end
+    去追新数据。
+
+v2.4改动（参数覆盖体系扩展）：
     screener.py v18.6把此前散落在函数体内的几组字面量/局部字典抽成了
     可覆盖的模块级常量（MIN_MARKET_CAP_AUD/MIN_LIQUIDITY_DOLLAR_VOL/
     TREND_SUB_WEIGHTS/CONFIDENCE_PARAMS/PERSISTENCE_WEIGHTS/
@@ -322,19 +370,42 @@ def send_telegram_document(file_path: str, caption: str = "",
 # ════════════════════════════════════════════════════════════
 
 # ════════════════════════════════════════════════════════════
-# 标准化测试窗口 —— "每次都测一样的，只改参数"
+# 测试窗口 —— v2.5起默认"有多少本地缓存用多少"，不再强制对齐"今天"
 #
-# 统一规则：不再手动传--start/--end，一律自动算成"今天倒推700天"，
-# 加上再往前365天（1年）的热身缓冲用于计算MA200/52周高点这些长窗口
-# 指标的初始值。700天留了30天余量在yfinance 60m数据~729天的硬上限
-# 内，所以--use-hourly-vol-ratio这个默认开启的功能不会因为标准窗口
-# 本身而触发2年上限报错。
+# 历史规则（v2.4及之前）：不手动传--start/--end时，一律自动算成
+# "今天倒推700天"。这个设计的本意是让所有实验的测试范围完全一致，
+# 只有参数在变，排行榜/对比才有意义。
 #
-# 这样做的目的：让所有实验的"测试范围"完全一致，只有参数在变，
-# 排行榜/对比才有意义——如果每次连测试区间都不一样，胜率差异到底是
-# 参数改得好还是测试期市场行情不同，根本分不清。
+# v2.5改动（本轮，性能修复的一部分）：这条规则本身制造了一个真实的
+# 性能问题——end对齐到"今天"，而yfinance的end参数是排他性的（永远
+# 不包含当天），导致DataLayer.fetch()/fetch_60m()每次运行都会计算出
+# 一个"今天"这1天的缺口并触发网络请求；这个缺口本质上永远补不上，
+# 但没有"补不上"的记忆机制，全市场~1840只股票逐票触发，是回测一次
+# 跑数小时的主因之一（详见对话里贴出的backtest.log分析）。
+#
+# 修复思路：本地缓存本来就在被data_fetcher.py（--mode backfill每周
+# +--mode weekly15m每周）持续累积，"回测尽量用最多数据"这个目标，
+# 不需要靠"精确对齐到今天"来达成——直接读本地缓存实际覆盖到的全部
+# 范围就够了，缓存覆盖到哪天就用到哪天，样本量随缓存增长自动变大，
+# 回测本身完全不用再发起任何网络请求（DataLayer.fetch_cached_only()/
+# fetch_60m_cached_only()，见DataLayer类定义）。
+#
+# 新规则：cfg.start_date/end_date默认都是None，表示"不设限制，缓存
+# 有多少用多少"，实际使用的范围在_run_inner()读取完本地缓存后动态
+# 算出（= 全部股票缓存的最早/最晚日期交集，扣除warmup_calendar_days
+# 热身缓冲）。--start/--end依然可以手动传，作用变成"在本地缓存基础
+# 上再做一次人工裁剪"（比如只想看2025年这一段），不传就是不裁剪。
+#
+# 对"跨实验公平对比"这条原则的影响：同一天内跑的多个不同参数实验，
+# 看到的是同一份本地缓存快照，互相依然完全可比；跨天对比（这周跑的
+# 实验vs下周跑的）会因为缓存持续增长而使用不同的实际数据范围——这是
+# 刻意的设计取舍（用最多的数据），不是bug，但排行榜排出的胜率差异
+# 跨天对比时要记得这一层。
 # ════════════════════════════════════════════════════════════
-STANDARD_WINDOW_DAYS = 700
+STANDARD_WINDOW_DAYS = 700   # 仅在手动--start/--end时，STANDARD_WARMUP_DAYS
+                              # 之类的常量依然沿用这个量级作为参考默认值；
+                              # 默认（不传--start/--end）路径不再使用这个值
+                              # 来强制截断范围
 STANDARD_WARMUP_DAYS = 365
 
 
@@ -349,8 +420,11 @@ def _standard_start_str() -> str:
 
 @dataclass
 class BacktestConfig:
-    start_date: Optional[str] = None  # None时自动算成"今天-700天"（标准窗口）
-    end_date: Optional[str] = None    # None时自动算成"今天"
+    # v2.5改动：默认都是None，含义是"不设限制，本地缓存有多少数据就用
+    # 多少"，实际使用的范围在_run_inner()读取完缓存后动态算出。手动
+    # 传了具体值时，含义变成"在本地缓存基础上再做一次人工裁剪"。
+    start_date: Optional[str] = None  # None（默认）= 不裁剪下限
+    end_date: Optional[str] = None    # None（默认）= 不裁剪上限
 
     universe_source: str = "watchlist"     # watchlist | file | full
     universe_file: str = ""
@@ -359,9 +433,9 @@ class BacktestConfig:
     min_history_days: int = 60             # 与download_ohlcv()的有效性门槛一致
 
     # 技术指标热身缓冲：MA200/52周高点这些指标需要至少约252个交易日的
-    # 滚动窗口。固定为1年（365天），不再随便调——这也是"统一标准"的一部分，
-    # 热身期长度本身变化也会轻微影响最早那段信号的质量，不应该在实验
-    # 之间变来变去。
+    # 滚动窗口。固定为1年（365天）——本地缓存最早的那一段，会被当作
+    # "热身期"扣掉，不真正参与评分/信号生成，只是用来让第一个真正
+    # 评分的交易日就已经有足够的MA200等长窗口指标可用。
     warmup_calendar_days: int = STANDARD_WARMUP_DAYS
 
     db_path: str = os.path.join(ASX_DIR, "backtest_results.db")
@@ -443,27 +517,34 @@ class BacktestConfig:
 def resolve_standard_window(cfg: BacktestConfig, logger: logging.Logger,
                             explicitly_overridden: bool) -> None:
     """
-    如果cfg.start_date/end_date没有手动指定，自动填成标准窗口
-    （今天 ~ 今天-700天）。如果是手动指定的（explicitly_overridden=True），
-    只做校验不做覆盖，但会大声提醒：手动指定的区间跑出来的结果，
-    不能直接和标准窗口跑出来的其他实验放在同一张排行榜里比较胜率，
-    因为测试期本身不一样，胜率差异可能只是市场行情不同，不是参数好坏。
-    """
-    if cfg.start_date is None:
-        cfg.start_date = _standard_start_str()
-    if cfg.end_date is None:
-        cfg.end_date = _today_str()
+    v2.5改动：不再自动把start_date/end_date填成"今天倒推700天"。
+    没有手动传--start/--end时（explicitly_overridden=False），
+    cfg.start_date/end_date保持None——实际使用的范围留给
+    BacktestEngine._run_inner()读取完本地缓存后动态算出（缓存覆盖
+    到哪天就用到哪天，样本量随data_fetcher.py持续累积自动增长，
+    回测本身不再发起任何网络请求）。
 
+    手动传了--start/--end（explicitly_overridden=True）时，含义
+    变成"在本地缓存基础上再做一次人工裁剪"——用于只想看某个具体
+    历史区间的场景，跟"是否要联网补数据"完全无关（本轮之后回测
+    永远不联网，不管有没有传--start/--end）。
+    """
     if explicitly_overridden:
         logger.warning(
-            f"⚠️ 手动指定了--start/--end（{cfg.start_date}~{cfg.end_date}），"
-            f"偏离了标准测试窗口（今天倒推{STANDARD_WINDOW_DAYS}天）。"
-            f"这次实验的结果不能直接和用标准窗口跑出来的其他实验比胜率——"
-            f"测试期不同，差异可能只是市场行情不同，不是参数好坏。"
+            f"⚠️ 手动指定了--start/--end（{cfg.start_date or '(不限下限)'}~"
+            f"{cfg.end_date or '(不限上限)'}），这是在本地缓存基础上的人工"
+            f"裁剪，不会触发任何网络请求（本地缓存本来覆盖到哪天就是"
+            f"哪天，裁剪范围如果超出本地缓存实际覆盖范围，只是让可用"
+            f"样本变少，不会现场去联网补）。跨天对比时注意：其他没有"
+            f"手动裁剪的实验用的是"'"'"缓存有多少用多少"'"'"，测试范围"
+            f"未必跟这次手动裁剪的一致。"
         )
     else:
-        logger.info(f"使用标准测试窗口: {cfg.start_date} ~ {cfg.end_date}"
-                   f"（今天倒推{STANDARD_WINDOW_DAYS}天，热身缓冲{cfg.warmup_calendar_days}天）")
+        logger.info(
+            "未指定--start/--end：本次回测使用本地缓存当前实际覆盖到的"
+            "全部历史（不联网补齐、不强制对齐到\"今天\"），具体范围会在"
+            "读取完本地缓存后打印"
+        )
 
 
 def setup_logging(log_path: str) -> logging.Logger:
@@ -496,12 +577,19 @@ class DataLayer:
     这些逻辑都搬到了market_data_cache.py里集中管理，不再在这里重复
     一份）。
 
+    v2.5改动（本轮，性能修复——见BacktestEngine._run_inner()新增的
+    changelog说明）：新增fetch_cached_only()/fetch_60m_cached_only()，
+    纯本地读取，不做缺口检测、不发任何网络请求。原有的fetch()/
+    fetch_60m()（会触发get_daily()/get_60m()里的缺口补齐逻辑）保留
+    不变，供仍然需要"精确到某个日期"的场景使用——但_run_inner()的
+    主数据加载循环和_get_hourly()都已经切换成cached_only版本，回测
+    本身现在完全不会在运行期间发起网络请求。
+
     建议在跑backtest_engine.py之前先执行一次：
         python3 data_fetcher.py --mode backfill --universe full
-    预热标准窗口，之后同一测试窗口下反复跑多组参数实验，数据下载
-    阶段基本不会再碰网络。即使没有提前预热，本类依然会在缓存未命中
-    时自动请求并顺手写入缓存，行为上跟v2.1之前完全一致（只是多了
-    "顺手存起来供下次用"这个副作用），不会影响本次回测的正确性。
+    以及定期跑 --mode weekly15m 持续累积——这是现在回测能用到的
+    数据的唯一来源，data_fetcher.py独立负责让本地缓存随时间增长，
+    backtest_engine.py不再负责在运行期间补齐任何缺口。
 
     self._cache是这个类自己维护的进程内存字典，跟market_data_cache的
     Parquet磁盘缓存是两层不同的缓存——前者避免同一次回测进程内对同一
@@ -530,6 +618,35 @@ class DataLayer:
         self._cache[key] = df
         return df
 
+    def fetch_cached_only(self, ticker: str) -> Optional[pd.DataFrame]:
+        """
+        v2.5新增：纯本地读取日线数据，不做缺口检测、不发任何网络
+        请求——直接返回market_data_cache.py里这只股票当前已经缓存的
+        全部内容。缓存覆盖到哪天就是哪天，不尝试补齐到"今天"。
+
+        这是_run_inner()主数据加载循环现在使用的方法，取代原来的
+        fetch(ticker, download_start, cfg.end_date)——原来那条路径
+        每次运行都会因为cfg.end_date对齐到"今天"、而yfinance的end
+        参数是排他性的（永远不包含当天），必然计算出一个"今天"这
+        1天的缺口并触发网络请求，这个缺口本质上永远补不上，但没有
+        "补不上"的记忆机制，每次运行都会重新触发一次全市场逐票请求
+        （这条路径完全没走data_fetcher.py的批量优化），是回测一次
+        跑数小时的主因之一。
+        """
+        key = f"cached_only|daily|{ticker}"
+        if key in self._cache:
+            return self._cache[key]
+
+        df = self._mdc.get_cached_only(ticker, "daily")
+        if df is None or df.empty:
+            return None
+        if len(df) < 30:
+            self.logger.debug(f"{ticker}: 本地缓存有效交易日不足30天，跳过")
+            return None
+
+        self._cache[key] = df
+        return df
+
     def fetch_60m(self, ticker: str, start: str, end: str,
                   max_days: int = 729) -> Optional[pd.DataFrame]:
         """
@@ -543,6 +660,26 @@ class DataLayer:
             return self._cache[key]
 
         df = self._mdc.get_60m(ticker, start, end)
+        if df is None or df.empty:
+            return None
+
+        self._cache[key] = df
+        return df
+
+    def fetch_60m_cached_only(self, ticker: str) -> Optional[pd.DataFrame]:
+        """
+        v2.5新增：60分钟线的纯本地读取版本，理由跟fetch_cached_only()
+        一致。_get_hourly()现在用这个方法，不再触发网络请求。下游对
+        health层/HTF检测的point-in-time切片（如
+        `full_hourly[full_hourly.index.normalize() <= day]`）不受
+        影响——这里返回的是全量本地缓存，切片逻辑还在原来的调用点，
+        没有改变。
+        """
+        key = f"60m_cached_only|{ticker}"
+        if key in self._cache:
+            return self._cache[key]
+
+        df = self._mdc.get_cached_only(ticker, "60m")
         if df is None or df.empty:
             return None
 
@@ -1640,6 +1777,15 @@ class BacktestEngine:
         断点续跑的识别key。加入param_set后，不同参数集下即使日期范围/universe
         完全一样，也会被当成互相独立的"另一次实验"，各自独立续跑、互不覆盖，
         这样才能支持"改参数重跑很多次、每次都能看到独立结果"的工作流。
+
+        v2.5备注：cfg.start_date/end_date默认都是None（不再自动填成
+        "今天倒推700天"），意味着同一个param_set在不同的日子重跑，
+        run_key字符串完全相同——这是刻意的、有利的副作用：
+        backtest_progress表按"交易日期字符串"记录断点，本地缓存这段
+        时间新增的交易日不会出现在旧的进度记录里，会被当作"剩余待
+        处理天数"自动继续跑，已经处理过的旧交易日不会重跑。也就是说
+        同一个param_set可以"越跑越新"，不需要手动改名字或者传新的
+        --start/--end去追新数据。
         """
         raw = f"{self.cfg.start_date}|{self.cfg.end_date}|{self.cfg.universe_source}|" \
               f"{self.cfg.universe_file}|{self.cfg.min_market_cap}|{self.cfg.param_set}"
@@ -1649,15 +1795,17 @@ class BacktestEngine:
         """
         懒加载 + 缓存60分钟线数据。只在实际需要时才请求（health层精确化
         或小时级变种检测都只涉及Top10/Top3候选，不是整个universe），
-        避免给大部分根本进不了候选池的股票也发一次60分钟线请求，浪费
-        网络配额和时间。缓存None也算（避免对已知失败的ticker重复请求）。
+        避免给大部分根本进不了候选池的股票也发一次60分钟线请求。
+
+        v2.5改动：改用fetch_60m_cached_only()，纯本地读取，不再触发
+        任何网络请求——原来这里用的fetch_60m(ticker, cfg.start_date,
+        cfg.end_date)，跟主数据加载循环一样，因为end对齐"今天"而
+        yfinance的end参数排他性，每次都会重新触发一次注定补不上的
+        "今天"缺口网络请求，是回测耗时数小时的主因之一。
         """
         if ticker in self._hourly_cache:
             return self._hourly_cache[ticker]
-        df = self.data_layer.fetch_60m(
-            ticker, self.cfg.start_date, self.cfg.end_date,
-            max_days=self.cfg.yf_60m_max_days,
-        )
+        df = self.data_layer.fetch_60m_cached_only(ticker)
         self._hourly_cache[ticker] = df
         return df
 
@@ -1669,8 +1817,11 @@ class BacktestEngine:
         无声无息地死掉、你隔天才发现日志停在半夜某个时间点。
         """
         cfg = self.cfg
+        range_desc = (f"{cfg.start_date or '(不限)'} ~ {cfg.end_date or '(不限)'}"
+                     if (cfg.start_date or cfg.end_date)
+                     else "本地缓存全部范围（不裁剪，具体范围见后续日志）")
         start_msg = (f"🚀 回测启动\n参数集: {cfg.param_set}\n"
-                     f"区间: {cfg.start_date} ~ {cfg.end_date}\n"
+                     f"区间: {range_desc}\n"
                      f"universe: {cfg.universe_source}({len(tickers)}只)\n"
                      f"时间预算: {max_minutes if max_minutes else '不限'}分钟")
         self.logger.info(start_msg.replace("\n", " | "))
@@ -1695,34 +1846,74 @@ class BacktestEngine:
             send_telegram(summary, self.logger)
 
     def _run_inner(self, tickers: list[str], max_minutes: Optional[float]) -> str:
-        self.logger.info(f"=== 回测启动 [{self.cfg.param_set}] {self.cfg.start_date} ~ "
-                          f"{self.cfg.end_date} universe={self.cfg.universe_source}"
-                          f"({len(tickers)}只) ===")
+        self.logger.info(f"=== 回测启动 [{self.cfg.param_set}] "
+                          f"universe={self.cfg.universe_source}({len(tickers)}只) "
+                          f"（v2.5起纯本地缓存，不发起任何网络请求，"
+                          f"实际数据范围将在读取完缓存后打印） ===")
 
-        download_start = str((pd.Timestamp(self.cfg.start_date)
-                               - pd.Timedelta(days=self.cfg.warmup_calendar_days)).date())
-        self.logger.info(f"数据下载起点(含热身缓冲): {download_start}（正式信号仍从"
-                          f"{self.cfg.start_date}开始，缓冲期本身不产出信号）")
-
+        # v2.5改动：不再计算download_start去联网拉取，直接读本地缓存
+        # 里已经有的全部内容。如果cfg.start_date/end_date被手动指定
+        # （--start/--end），在这里对读到的本地数据做一次裁剪；默认
+        # （两者都是None）不裁剪，缓存有多少用多少。
         history: dict[str, pd.DataFrame] = {}
         for t in tickers:
-            df = self.data_layer.fetch(t, download_start, self.cfg.end_date)
-            if df is not None and len(df) >= self.cfg.min_history_days:
+            df = self.data_layer.fetch_cached_only(t)
+            if df is None:
+                continue
+            if self.cfg.start_date:
+                cutoff_start = pd.Timestamp(self.cfg.start_date) - pd.Timedelta(days=self.cfg.warmup_calendar_days)
+                df = df[df.index >= cutoff_start]
+            if self.cfg.end_date:
+                df = df[df.index <= pd.Timestamp(self.cfg.end_date)]
+            if len(df) >= self.cfg.min_history_days:
                 history[t] = df
 
-        self.logger.info(f"有效历史数据：{len(history)}/{len(tickers)} 只")
+        self.logger.info(f"有效历史数据（纯本地缓存，本次运行未发起任何网络请求）："
+                          f"{len(history)}/{len(tickers)} 只")
         if not history:
-            msg = f"🔴 回测终止 [{self.cfg.param_set}]：universe拉不到任何有效历史数据"
+            msg = (f"🔴 回测终止 [{self.cfg.param_set}]：本地缓存里没有任何股票有"
+                   f"足够的历史数据（min_history_days={self.cfg.min_history_days}天）。"
+                   f"请先跑 python3 data_fetcher.py --mode backfill --universe full "
+                   f"预热本地缓存，回测本身不会再自动联网补齐。")
             self.logger.error(msg)
             return msg
 
-        xjo_full = self.data_layer.fetch(self.cfg.benchmark_ticker,
-                                          download_start, self.cfg.end_date)
-        xjo_series = xjo_full["Close"].squeeze() if xjo_full is not None else None
+        xjo_full = self.data_layer.fetch_cached_only(self.cfg.benchmark_ticker)
+        if xjo_full is not None:
+            if self.cfg.start_date:
+                cutoff_start = pd.Timestamp(self.cfg.start_date) - pd.Timedelta(days=self.cfg.warmup_calendar_days)
+                xjo_full = xjo_full[xjo_full.index >= cutoff_start]
+            if self.cfg.end_date:
+                xjo_full = xjo_full[xjo_full.index <= pd.Timestamp(self.cfg.end_date)]
+        if xjo_full is None or xjo_full.empty:
+            self.logger.warning(
+                f"本地缓存里没有{self.cfg.benchmark_ticker}（ASX200基准）数据，"
+                f"rs_vs_xjo等相对强度因子会退化为默认值1.0，不影响其余因子计算。"
+                f"如需完整功能，请先跑一次data_fetcher.py --mode backfill补齐基准指数。"
+            )
+            xjo_series = None
+        else:
+            xjo_series = xjo_full["Close"].squeeze()
+
+        # v2.5新增：实际可评分区间从本地缓存的真实覆盖范围动态算出，
+        # 不再依赖cfg.start_date/end_date这两个原本锚定"今天倒推700天"
+        # 的固定值——效果是"缓存覆盖到哪天，回测就能测到哪天"，样本量
+        # 随data_fetcher.py每周持续累积自动增长，不需要人工干预。
+        earliest_cached = min(df.index.min() for df in history.values())
+        latest_cached = max(df.index.max() for df in history.values())
+        effective_scoring_start = earliest_cached + pd.Timedelta(days=self.cfg.warmup_calendar_days)
 
         trading_days = sorted(set().union(*[df.index for df in history.values()]))
-        trading_days = [d for d in trading_days if d >= pd.Timestamp(self.cfg.start_date)]
-        self.logger.info(f"回测交易日数（总计，已扣除热身期）：{len(trading_days)}")
+        trading_days = [d for d in trading_days if d >= effective_scoring_start]
+        if self.cfg.end_date:
+            trading_days = [d for d in trading_days if d <= pd.Timestamp(self.cfg.end_date)]
+
+        self.logger.info(
+            f"本地缓存实际覆盖范围: {earliest_cached.date()} ~ {latest_cached.date()}"
+            f"（跨universe内全部股票的最早/最晚日期）\n"
+            f"扣除{self.cfg.warmup_calendar_days}天热身缓冲后，可评分交易日区间: "
+            f"{effective_scoring_start.date()} 起，共{len(trading_days)}天"
+        )
 
         conn = sqlite3.connect(self.cfg.db_path)
         self._init_db(conn)
@@ -2559,10 +2750,30 @@ class StatsReporter:
             conn.close()
         return df
 
-    def _benchmark_return(self) -> Optional[float]:
+    def _benchmark_return(self, start: Optional[str], end: Optional[str]) -> Optional[float]:
+        """
+        计算基准指数（默认^AXJO）在[start, end]区间的涨跌幅，用于报告里
+        "ASX200同期涨跌幅"这一行。
+
+        v2.5改动：start/end现在由调用方（report()）显式传入,不再直接读
+        self.cfg.start_date/end_date——这两个字段v2.5起默认是None（"缓存
+        有多少用多少"),如果这里继续用cfg的值,None/None会让yf.download()
+        退化成"下载全部可得历史",算出来的涨跌幅跟本次回测实际测试的
+        交易日区间对不上,是一个没有意义的数字。report()会优先用cfg里
+        手动指定的值（如果有),否则从combined实际的signal_date范围反推。
+
+        这里仍然是一次直接的yf.download()网络调用（不经过
+        market_data_cache),因为这只是报告展示层的一个补充性指标（不
+        参与任何回测结果计算),调用频率是"每次看报告一次",不是主循环
+        里的高频路径,不是这轮性能修复要处理的瓶颈,暂不改造成走本地
+        缓存——如果这次调用失败（比如离线环境),只是这一行显示"获取
+        失败",不影响其余统计结果。
+        """
+        if not start or not end:
+            return None
         try:
-            df = yf.download(self.cfg.benchmark_ticker, start=self.cfg.start_date,
-                              end=self.cfg.end_date, auto_adjust=True, progress=False)
+            df = yf.download(self.cfg.benchmark_ticker, start=start,
+                              end=end, auto_adjust=True, progress=False)
             if df is None or df.empty:
                 return None
             c = df["Close"].squeeze()
@@ -2623,7 +2834,18 @@ class StatsReporter:
         running_max = np.maximum.accumulate(cum)
         max_dd = float((cum - running_max).min())
 
-        bench = self._benchmark_return()
+        # v2.5改动：优先用cfg里手动指定的--start/--end（如果有），否则
+        # 从combined实际的signal_date范围反推——cfg.start_date/end_date
+        # 默认是None（"缓存有多少用多少"），直接传None/None给
+        # _benchmark_return()会让基准涨跌幅退化成"全部可得历史"，
+        # 跟本次回测实际测试的区间对不上，是一个没有意义的数字。
+        bench_start = self.cfg.start_date
+        bench_end = self.cfg.end_date
+        if not bench_start and "signal_date" in combined.columns:
+            bench_start = str(combined["signal_date"].min())
+        if not bench_end and "signal_date" in combined.columns:
+            bench_end = str(combined["signal_date"].max())
+        bench = self._benchmark_return(bench_start, bench_end)
 
         health_note = f"（仅健康度={health_status}）" if health_status else ""
         tier_note = f"（仅{tier}层级）" if tier else "（全部T1-T4层级）"
@@ -2986,21 +3208,23 @@ def main():
 
     resolve_standard_window(cfg, logger, explicitly_overridden=bool(args.start or args.end))
 
-    if cfg.use_hourly_vol_ratio or cfg.include_hourly_intraday:
+    # v2.5备注：这个校验原本是为了防止"--start早于60分钟线可用窗口"时
+    # 现场触发一次注定失败的网络请求。现在DataLayer.fetch_60m_cached_only()
+    # 纯本地读取、不再联网，这个前提已经不存在——不管--start设成什么，
+    # 都不会真的去问yfinance。保留这个提示但降级成软警告（不阻断运行）：
+    # 只在你显式传了--start且早于60分钟线窗口时提醒一句，本地缓存里
+    # 那部分之前的日期反正也没有60分钟数据，health层会自动回退到
+    # 日总成交量比例代理，不影响回测能不能跑。
+    if cfg.start_date and (cfg.use_hourly_vol_ratio or cfg.include_hourly_intraday):
         earliest_allowed = (pd.Timestamp.now().normalize()
                             - pd.Timedelta(days=cfg.yf_60m_max_days))
         if pd.Timestamp(cfg.start_date) < earliest_allowed:
-            msg = (f"🔴 --start={cfg.start_date} 早于60分钟线可用窗口"
-                   f"({earliest_allowed.date()}起)。当前开启了60分钟线相关功能"
-                   f"，只在最近~{cfg.yf_60m_max_days}天内"
-                   f"有60分钟数据，请把--start改到{earliest_allowed.date()}或更晚，"
-                   f"或者加 --disable-hourly-vol-ratio"
-                   f"只跑纯日线回测（如果加了--enable-hourly-intraday，"
-                   f"也要一并去掉才能完全避开60分钟数据）")
-            logger.error(msg)
-            if cfg.push_telegram:
-                send_telegram(msg, logger)
-            return
+            logger.warning(
+                f"⚠️ --start={cfg.start_date} 早于60分钟线约{cfg.yf_60m_max_days}天"
+                f"的可用窗口({earliest_allowed.date()}起)。这部分更早的交易日"
+                f"本地缓存里本来就不会有60分钟数据（yfinance该颗粒度硬限制），"
+                f"health层会自动回退到日总成交量比例代理，不影响回测正常运行。"
+            )
 
     # 顶层崩溃兜底：任何没被内层捕获的异常（比如resolve_universe本身出错、
     # 队列文件解析出错等），都在这里兜住，推一条Telegram报警，
