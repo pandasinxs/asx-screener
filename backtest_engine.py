@@ -706,6 +706,33 @@ class DataLayer:
         self._cache[key] = df
         return df
 
+    def fetch_15m_cached_only(self, ticker: str) -> Optional[pd.DataFrame]:
+        """
+        v2.5新增：15分钟线的纯本地读取版本，供backtest_intraday.py
+        Stage2使用。原来的fetch_15m(ticker, first_date, last_date)
+        （first_date是这只股票候选日序列里最早的一天，往往是1-2年前）
+        必然会算出一个"start早于15分钟线~60天可用窗口"的缺口，触发一次
+        请求——这个请求不是"永远补不上"（不像daily/60m那种end=今天的
+        情况），而是"注定超出数据源窗口，本地缓存和yfinance都给不了"，
+        但一样是每次调用都要重新试一次、白白等重试退避的时间。
+        Stage2对候选池里~500只股票逐票调用，这部分时间成本不小。
+
+        跟fetch_cached_only()/fetch_60m_cached_only()一样，直接返回
+        market_data_cache里这只股票15分钟线当前已经缓存的全部内容，
+        缓存覆盖到哪天（这几个月weekly15m滚动出来的窗口）就是哪天，
+        不尝试去补更早的历史。
+        """
+        key = f"15m_cached_only|{ticker}"
+        if key in self._cache:
+            return self._cache[key]
+
+        df = self._mdc.get_cached_only(ticker, "15m")
+        if df is None or df.empty:
+            return None
+
+        self._cache[key] = df
+        return df
+
     @staticmethod
     def slice_up_to(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
         """严格point-in-time切片，杜绝未来函数。"""
