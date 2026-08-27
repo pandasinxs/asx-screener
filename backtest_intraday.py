@@ -157,6 +157,23 @@ cache.py按周累积的Parquet缓存）上——不是近似策略；backtest_en
 ============================================================
 CHANGELOG
 ============================================================
+    - 性能修复（对齐backtest_engine.py v2.5同一轮修复）：Stage1的
+      process_ticker()（daily_df/hourly_df两处）、run()里的ASX200
+      基准日历获取、Stage2的process_ticker_stage2()（daily_df/
+      all_15m两处），全部从会触发网络请求的fetch()/fetch_60m()/
+      fetch_15m()改成纯本地读取的fetch_cached_only()/
+      fetch_60m_cached_only()/fetch_15m_cached_only()。根因：原来
+      这几处都把end对齐"今天"（daily_df/hourly_df/xjo_df）或者
+      first_date设成候选日序列最早的一天（all_15m，往往1-2年前，
+      必然早于15分钟线~60天可用窗口），前者因为yfinance的end参数
+      排他性、永远算出一个补不上的缺口，后者必然超出数据源窗口，
+      两者都会在每次运行时对候选池里~500只股票逐票触发一次注定
+      白费的网络请求+重试退避，是Stage1/Stage2运行耗时的重要拖累
+      来源（诊断过程和backtest_engine.py那边完全一样的bug模式，
+      详见对话记录）。修复后Stage1/Stage2运行期间完全不发起任何
+      网络请求，用到的历史数据全部来自本地缓存当前已经覆盖的范围
+      ——覆盖率随data_fetcher.py持续累积自动增长，不需要跑Stage1/
+      Stage2时额外联网补齐。
     - Stage1/Stage2的run()/run_stage2()新增启动时的Telegram推送
       （🚀 ...启动），此前只有完成/熔断/崩溃才推送，中途不知道
       有没有真的跑起来。对齐backtest_engine.py的BacktestEngine.run()
@@ -479,10 +496,15 @@ def process_ticker(ticker: str, appearances: dict, data_layer: "bte.DataLayer",
     appearance_dates = sorted(appearances.keys())
     first_entry = appearance_dates[0]
 
-    download_start = (pd.Timestamp(first_entry) - pd.Timedelta(days=400)).date().isoformat()
-    today_str = date.today().isoformat()
-
-    daily_df = data_layer.fetch(ticker, download_start, today_str)
+    # v2改动（对齐backtest_engine.py v2.5同一轮性能修复）：改用纯本地
+    # 缓存读取，不再计算download_start/today_str去联网补齐。原来的
+    # data_layer.fetch(ticker, download_start, today_str)跟
+    # backtest_engine.py改之前完全一样的问题——end对齐"今天"，
+    # yfinance的end参数排他性，必然算出一个补不上的"今天"缺口，
+    # 对候选池里~500只股票逐票触发一次网络请求。日线/60分钟线现在
+    # 都直接读market_data_cache里已经缓存的全部内容，缓存覆盖到哪天
+    # 就是哪天，回测本身不再联网。
+    daily_df = data_layer.fetch_cached_only(ticker)
     if daily_df is None:
         logger.debug(f"[{ticker}] 日线数据不足，跳过（数据覆盖边界，非错误）")
         return None
@@ -498,7 +520,7 @@ def process_ticker(ticker: str, appearances: dict, data_layer: "bte.DataLayer",
     # 窗口）由DailyHealthEvaluator.evaluate()内部自动回退到全天成交量
     # 比例代理，不会报错、不会跳过整只股票——市值/数据获取层面的
     # 截断处理已经在market_data_cache内部统一做了，这里不重复判断。
-    hourly_df = data_layer.fetch_60m(ticker, download_start, today_str)
+    hourly_df = data_layer.fetch_60m_cached_only(ticker)
 
     trading_days = [d for d in master_trading_days if str(d.date()) >= first_entry]
     if not trading_days:
@@ -648,10 +670,12 @@ def run(cfg: IntradayBacktestConfig, max_minutes: Optional[float] = None) -> tup
         )
     health_eval = bte.DailyHealthEvaluator(health_cfg, logger)
 
-    earliest = min(min(d.keys()) for d in candidates.values())
-    xjo_start = (pd.Timestamp(earliest) - pd.Timedelta(days=400)).date().isoformat()
-    today_str = date.today().isoformat()
-    xjo_df = data_layer.fetch("^AXJO", xjo_start, today_str)
+    # v2改动：ASX200基准日历也改用纯本地读取，跟process_ticker()同一轮
+    # 修复——原来的fetch("^AXJO", xjo_start, today_str)同样end对齐"今天"，
+    # 触发跟每只股票daily_df一样的问题，只是这里只调用一次（不是逐票），
+    # 单次影响虽小，但既然都在改，一并对齐，回测这条链路上不留一处
+    # 还会联网的调用。
+    xjo_df = data_layer.fetch_cached_only("^AXJO")
     if xjo_df is None:
         msg = "🔴 backtest_intraday Stage1终止：无法获取ASX200基准日线，没有交易日历可用"
         logger.error(msg)
@@ -1176,17 +1200,23 @@ def process_ticker_stage2(ticker: str, health_days: list, data_layer: "bte.DataL
     某天局部缺口）都只跳过对应的部分，不影响这只股票其余能测的日期
     ——本地15分钟数据会随data_fetcher.py每周持续累积，这不是决定
     要不要处理这只股票的门槛，只是当下这一天暂时测不到。
-    """
-    download_start = (pd.Timestamp(health_days[0][0]) - pd.Timedelta(days=400)).date().isoformat()
-    today_str = date.today().isoformat()
 
-    daily_df = data_layer.fetch(ticker, download_start, today_str)
+    v2改动（对齐backtest_engine.py/Stage1 process_ticker()同一轮
+    性能修复）：daily_df/all_15m都改用纯本地读取，不再计算
+    download_start/today_str/first_date/last_date去联网补齐。
+    daily_df原来的问题跟backtest_engine.py改之前一样——end对齐
+    "今天"必然触发一次补不上的网络请求；all_15m原来的问题类型不同
+    但同样浪费时间——first_date往往是这只股票候选日序列里最早的
+    一天（可能1-2年前），必然早于15分钟线~60天可用窗口，触发一次
+    "注定超出数据源窗口"的请求，重试退避一轮才放弃。候选池~500只
+    股票逐票触发，两处加起来是Stage2性能的重要拖累来源。
+    """
+    daily_df = data_layer.fetch_cached_only(ticker)
     if daily_df is None:
         logger.debug(f"[{ticker}] 日线数据不足，跳过（数据覆盖边界，非错误）")
         return {"signals": [], "skipped": True}
 
-    first_date, last_date = health_days[0][0], health_days[-1][0]
-    all_15m = data_layer.fetch_15m(ticker, first_date, last_date)
+    all_15m = data_layer.fetch_15m_cached_only(ticker)
     if all_15m is None:
         logger.debug(f"[{ticker}] 本地无15分钟数据覆盖，跳过（数据现状，非错误）")
         return {"signals": [], "skipped": True}
