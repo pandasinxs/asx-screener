@@ -68,6 +68,32 @@
 #      统一改成now_syd().date()，消除这个隐患，跟系统本地时区配置
 #      完全脱钩。
 #
+# v3.3改动（本轮，生产参数运行时加载）：
+#   8. 新增param_loader.py依赖：main()启动时第一步调用
+#      param_loader.apply_params()，从params.json读取并覆盖本文件
+#      的可调参数（见文件末尾PARAM_MAPPING/HARD_BOUNDS定义）。
+#      params.json缺失/损坏/字段非法时，自动回退到本文件写死的
+#      默认值。
+#      【关键】：这个调用只发生在main()里，不在模块顶层执行——
+#      backtest_intraday.py的Stage2是`import intraday_monitor`直接
+#      复用本文件的真实函数（detect_mode1_breakout等），如果参数
+#      加载发生在import的时候，会让Stage2在没有征得同意的情况下
+#      开始被"生产环境当前params.json内容"影响，跟"同一个Stage1
+#      param_set重跑两次几乎完全一致"这种回测复现性要求冲突。
+#      main()级别的调用完全不影响import行为。
+#   9. 【本轮同时解决的手动同步风险】：TOTAL_CAPITAL/RISK_PER_TRADE/
+#      ATR_STOP_MULTIPLIER/MAX_POSITION_PCT/MIN_POSITION_VALUE/
+#      CMC_RATE/CMC_MIN_FEE，以及MODE4_PULLBACK_MIN_DEPTH_PCT/
+#      MODE4_PULLBACK_MAX_DEPTH_PCT/MODE4_PULLBACK_LOOKBACK_DAYS/
+#      MODE4_BOTTOM_CLOSE_POS_MIN/MODE4_BOTTOM_VOL_UPTICK_MIN——
+#      这两组常量源码注释此前写明必须手动跟daily_analysis.py同名/
+#      近义常量保持一致。现在两边都从params.json里
+#      PRODUCTION_RISK_PARAMS/PRODUCTION_PULLBACK_PARAMS这两段读取
+#      同一份配置，不再是"两份独立硬编码、必须手动保持一致"。
+#      VOL_SPIKE_RATIO_M1/MODE2_PULLBACK_MAX_DEPTH_PCT等本文件专属、
+#      不带"必须跟daily_analysis.py同步"约束的常量，放进新的
+#      PRODUCTION_INTRADAY_PARAMS段，只有本文件读取。
+#
 # 四种模式（均为15分钟K线级别的"代理判断"，非逐笔tick级）：
 #   模式1 突破瞬间买：15分钟K线收盘突破prior_high_20d + 放量 + 未被砸回
 #                     （v3.1起改成两阶段：疑似突破→下一根K线确认）
@@ -106,6 +132,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import watchlist_db as wdb
+import param_loader
 
 # ════════════════════════════════════════════════════════════
 # 0. 日志 & 环境变量
@@ -152,6 +179,8 @@ BREAKOUT_FAILURE_PCT     = -0.3
 # 设计时想的更松。改成用同一个常量三处共享，避免以后再和交易时段
 # 配置脱节。三处原有的倍数阈值（VOL_SPIKE_RATIO_M1等）暂不调整，
 # 先看这个修正本身对信号频率的影响，再决定要不要相应重新校准。
+# 注：这是交易时段的结构性推导值（跟随MARKET_OPEN/MARKET_CLOSE），
+# 不是策略层面可调参数，因此不纳入params.json覆盖范围。
 BARS_PER_DAY_15M = 24
 
 # v3.1新增：模式1两阶段确认。疑似突破后最多等待这么多根15分钟K线
@@ -184,6 +213,10 @@ HEALTH_BELOW_MA50_GRACE_DAYS = 2
 # PULLBACK_LOOKBACK_DAYS）保持一致——两边是独立实现，不共享代码，
 # 改一处记得改另一处，否则两个文件对"什么算健康回调"的定义会
 # 逐渐不同步。
+# v3.3更新：这条"手动同步"提醒本身已经被params.json覆盖机制解决——
+# 见文件末尾PARAM_MAPPING，这五项现在跟daily_analysis.py共用同一段
+# PRODUCTION_PULLBACK_PARAMS配置。这里保留的硬编码值是两边各自的
+# 兜底默认值，值必须相等，但不再需要"记得手动改另一个文件"。
 MODE4_PULLBACK_MIN_DEPTH_PCT = 8.0
 MODE4_PULLBACK_MAX_DEPTH_PCT = 25.0
 MODE4_PULLBACK_LOOKBACK_DAYS = 20
@@ -199,6 +232,8 @@ MODE4_BOTTOM_VOL_UPTICK_MIN = 1.0
 # 不共享代码，改一处记得改另一处。这是本次改动里第二个"需要
 # 手动同步"的常量组（第一个是MODE4_*），如果以后要消除这类
 # 手动同步风险，可以考虑抽一个两边都import的共享配置文件。
+# v3.3更新：同上，这七项现在跟daily_analysis.py共用同一段
+# PRODUCTION_RISK_PARAMS配置，见文件末尾PARAM_MAPPING。
 TOTAL_CAPITAL        = 50_000
 RISK_PER_TRADE       = 0.008     # 0.8% = $400
 ATR_STOP_MULTIPLIER  = 1.5
@@ -1332,8 +1367,76 @@ def run_end_of_day_maintenance() -> None:
 # 9. 主入口
 # ════════════════════════════════════════════════════════════
 
+# v3.3新增：params.json运行时覆盖映射。与daily_analysis.py共用
+# PRODUCTION_RISK_PARAMS/PRODUCTION_PULLBACK_PARAMS这两段JSON路径
+# ——本地属性名（MODE4_PULLBACK_MIN_DEPTH_PCT等）跟daily_analysis.py
+# 那边（PULLBACK_MIN_DEPTH_PCT等）不同名，但指向同一份JSON配置，
+# 从根本上解决两边"必须手动保持一致"的注释所警示的风险。
+PARAM_MAPPING = {
+    # 与daily_analysis.py共用：PRODUCTION_RISK_PARAMS
+    "TOTAL_CAPITAL": "PRODUCTION_RISK_PARAMS.TOTAL_CAPITAL",
+    "RISK_PER_TRADE": "PRODUCTION_RISK_PARAMS.RISK_PER_TRADE",
+    "ATR_STOP_MULTIPLIER": "PRODUCTION_RISK_PARAMS.ATR_STOP_MULTIPLIER",
+    "MAX_POSITION_PCT": "PRODUCTION_RISK_PARAMS.MAX_POSITION_PCT",
+    "MIN_POSITION_VALUE": "PRODUCTION_RISK_PARAMS.MIN_POSITION_VALUE",
+    "CMC_RATE": "PRODUCTION_RISK_PARAMS.CMC_RATE",
+    "CMC_MIN_FEE": "PRODUCTION_RISK_PARAMS.CMC_MIN_FEE",
+    # 与daily_analysis.py共用：PRODUCTION_PULLBACK_PARAMS
+    "MODE4_PULLBACK_MIN_DEPTH_PCT": "PRODUCTION_PULLBACK_PARAMS.MIN_DEPTH_PCT",
+    "MODE4_PULLBACK_MAX_DEPTH_PCT": "PRODUCTION_PULLBACK_PARAMS.MAX_DEPTH_PCT",
+    "MODE4_PULLBACK_LOOKBACK_DAYS": "PRODUCTION_PULLBACK_PARAMS.LOOKBACK_DAYS",
+    "MODE4_BOTTOM_CLOSE_POS_MIN": "PRODUCTION_PULLBACK_PARAMS.BOTTOM_CLOSE_POS_MIN",
+    "MODE4_BOTTOM_VOL_UPTICK_MIN": "PRODUCTION_PULLBACK_PARAMS.BOTTOM_VOL_UPTICK_MIN",
+    # intraday_monitor.py专属（不带"必须跟daily_analysis.py同步"
+    # 约束的常量，只有本文件读取）
+    "VOL_SPIKE_RATIO_M1": "PRODUCTION_INTRADAY_PARAMS.VOL_SPIKE_RATIO_M1",
+    "VOL_SPIKE_RATIO_HIST": "PRODUCTION_INTRADAY_PARAMS.VOL_SPIKE_RATIO_HIST",
+    "BREAKOUT_FAILURE_PCT": "PRODUCTION_INTRADAY_PARAMS.BREAKOUT_FAILURE_PCT",
+    "MODE1_CONFIRM_MAX_BARS_WAIT": "PRODUCTION_INTRADAY_PARAMS.MODE1_CONFIRM_MAX_BARS_WAIT",
+    "MODE2_PULLBACK_MAX_DEPTH_PCT": "PRODUCTION_INTRADAY_PARAMS.MODE2_PULLBACK_MAX_DEPTH_PCT",
+    "MODE2_PULLBACK_VOL_SHRINK_RATIO": "PRODUCTION_INTRADAY_PARAMS.MODE2_PULLBACK_VOL_SHRINK_RATIO",
+    "MODE2_BREAKOUT_LOOKBACK_DAYS": "PRODUCTION_INTRADAY_PARAMS.MODE2_BREAKOUT_LOOKBACK_DAYS",
+    "LATE_SESSION_NEAR_HIGH_PCT": "PRODUCTION_INTRADAY_PARAMS.LATE_SESSION_NEAR_HIGH_PCT",
+    "LATE_SESSION_MIN_VOL_RATIO": "PRODUCTION_INTRADAY_PARAMS.LATE_SESSION_MIN_VOL_RATIO",
+    "HEALTH_BELOW_MA50_GRACE_DAYS": "PRODUCTION_INTRADAY_PARAMS.HEALTH_BELOW_MA50_GRACE_DAYS",
+    # 注：HEALTH_MIN_RS_VS_XJO没有列入映射——检查过check_health()的
+    # 真实实现，这个常量当前没有被任何函数读取（定义了但从未使用，
+    # 疑似遗留的孤儿常量，跟check_health()只做MA50连续天数检查的
+    # 现状不符）。映射一个不生效的常量会造成"改了params.json却没
+    # 反应"的误导，所以没有放进来。这是本轮读代码时顺带发现的，
+    # 不是本次任务修复范围，如实记录，未做改动。
+}
+
+# 高风险字段硬性范围校验——RISK_PER_TRADE/ATR_STOP_MULTIPLIER/
+# MAX_POSITION_PCT/CMC_RATE直接决定真实下单的仓位大小，
+# MODE4_*/MODE2_*深度类字段决定止损参考位是否合理。
+HARD_BOUNDS = {
+    "RISK_PER_TRADE": (0.0, 0.05),
+    "ATR_STOP_MULTIPLIER": (0.1, 10.0),
+    "MAX_POSITION_PCT": (0.01, 1.0),
+    "CMC_RATE": (0.0, 0.05),
+    "MODE4_PULLBACK_MIN_DEPTH_PCT": (0.0, 100.0),
+    "MODE4_PULLBACK_MAX_DEPTH_PCT": (0.0, 100.0),
+    "MODE2_PULLBACK_MAX_DEPTH_PCT": (0.0, 100.0),
+    "BREAKOUT_FAILURE_PCT": (-100.0, 0.0),
+}
+
+
 def main() -> None:
     wdb.init_watchlist_db()
+
+    # v3.3新增：main()最开头加载params.json覆盖，在is_trading_day_
+    # and_time()判断之前——这样即使在非交易时段（比如周末、盘前）
+    # Vincel改了params.json，也能在下一次cron轮询时立刻被发现并
+    # 记录/告警，不用等到交易时段第一次tick才发现配置问题。
+    param_loader.apply_params(
+        target_module=sys.modules[__name__],
+        mapping=PARAM_MAPPING,
+        log=log,
+        hard_bounds=HARD_BOUNDS,
+        telegram_on_change=send_telegram,
+        state_tag="intraday_monitor",
+    )
 
     n = now_syd()
     log.info(f"intraday_monitor 触发 [{n.strftime('%Y-%m-%d %H:%M:%S %Z')}]")
