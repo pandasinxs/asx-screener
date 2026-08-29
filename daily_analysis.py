@@ -68,6 +68,32 @@
 #
 # 风控参数基线：
 #   $50,000 资金 | CMC 0.11%/最低$7 | 单笔风险0.8% | ATR×1.5止损
+#
+# v3.3改动（本轮，生产参数运行时加载）：
+#   - 新增param_loader.py依赖：main()启动时第一步调用
+#     param_loader.apply_params()，从params.json读取并覆盖本文件
+#     的可调参数（见文件末尾PARAM_MAPPING/HARD_BOUNDS定义）。
+#     params.json缺失/损坏/字段非法时，自动回退到本文件写死的
+#     默认值。
+#   - 【本轮同时解决的一个手动同步风险】：TOTAL_CAPITAL/
+#     RISK_PER_TRADE/ATR_STOP_MULTIPLIER/MAX_POSITION_PCT/
+#     MIN_POSITION_VALUE/CMC_RATE/CMC_MIN_FEE这组仓位计算常量，
+#     以及PULLBACK_MIN_DEPTH_PCT/PULLBACK_MAX_DEPTH_PCT/
+#     PULLBACK_LOOKBACK_DAYS/BOTTOM_CLOSE_POS_MIN/
+#     BOTTOM_VOL_UPTICK_MIN这组回调判断常量，源码注释里此前
+#     写明必须手动跟intraday_monitor.py的同名/近义常量保持一致
+#     （两边各自独立硬编码一份）。现在两边都从params.json里
+#     PRODUCTION_RISK_PARAMS/PRODUCTION_PULLBACK_PARAMS这两段
+#     读取同一份配置，从根本上消除"改一处忘了改另一处"的风险，
+#     不再是"两份独立实现、必须手动保持一致"。
+#   - 【只在main()里调用，不在模块顶层】：daily_analysis.py当前
+#     没有被backtest_engine.py/backtest_intraday.py直接import
+#     （两边的DailyHealthEvaluator是各自独立的重新实现，源码注释
+#     里写明"不能直接import daily_analysis.py，因为它的日志路径
+#     写死了"），所以这里没有screener.py/intraday_monitor.py那样
+#     的"污染回测pristine默认值"风险，但仍然沿用main()级别调用
+#     的写法，保持三个生产文件同一套约定，也避免以后万一被import
+#     时产生意外的顶层副作用。
 # ============================================================
 
 import os
@@ -86,6 +112,7 @@ import numpy as np
 import requests as req
 
 import watchlist_db as wdb
+import param_loader
 
 # ════════════════════════════════════════════════════════════
 # 0. 日志
@@ -1178,6 +1205,60 @@ def format_postmarket_report(results: list, run_date: str) -> str:
 # 9. 主入口
 # ════════════════════════════════════════════════════════════
 
+# v3.3新增：params.json运行时覆盖映射。
+#
+# 【关键设计】：RISK_PER_TRADE/TOTAL_CAPITAL/ATR_STOP_MULTIPLIER等
+# 映射到"PRODUCTION_RISK_PARAMS.*"这个JSON段，PULLBACK_MIN_DEPTH_PCT
+# 等映射到"PRODUCTION_PULLBACK_PARAMS.*"这个JSON段——这两段JSON路径
+# 跟intraday_monitor.py里对应常量（TOTAL_CAPITAL/RISK_PER_TRADE等，
+# MODE4_PULLBACK_MIN_DEPTH_PCT等）指向的【完全是同一份JSON路径】。
+# 两个文件各自独立硬编码这些常量的默认值不变（互为兜底），但一旦
+# params.json里这两段被更新，两边会同步生效，不再需要人工分别改
+# 两个.py文件、也不会出现"改了一边忘了改另一边"的静默不一致。
+#
+# 不属于这两段共享范围的字段（daily_analysis.py独有，
+# intraday_monitor.py没有对应常量）放进
+# PRODUCTION_DAILY_ANALYSIS_PARAMS这个专属段。
+PARAM_MAPPING = {
+    # 与intraday_monitor.py共用：PRODUCTION_RISK_PARAMS
+    "TOTAL_CAPITAL": "PRODUCTION_RISK_PARAMS.TOTAL_CAPITAL",
+    "RISK_PER_TRADE": "PRODUCTION_RISK_PARAMS.RISK_PER_TRADE",
+    "ATR_STOP_MULTIPLIER": "PRODUCTION_RISK_PARAMS.ATR_STOP_MULTIPLIER",
+    "MAX_POSITION_PCT": "PRODUCTION_RISK_PARAMS.MAX_POSITION_PCT",
+    "MIN_POSITION_VALUE": "PRODUCTION_RISK_PARAMS.MIN_POSITION_VALUE",
+    "CMC_RATE": "PRODUCTION_RISK_PARAMS.CMC_RATE",
+    "CMC_MIN_FEE": "PRODUCTION_RISK_PARAMS.CMC_MIN_FEE",
+    # 与intraday_monitor.py共用：PRODUCTION_PULLBACK_PARAMS
+    # （本地属性名PULLBACK_*/BOTTOM_*，跟intraday_monitor.py的
+    # MODE4_PULLBACK_*/MODE4_BOTTOM_*不同名，但指向同一段JSON配置）
+    "PULLBACK_MIN_DEPTH_PCT": "PRODUCTION_PULLBACK_PARAMS.MIN_DEPTH_PCT",
+    "PULLBACK_MAX_DEPTH_PCT": "PRODUCTION_PULLBACK_PARAMS.MAX_DEPTH_PCT",
+    "PULLBACK_LOOKBACK_DAYS": "PRODUCTION_PULLBACK_PARAMS.LOOKBACK_DAYS",
+    "BOTTOM_CLOSE_POS_MIN": "PRODUCTION_PULLBACK_PARAMS.BOTTOM_CLOSE_POS_MIN",
+    "BOTTOM_VOL_UPTICK_MIN": "PRODUCTION_PULLBACK_PARAMS.BOTTOM_VOL_UPTICK_MIN",
+    # daily_analysis.py专属（intraday_monitor.py没有对应常量）
+    "PULLBACK_VOL_SHRINK_RATIO": "PRODUCTION_DAILY_ANALYSIS_PARAMS.PULLBACK_VOL_SHRINK_RATIO",
+    "PULLBACK_VOL_DANGER_RATIO": "PRODUCTION_DAILY_ANALYSIS_PARAMS.PULLBACK_VOL_DANGER_RATIO",
+    "VOL_SPIKE_THRESHOLD": "PRODUCTION_DAILY_ANALYSIS_PARAMS.VOL_SPIKE_THRESHOLD",
+    "VOL_SHRINK_SLOPE_MAX": "PRODUCTION_DAILY_ANALYSIS_PARAMS.VOL_SHRINK_SLOPE_MAX",
+    "AMPLITUDE_SHRINK_SLOPE": "PRODUCTION_DAILY_ANALYSIS_PARAMS.AMPLITUDE_SHRINK_SLOPE",
+    "CLOSE_POS_MIN": "PRODUCTION_DAILY_ANALYSIS_PARAMS.CLOSE_POS_MIN",
+    "MIN_DAYS_FOR_ANALYSIS": "PRODUCTION_DAILY_ANALYSIS_PARAMS.MIN_DAYS_FOR_ANALYSIS",
+    "MIN_DAYS_FOR_EXHAUSTION": "PRODUCTION_DAILY_ANALYSIS_PARAMS.MIN_DAYS_FOR_EXHAUSTION",
+}
+
+# 高风险字段硬性范围校验——这几项直接决定真实下单的仓位大小和
+# 止损距离，写错的后果比screener.py的选股门槛严重得多。
+HARD_BOUNDS = {
+    "RISK_PER_TRADE": (0.0, 0.05),
+    "ATR_STOP_MULTIPLIER": (0.1, 10.0),
+    "MAX_POSITION_PCT": (0.01, 1.0),
+    "CMC_RATE": (0.0, 0.05),
+    "PULLBACK_MIN_DEPTH_PCT": (0.0, 100.0),
+    "PULLBACK_MAX_DEPTH_PCT": (0.0, 100.0),
+}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="ASX每日跨日因子分析")
     parser.add_argument("--mode",
@@ -1185,6 +1266,16 @@ def main() -> None:
                         default="premarket")
     args     = parser.parse_args()
     run_date = date.today().isoformat()
+
+    # v3.3新增：main()第一行加载params.json覆盖。
+    param_loader.apply_params(
+        target_module=sys.modules[__name__],
+        mapping=PARAM_MAPPING,
+        log=log,
+        hard_bounds=HARD_BOUNDS,
+        telegram_on_change=send_telegram,
+        state_tag="daily_analysis",
+    )
 
     log.info(f"=== daily_analysis.py v3.2 [{args.mode}] {run_date} ===")
 
