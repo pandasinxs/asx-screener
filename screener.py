@@ -75,6 +75,22 @@
 #      全部是"把字面量换成同值的具名模块常量"，默认值完全不变，
 #      纯为了让回测能测试不同参数组合，不改变screener.py当前的
 #      实际运行行为。
+#
+# v18.7改动（本轮，生产参数运行时加载）：
+#   8) 新增param_loader.py依赖：main()启动时第一步调用
+#      param_loader.apply_params()，从params.json读取并覆盖本文件
+#      的可调参数（见文件末尾PARAM_MAPPING/HARD_BOUNDS定义）。
+#      params.json缺失/损坏/字段非法时，自动回退到本文件写死的
+#      默认值，不影响正常运行。
+#      【关键】：这个调用只发生在main()里（即只有直接运行
+#      `python3 screener.py`才会触发），不在模块顶层执行——
+#      backtest_engine.py是`import screener`直接复用本文件的函数
+#      （_passes_tier/calc_composite_score等），如果参数加载发生在
+#      import的时候，会污染backtest_engine.py的
+#      _SCREENER_PRISTINE_DEFAULTS快照机制（该机制假设"import时
+#      看到的是硬编码字面量"），--run-queue连续跑实验之间的重置
+#      会被静默破坏。放在main()里，backtest_engine.py的import行为
+#      完全不受影响。
 # ============================================================
 
 import os, io, re, sys, time, logging, json, subprocess
@@ -84,6 +100,7 @@ import yfinance as yf
 import pandas as pd
 import pdfplumber
 import watchlist_db as wdb
+import param_loader
 from datetime import datetime, date, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Optional
@@ -2368,8 +2385,8 @@ D. Do not explain your process—output only the final version of the copy.
 
 ━━━━━━━━━━━━━━
 核心定义
-“盲盒” = 股票（用于隐喻表达，规避平台审查）
-全文统一使用“盲盒”，不使用“股票/标的”。
+"盲盒" = 股票（用于隐喻表达，规避平台审查）
+全文统一使用"盲盒"，不使用"股票/标的"。
 盲盒使用的股票代码，不能包含后缀.AX
 
 ━━━━━━━━━━━━━━
@@ -2387,8 +2404,8 @@ D. Do not explain your process—output only the final version of the copy.
 ━━━━━━━━━━━━━━
 一、标题
 
-类似“花光了今天的token额度抽取的盲盒”的一句话
-（仅作参考，类似表达即可，但必须包含“token“和“盲盒”）
+类似"花光了今天的token额度抽取的盲盒"的一句话
+（仅作参考，类似表达即可，但必须包含"token"和"盲盒"）
 
 ━━━━━━━━━━━━━━
 二、每个盲盒各写一段点评（核心结构）
@@ -2408,8 +2425,8 @@ D. Do not explain your process—output only the final version of the copy.
 
 要求：
 
-- 参考表达“我什么时候看见它发生了什么事情，是因为什么，然后今天发生了什么事，有什么变化”
-- 像“持续观察者视角”，不是一次性解读
+- 参考表达"我什么时候看见它发生了什么事情，是因为什么，然后今天发生了什么事，有什么变化"
+- 像"持续观察者视角"，不是一次性解读
 
 --------------------------------
 3. 结构判断 + 趋势分析 （1-2句话）
@@ -3198,7 +3215,59 @@ def run_report_flow(all_data: dict, market_snap: dict,
 # 9. 主入口
 # ════════════════════════════════════════════════════════════
 
+# v18.7新增：params.json运行时覆盖映射。只在main()（本文件作为
+# 顶层脚本被`python3 screener.py`直接运行时）里被调用一次，import
+# screener.py（backtest_engine.py的用法）完全不会触发这段逻辑。
+#
+# JSON路径沿用backtest_engine.py --export-params模板里已确认的
+# 顶层key名（SCORE_WEIGHTS/TIER_BONUS/TREND_SCORE_THRESHOLD/TIERS/
+# MIN_MARKET_CAP_AUD/MIN_LIQUIDITY_DOLLAR_VOL/TREND_SUB_WEIGHTS/
+# CONFIDENCE_PARAMS/PERSISTENCE_WEIGHTS/PERSISTENCE_MA50_SLOPE_MIN_PCT/
+# BT_STOP_ATR_MULT/BT_TARGET_ATR_MULT/BT_TIMEOUT_DAYS），跟回测那边
+# 用的是同一份params.json、同一套字段名，不是另起一套。
+PARAM_MAPPING = {
+    "SCORE_WEIGHTS": "SCORE_WEIGHTS",
+    "TIER_BONUS": "TIER_BONUS",
+    "TREND_SCORE_THRESHOLD": "TREND_SCORE_THRESHOLD",
+    "TIERS": "TIERS",
+    "MIN_MARKET_CAP_AUD": "MIN_MARKET_CAP_AUD",
+    "MIN_LIQUIDITY_DOLLAR_VOL": "MIN_LIQUIDITY_DOLLAR_VOL",
+    "TREND_SUB_WEIGHTS": "TREND_SUB_WEIGHTS",
+    "CONFIDENCE_PARAMS": "CONFIDENCE_PARAMS",
+    "PERSISTENCE_WEIGHTS": "PERSISTENCE_WEIGHTS",
+    "PERSISTENCE_MA50_SLOPE_MIN_PCT": "PERSISTENCE_MA50_SLOPE_MIN_PCT",
+    "BT_STOP_ATR_MULT": "BT_STOP_ATR_MULT",
+    "BT_TARGET_ATR_MULT": "BT_TARGET_ATR_MULT",
+    "BT_TIMEOUT_DAYS": "BT_TIMEOUT_DAYS",
+}
+
+# 高风险字段的硬性范围校验（宽松+对高风险字段加硬性范围校验）。
+# 这里的"高风险"指"一旦写错会让选股门槛失去意义"（比如市值门槛
+# 被误设成0，会让微盘垃圾股涌入Top3），而不是像daily_analysis.py/
+# intraday_monitor.py那样直接决定真实下单仓位大小——screener.py
+# 本身不下单，所以这里的范围校验没有那两个文件严格，但仍然是
+# 必要的最后防线。
+HARD_BOUNDS = {
+    "MIN_MARKET_CAP_AUD": (0.0, 10_000_000_000.0),
+    "MIN_LIQUIDITY_DOLLAR_VOL": (0.0, 100_000_000.0),
+    "BT_STOP_ATR_MULT": (0.1, 20.0),
+    "BT_TARGET_ATR_MULT": (0.1, 50.0),
+    "BT_TIMEOUT_DAYS": (1.0, 250.0),
+}
+
+
 def main() -> None:
+    # v18.7新增：main()的第一行——只有直接运行`python3 screener.py`
+    # 才会触发，backtest_engine.py的`import screener`不受影响。
+    param_loader.apply_params(
+        target_module=sys.modules[__name__],
+        mapping=PARAM_MAPPING,
+        log=log,
+        hard_bounds=HARD_BOUNDS,
+        telegram_on_change=send_telegram,
+        state_tag="screener",
+    )
+
     start = time.time()
     log.info("=" * 60)
     log.info(f"ASX System v18.4 启动 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
