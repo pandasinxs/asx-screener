@@ -92,10 +92,14 @@
   }
 }
 {
-  "_comment": "以下四段是本轮新增，用来支持screener.py/daily_analysis.py/intraday_monitor.py三个生产文件的params.json运行时覆盖。VM上现有的params.json里应该已经有SCORE_WEIGHTS/TIER_BONUS/TREND_SCORE_THRESHOLD/TIERS/MIN_MARKET_CAP_AUD/MIN_LIQUIDITY_DOLLAR_VOL/TREND_SUB_WEIGHTS/CONFIDENCE_PARAMS/PERSISTENCE_WEIGHTS/PERSISTENCE_MA50_SLOPE_MIN_PCT/BT_STOP_ATR_MULT/BT_TARGET_ATR_MULT/BT_TIMEOUT_DAYS/DAILY_HEALTH/HTF这些字段（screener.py沿用的是这份既有schema，不需要新增，见下方PARAM_MAPPING）。下面四段（PRODUCTION_RISK_PARAMS/PRODUCTION_PULLBACK_PARAMS/PRODUCTION_DAILY_ANALYSIS_PARAMS/PRODUCTION_INTRADAY_PARAMS）是全新的、专供生产脚本main()读取，不影响DAILY_HEALTH/HTF这两段既有的回测专用schema——没有碰过backtest_engine.py/backtest_intraday.py，因为这轮没有拿到这两个文件的最新代码，不确定它们内部怎么消费DAILY_HEALTH/HTF，不想凭猜测去改。所有数值都是各文件里当前硬编码的默认值，合并进去当天不会改变任何生产行为，只是让这些值变得可以后续通过params.json调整。",
+  "_comment_1": "本文件只列出【真正需要新增】的段落，不是完整params.json。",
+
+  "_comment_2": "重要更正（对照你贴的backtest_engine.py真实代码后修正）：daily_analysis.py和intraday_monitor.py的VOL_SPIKE_THRESHOLD/PULLBACK_MIN_DEPTH_PCT等字段，不需要新建段落——直接复用你params.json里已经存在的'DAILY_HEALTH'段（backtest_engine.py的export_default_params()/apply_param_overrides()一直在用这个段落名，字段名跟daily_analysis.py真实常量逐个同名）。如果你的params.json里已经有DAILY_HEALTH（用过--export-params，或者手写过），不需要改它一个字段，生产脚本会自动读同一份。TIERS同理：直接沿用你现有的{level: {字段: 值}}格式，不需要改。",
+
+  "_comment_3": "真正新增的只有下面两段：PRODUCTION_RISK_PARAMS（daily_analysis.py+intraday_monitor.py共用的仓位/风控常量，backtest_engine.py目前没有对应机制，回测还没做账户级仓位模拟）、PRODUCTION_INTRADAY_PARAMS（intraday_monitor.py专属，不带'必须跟daily_analysis.py同步'约束的常量，backtest_intraday.py目前也不覆盖这批常量）。",
 
   "PRODUCTION_RISK_PARAMS": {
-    "_comment": "daily_analysis.py和intraday_monitor.py共用同一段，改这里两边同步生效",
+    "_comment": "daily_analysis.py和intraday_monitor.py共用，改这里两边同步生效；回测无对应机制，纯生产内部配置",
     "TOTAL_CAPITAL": 50000,
     "RISK_PER_TRADE": 0.008,
     "ATR_STOP_MULTIPLIER": 1.5,
@@ -105,29 +109,8 @@
     "CMC_MIN_FEE": 7.0
   },
 
-  "PRODUCTION_PULLBACK_PARAMS": {
-    "_comment": "daily_analysis.py（PULLBACK_MIN_DEPTH_PCT等）和intraday_monitor.py（MODE4_PULLBACK_MIN_DEPTH_PCT等）共用同一段，改这里两边同步生效",
-    "MIN_DEPTH_PCT": 8.0,
-    "MAX_DEPTH_PCT": 25.0,
-    "LOOKBACK_DAYS": 20,
-    "BOTTOM_CLOSE_POS_MIN": 0.60,
-    "BOTTOM_VOL_UPTICK_MIN": 1.0
-  },
-
-  "PRODUCTION_DAILY_ANALYSIS_PARAMS": {
-    "_comment": "daily_analysis.py专属，intraday_monitor.py没有对应常量",
-    "PULLBACK_VOL_SHRINK_RATIO": 0.8,
-    "PULLBACK_VOL_DANGER_RATIO": 1.3,
-    "VOL_SPIKE_THRESHOLD": 1.8,
-    "VOL_SHRINK_SLOPE_MAX": -0.02,
-    "AMPLITUDE_SHRINK_SLOPE": -0.001,
-    "CLOSE_POS_MIN": 0.65,
-    "MIN_DAYS_FOR_ANALYSIS": 5,
-    "MIN_DAYS_FOR_EXHAUSTION": 10
-  },
-
   "PRODUCTION_INTRADAY_PARAMS": {
-    "_comment": "intraday_monitor.py专属，不带'必须跟daily_analysis.py同步'约束的常量（MODE4_*系列在PRODUCTION_PULLBACK_PARAMS里，不在这里）",
+    "_comment": "intraday_monitor.py专属，backtest_intraday.py目前不覆盖这批常量（详见该文件文档'已知限制'一节）",
     "VOL_SPIKE_RATIO_M1": 1.8,
     "VOL_SPIKE_RATIO_HIST": 1.5,
     "BREAKOUT_FAILURE_PCT": -0.3,
@@ -138,5 +121,25 @@
     "LATE_SESSION_NEAR_HIGH_PCT": 1.5,
     "LATE_SESSION_MIN_VOL_RATIO": 0.8,
     "HEALTH_BELOW_MA50_GRACE_DAYS": 2
+  },
+
+  "_comment_4": "以下是为你核对用的：DAILY_HEALTH段现在同时被backtest_engine.py（回测调参）+daily_analysis.py（生产）+intraday_monitor.py的MODE4_*（生产）三方读取。如果你的params.json里还没有这一段，可以用 python3 backtest_engine.py --export-params tmp.json 生成一份模板，把里面的DAILY_HEALTH原样合并进你的正式params.json——数值就是三边现在各自硬编码的默认值，合并进去当天不会改变任何行为。",
+
+  "_reference_only_DAILY_HEALTH_schema": {
+    "VOL_SPIKE_THRESHOLD": 1.8,
+    "VOL_SHRINK_SLOPE_MAX": -0.02,
+    "AMPLITUDE_SHRINK_SLOPE": -0.001,
+    "CLOSE_POS_MIN": 0.65,
+    "MIN_DAYS_FOR_ANALYSIS": 5,
+    "MIN_DAYS_FOR_EXHAUSTION": 10,
+    "LOOKBACK_DAYS": 70,
+    "PULLBACK_MIN_DEPTH_PCT": 8.0,
+    "PULLBACK_MAX_DEPTH_PCT": 25.0,
+    "PULLBACK_VOL_SHRINK_RATIO": 0.8,
+    "PULLBACK_VOL_DANGER_RATIO": 1.3,
+    "PULLBACK_LOOKBACK_DAYS": 20,
+    "BOTTOM_CLOSE_POS_MIN": 0.60,
+    "BOTTOM_VOL_UPTICK_MIN": 1.0,
+    "_note": "这个key名是_reference_only_DAILY_HEALTH_schema，不要真的用这个名字合并进params.json——它只是给你核对字段名/默认值用的参考副本。真正生效的段落名必须是'DAILY_HEALTH'（不带前缀），且LOOKBACK_DAYS这一项目前只有backtest_engine.py的近似评估器在用，daily_analysis.py的真实load_daily_summaries()里这是函数默认参数不是模块常量，params.json改这个字段不会影响生产（如实说明，不是本轮要修的范围）。"
   }
 }
