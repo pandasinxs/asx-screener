@@ -91,6 +91,23 @@
 #      看到的是硬编码字面量"），--run-queue连续跑实验之间的重置
 #      会被静默破坏。放在main()里，backtest_engine.py的import行为
 #      完全不受影响。
+#
+# v18.8改动（本轮，Telegram报告新增T1/T2完整候选名单）：
+#   9) select_top3()新增第5个返回值t1_t2_summary：在composite_score
+#      排序+截断到Top10之前，先留一份完整的T1/T2候选快照，并标注
+#      每只股票最终去向（selected入选Top3 / ranked_below_top3过了
+#      市值门槛但评分排名没到前3 / market_cap_filtered市值不达标
+#      被过滤 / below_top10评分排名连Top10候选池都没进入）。
+#      背景：composite_score全市场排序+Top10截断+市值过滤这三层，
+#      任何一层都可能让T1/T2信号没能进最终Top3，此前的Telegram报告
+#      只展示Top3本身，完全看不出"今天有没有T1/T2信号被避开、
+#      避开的原因是什么"——尤其是"评分排名连Top10候选池都没进入"
+#      这种情况，此前没有任何渠道能看到（raw_signals在select_top3()
+#      内部就已经被截断到10个了）。
+#      这是纯报告展示层的新增，不改变raw_signals截断/市值过滤/
+#      Top3选取/signals_history写入的任何现有行为，跟
+#      backtest_engine.py SignalGenerator.scan_day()的
+#      raw_top10截断逻辑保持完全一致（回测复现性要求不变）。
 # ============================================================
 
 import os, io, re, sys, time, logging, json, subprocess
@@ -2653,10 +2670,29 @@ def select_top3(all_data: dict, market_snap: dict,
 
     if not raw_signals:
         log.info("T1-T4均无信号")
-        return [], [], "", "T?"
+        return [], [], "", "T?", []
 
     for s in raw_signals:
         s["composite_score"] = calc_composite_score(s)
+
+    # v18.8新增：在截断到Top10之前，先留一份完整的T1/T2候选快照
+    # （按composite_score降序），供Telegram报告展示"没入选Top3、
+    # 甚至没进入Top10候选池的T1/T2信号"用。理由：下面的
+    # raw_signals[:10]截断是按全市场composite_score排序，如果当天
+    # T1/T2候选本身就超过10只（TIER_BONUS让T1/T2天然评分更高，
+    # 正常情况下不容易被挤出，但候选数多的强势市场日是可能发生的），
+    # 评分靠后的T1/T2会在这一步被完全挤出候选池、此前的代码完全
+    # 看不到这种情况。这里只是取快照，不改变raw_signals截断本身的
+    # 行为，不影响signals_history写入口径（跟backtest_engine.py
+    # SignalGenerator.scan_day()的raw_top10截断逻辑保持完全一致，
+    # 这是刻意维持的：回测复现性要求两边在"进入候选池"这一步的
+    # 截断行为必须一致，新增的T1/T2快照只是报告展示层的旁路，
+    # 不接入任何筛选/打分/DB写入逻辑）。
+    t1_t2_full = sorted(
+        [s for s in raw_signals if s.get("tier_level") in ("T1", "T2")],
+        key=lambda x: x["composite_score"], reverse=True,
+    )
+
     raw_signals.sort(key=lambda x: x["composite_score"], reverse=True)
     raw_signals = raw_signals[:10]
 
@@ -2673,6 +2709,37 @@ def select_top3(all_data: dict, market_snap: dict,
         filtered_pool.append(s)
 
     signals = filtered_pool[:TOP_N]
+
+    # v18.8新增：给t1_t2_full里每只股票标注最终去向，供Telegram报告
+    # 展示用。四种状态，按"离入选Top3有多远"排序：
+    #   selected             —— 进了Top3
+    #   ranked_below_top3    —— 过了市值门槛，进入filtered_pool，
+    #                           但综合评分排名没进前3
+    #   market_cap_filtered  —— 进了Top10候选池，但市值不达
+    #                           MIN_MARKET_CAP_AUD门槛，被过滤掉
+    #   below_top10          —— 综合评分排名连Top10候选池都没进入
+    #                           （这是本轮新增快照t1_t2_full之前，
+    #                           完全没有渠道能看到的情况）
+    top10_tickers = {s["ticker"] for s in raw_signals}
+    filtered_tickers = {s["ticker"] for s in filtered_pool}
+    selected_tickers_for_summary = {s["ticker"] for s in signals}
+    t1_t2_summary = []
+    for s in t1_t2_full:
+        ticker = s["ticker"]
+        if ticker in selected_tickers_for_summary:
+            status = "selected"
+        elif ticker in filtered_tickers:
+            status = "ranked_below_top3"
+        elif ticker in top10_tickers:
+            status = "market_cap_filtered"
+        else:
+            status = "below_top10"
+        t1_t2_summary.append({
+            "ticker": ticker,
+            "tier_level": s.get("tier_level"),
+            "composite_score": s.get("composite_score"),
+            "status": status,
+        })
 
     tier_summary = {}
     for s in signals:
@@ -2701,7 +2768,7 @@ def select_top3(all_data: dict, market_snap: dict,
             )
         log.info(f"watchlist写入：{len(filtered_pool)} 只（Top10全部，不只Top3）")
 
-    return signals, raw_signals, tier_label, tier_level
+    return signals, raw_signals, tier_label, tier_level, t1_t2_summary
 
 VALIDATION_LOG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "tier_validation.log"
@@ -2914,6 +2981,36 @@ def run_threshold_scan(all_data: dict, market_snap: dict,
             log.info(f"    阈值{threshold}: 通过{pass_count}只 ({pass_pct:.1f}%)")
         log.info("")
 
+_T1_T2_STATUS_LABEL = {
+    "selected": "✅ 已入选Top3",
+    "ranked_below_top3": "🔸 过了市值门槛，评分排名未进Top3",
+    "market_cap_filtered": "🔸 市值未达门槛，被过滤",
+    "below_top10": "🔸 评分排名未进入Top10候选池",
+}
+
+
+def _build_t1_t2_summary_block(t1_t2_summary: list) -> str:
+    """
+    v18.8新增：格式化T1/T2完整候选名单，供run_screener_flow()的
+    Telegram扫描报告使用。目的：composite_score排序+Top10截断+
+    市值过滤这三层，任何一层都可能让一只T1/T2股票没能进入最终Top3，
+    此前的报告只展示Top3本身，看不出"今天到底有没有T1/T2信号被
+    避开、避开的原因是什么"。t1_t2_summary的每一项已经在
+    select_top3()里标注好了status，这里只负责格式化文本。
+    """
+    if not t1_t2_summary:
+        return "\n\n📌 <b>T1/T2完整候选名单</b>：今日无T1/T2层级候选"
+
+    lines = ["\n\n📌 <b>T1/T2完整候选名单</b>（含未入选Top3的信号）"]
+    for s in t1_t2_summary:
+        label = _T1_T2_STATUS_LABEL.get(s["status"], s["status"])
+        lines.append(
+            f"{s['ticker']} [{s['tier_level']}] "
+            f"评分:{s['composite_score']} → {label}"
+        )
+    return "\n".join(lines)
+
+
 def run_screener_flow(all_data: dict, market_snap: dict) -> list:
     today   = date.today().strftime("%Y-%m-%d")
     start   = time.time()
@@ -2926,7 +3023,7 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
 
     today_ann = fetch_today_announcements()
 
-    signals, raw_signals, tier_label, tier_level = select_top3(all_data, market_snap)
+    signals, raw_signals, tier_label, tier_level, t1_t2_summary = select_top3(all_data, market_snap)
 
     elapsed_screen = round((time.time() - start) / 60, 1)
 
@@ -2936,7 +3033,9 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
         send_telegram(
             f"📊 <b>{market_label}ASX扫描完成 {today}</b>\n\n"
             f"扫描：{len(all_data)} 只（T1-T4均无信号）\n"
-            f"市场动能不足，建议观望。耗时：{elapsed_screen}分钟{market_note}"
+            f"市场动能不足，建议观望。耗时：{elapsed_screen}分钟"
+            + _build_t1_t2_summary_block(t1_t2_summary)
+            + market_note
         )
         return []
 
@@ -2950,6 +3049,7 @@ def run_screener_flow(all_data: dict, market_snap: dict) -> list:
             f"RS:{s['rs_vs_xjo']} ADX:{s['adx14']} 量比:{s['vol_ratio']}x"
             for i, s in enumerate(signals)
         )
+        + _build_t1_t2_summary_block(t1_t2_summary)
         + market_note
     )
 
