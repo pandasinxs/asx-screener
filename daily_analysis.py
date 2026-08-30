@@ -82,10 +82,13 @@
 #     PULLBACK_LOOKBACK_DAYS/BOTTOM_CLOSE_POS_MIN/
 #     BOTTOM_VOL_UPTICK_MIN这组回调判断常量，源码注释里此前
 #     写明必须手动跟intraday_monitor.py的同名/近义常量保持一致
-#     （两边各自独立硬编码一份）。现在两边都从params.json里
-#     PRODUCTION_RISK_PARAMS/PRODUCTION_PULLBACK_PARAMS这两段
-#     读取同一份配置，从根本上消除"改一处忘了改另一处"的风险，
-#     不再是"两份独立实现、必须手动保持一致"。
+#     （两边各自独立硬编码一份）。现在两边都从params.json里读取
+#     同一份配置——仓位常量走新增的PRODUCTION_RISK_PARAMS段，
+#     回调判断常量直接复用backtest_engine.py已有的DAILY_HEALTH段
+#     （v3.4修正，见下方main()入口附近的说明；v3.3最初的实现走的
+#     是另外发明的PRODUCTION_PULLBACK_PARAMS段，未跟backtest_engine.py
+#     的调参入口打通，已废弃），从根本上消除"改一处忘了改另一处"
+#     的风险，不再是"两份独立实现、必须手动保持一致"。
 #   - 【只在main()里调用，不在模块顶层】：daily_analysis.py当前
 #     没有被backtest_engine.py/backtest_intraday.py直接import
 #     （两边的DailyHealthEvaluator是各自独立的重新实现，源码注释
@@ -1205,22 +1208,26 @@ def format_postmarket_report(results: list, run_date: str) -> str:
 # 9. 主入口
 # ════════════════════════════════════════════════════════════
 
-# v3.3新增：params.json运行时覆盖映射。
+# v3.4修正（本轮，对照backtest_engine.py真实代码后修正）：上一版
+# （v3.3）把PULLBACK_*/VOL_*等字段映射到了自己发明的
+# PRODUCTION_PULLBACK_PARAMS/PRODUCTION_DAILY_ANALYSIS_PARAMS这两个
+# 新段落——但backtest_engine.py里其实已经有一个跟daily_analysis.py
+# 逐字段同名对应的"DAILY_HEALTH"JSON段（export_default_params()/
+# apply_param_overrides()都在用），你平时调参数、跑backtest_intraday.py
+# Stage1健康度精确化，用的就是这个字段名。继续用自造的新段落，
+# 会导致"回测里调DAILY_HEALTH.PULLBACK_MIN_DEPTH_PCT"这个动作根本
+# 传不到生产（生产读的是另一个key），这次任务要解决的"回测最优参数
+# 自动应用到生产"对这批字段完全不生效——现在改成直接读DAILY_HEALTH，
+# 字段名跟backtest_engine.py export出来的模板逐个对齐，你在回测里
+# 调的DAILY_HEALTH.*这份，跟生产main()读的是同一份JSON路径。
 #
-# 【关键设计】：RISK_PER_TRADE/TOTAL_CAPITAL/ATR_STOP_MULTIPLIER等
-# 映射到"PRODUCTION_RISK_PARAMS.*"这个JSON段，PULLBACK_MIN_DEPTH_PCT
-# 等映射到"PRODUCTION_PULLBACK_PARAMS.*"这个JSON段——这两段JSON路径
-# 跟intraday_monitor.py里对应常量（TOTAL_CAPITAL/RISK_PER_TRADE等，
-# MODE4_PULLBACK_MIN_DEPTH_PCT等）指向的【完全是同一份JSON路径】。
-# 两个文件各自独立硬编码这些常量的默认值不变（互为兜底），但一旦
-# params.json里这两段被更新，两边会同步生效，不再需要人工分别改
-# 两个.py文件、也不会出现"改了一边忘了改另一边"的静默不一致。
-#
-# 不属于这两段共享范围的字段（daily_analysis.py独有，
-# intraday_monitor.py没有对应常量）放进
-# PRODUCTION_DAILY_ANALYSIS_PARAMS这个专属段。
+# TOTAL_CAPITAL等仓位/风控常量，backtest_engine.py当前没有对应的
+# JSON段（回测目前没有账户级仓位模拟，是已知的未做项，见handoff
+# 文档F1），继续放在新段落PRODUCTION_RISK_PARAMS——这部分暂时只能
+# 是"生产内部两个文件互相同步"，还谈不上"回测自动优化"，如实标注。
 PARAM_MAPPING = {
-    # 与intraday_monitor.py共用：PRODUCTION_RISK_PARAMS
+    # 与intraday_monitor.py共用（回测目前没有对应机制，是生产内部
+    # 两个文件互相同步的新段落）
     "TOTAL_CAPITAL": "PRODUCTION_RISK_PARAMS.TOTAL_CAPITAL",
     "RISK_PER_TRADE": "PRODUCTION_RISK_PARAMS.RISK_PER_TRADE",
     "ATR_STOP_MULTIPLIER": "PRODUCTION_RISK_PARAMS.ATR_STOP_MULTIPLIER",
@@ -1228,23 +1235,30 @@ PARAM_MAPPING = {
     "MIN_POSITION_VALUE": "PRODUCTION_RISK_PARAMS.MIN_POSITION_VALUE",
     "CMC_RATE": "PRODUCTION_RISK_PARAMS.CMC_RATE",
     "CMC_MIN_FEE": "PRODUCTION_RISK_PARAMS.CMC_MIN_FEE",
-    # 与intraday_monitor.py共用：PRODUCTION_PULLBACK_PARAMS
-    # （本地属性名PULLBACK_*/BOTTOM_*，跟intraday_monitor.py的
-    # MODE4_PULLBACK_*/MODE4_BOTTOM_*不同名，但指向同一段JSON配置）
-    "PULLBACK_MIN_DEPTH_PCT": "PRODUCTION_PULLBACK_PARAMS.MIN_DEPTH_PCT",
-    "PULLBACK_MAX_DEPTH_PCT": "PRODUCTION_PULLBACK_PARAMS.MAX_DEPTH_PCT",
-    "PULLBACK_LOOKBACK_DAYS": "PRODUCTION_PULLBACK_PARAMS.LOOKBACK_DAYS",
-    "BOTTOM_CLOSE_POS_MIN": "PRODUCTION_PULLBACK_PARAMS.BOTTOM_CLOSE_POS_MIN",
-    "BOTTOM_VOL_UPTICK_MIN": "PRODUCTION_PULLBACK_PARAMS.BOTTOM_VOL_UPTICK_MIN",
-    # daily_analysis.py专属（intraday_monitor.py没有对应常量）
-    "PULLBACK_VOL_SHRINK_RATIO": "PRODUCTION_DAILY_ANALYSIS_PARAMS.PULLBACK_VOL_SHRINK_RATIO",
-    "PULLBACK_VOL_DANGER_RATIO": "PRODUCTION_DAILY_ANALYSIS_PARAMS.PULLBACK_VOL_DANGER_RATIO",
-    "VOL_SPIKE_THRESHOLD": "PRODUCTION_DAILY_ANALYSIS_PARAMS.VOL_SPIKE_THRESHOLD",
-    "VOL_SHRINK_SLOPE_MAX": "PRODUCTION_DAILY_ANALYSIS_PARAMS.VOL_SHRINK_SLOPE_MAX",
-    "AMPLITUDE_SHRINK_SLOPE": "PRODUCTION_DAILY_ANALYSIS_PARAMS.AMPLITUDE_SHRINK_SLOPE",
-    "CLOSE_POS_MIN": "PRODUCTION_DAILY_ANALYSIS_PARAMS.CLOSE_POS_MIN",
-    "MIN_DAYS_FOR_ANALYSIS": "PRODUCTION_DAILY_ANALYSIS_PARAMS.MIN_DAYS_FOR_ANALYSIS",
-    "MIN_DAYS_FOR_EXHAUSTION": "PRODUCTION_DAILY_ANALYSIS_PARAMS.MIN_DAYS_FOR_EXHAUSTION",
+    # 直接读backtest_engine.py已有的DAILY_HEALTH段，字段名跟那边
+    # export_default_params()导出的模板逐个同名（见该函数定义）。
+    # intraday_monitor.py的MODE4_*系列也读这同一批key（不同的本地
+    # 属性名，同一段JSON路径），三边（回测调参/daily_analysis.py
+    # 生产/intraday_monitor.py生产）现在共用一份数字。
+    "VOL_SPIKE_THRESHOLD": "DAILY_HEALTH.VOL_SPIKE_THRESHOLD",
+    "VOL_SHRINK_SLOPE_MAX": "DAILY_HEALTH.VOL_SHRINK_SLOPE_MAX",
+    "AMPLITUDE_SHRINK_SLOPE": "DAILY_HEALTH.AMPLITUDE_SHRINK_SLOPE",
+    "CLOSE_POS_MIN": "DAILY_HEALTH.CLOSE_POS_MIN",
+    "MIN_DAYS_FOR_ANALYSIS": "DAILY_HEALTH.MIN_DAYS_FOR_ANALYSIS",
+    "MIN_DAYS_FOR_EXHAUSTION": "DAILY_HEALTH.MIN_DAYS_FOR_EXHAUSTION",
+    "PULLBACK_MIN_DEPTH_PCT": "DAILY_HEALTH.PULLBACK_MIN_DEPTH_PCT",
+    "PULLBACK_MAX_DEPTH_PCT": "DAILY_HEALTH.PULLBACK_MAX_DEPTH_PCT",
+    "PULLBACK_VOL_SHRINK_RATIO": "DAILY_HEALTH.PULLBACK_VOL_SHRINK_RATIO",
+    "PULLBACK_VOL_DANGER_RATIO": "DAILY_HEALTH.PULLBACK_VOL_DANGER_RATIO",
+    "PULLBACK_LOOKBACK_DAYS": "DAILY_HEALTH.PULLBACK_LOOKBACK_DAYS",
+    "BOTTOM_CLOSE_POS_MIN": "DAILY_HEALTH.BOTTOM_CLOSE_POS_MIN",
+    "BOTTOM_VOL_UPTICK_MIN": "DAILY_HEALTH.BOTTOM_VOL_UPTICK_MIN",
+    # 注：DAILY_HEALTH.LOOKBACK_DAYS（backtest_engine.py近似
+    # load_daily_summaries()的lookback_days参数）没有映射到这里——
+    # 真实daily_analysis.py里这是函数默认参数load_daily_summaries
+    # (ticker, lookback_days=70)，不是模块级常量，setattr不到它。
+    # 想让这个也能被params.json控制，需要改函数签名读模块常量，
+    # 这次没做（超出这轮范围），如实记录。
 }
 
 # 高风险字段硬性范围校验——这几项直接决定真实下单的仓位大小和
