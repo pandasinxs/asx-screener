@@ -163,26 +163,29 @@ def _deep_merge_dict(default: dict, override: dict) -> dict:
     return merged
 
 
-def _merge_tiers_list(default_tiers: list, override_tiers: list) -> list:
+def _merge_tiers_list(default_tiers: list, override_by_level: dict) -> list:
     """
-    screener.py的TIERS专用：list of dict，按'level'字段逐项合并。
-    override里只出现T1，不会导致T2-T4从生效的TIERS里消失；
-    override里某个tier只写了部分字段（比如只想调vol_mult），
-    该tier其余字段保留默认值。默认顺序（T1→T4）保持不变，
-    override里如果出现默认没有的新level，追加在末尾。
+    screener.py的TIERS专用。
+
+    【格式对齐backtest_engine.py，2轮修正】：params.json里TIERS的真实
+    格式是"按level分组的dict"（backtest_engine.py的export_default_params()
+    / apply_param_overrides()都是这么读写的），不是list——
+        {"T1": {"vol_mult": 2.0, ...}, "T2": {...}}
+    导出时"level"/"label"/"note"这三个字段被剥掉了（只留可调的数值
+    字段），这里合并时用screener.TIERS原有tier的level去override_by_level
+    里查同名key，patch上去；查不到就保留这个tier的默认值不变。
+    默认顺序（T1→T4）保持不变，override里出现的、默认没有的新level会
+    被忽略（不追加），因为screener.py的TIERS结构里每个tier还需要
+    level/label/note这些字段，凭空出现一个新level没有这些字段会导致
+    下游代码（比如_passes_tier()读tier["label"]）出错，这跟
+    backtest_engine.py自己的apply_param_overrides()行为一致——那边
+    也是只patch已有tier，不支持新增tier。
     """
-    by_level = {t.get("level"): dict(t) for t in default_tiers}
-    order = [t.get("level") for t in default_tiers]
-    for ot in override_tiers:
-        lv = ot.get("level")
-        if lv is None:
-            continue
-        if lv in by_level:
-            by_level[lv] = _deep_merge_dict(by_level[lv], ot)
-        else:
-            by_level[lv] = dict(ot)
-            order.append(lv)
-    return [by_level[lv] for lv in order]
+    new_tiers = []
+    for tier in default_tiers:
+        patch = override_by_level.get(tier.get("level"), {})
+        new_tiers.append({**tier, **patch})
+    return new_tiers
 
 
 def apply_params(
@@ -277,11 +280,16 @@ def apply_params(
                 continue
 
         try:
-            if isinstance(default_val, dict) and isinstance(override_val, dict):
-                new_val = _deep_merge_dict(default_val, override_val)
-            elif (attr_name == "TIERS" and isinstance(default_val, list)
-                  and isinstance(override_val, list)):
+            if (attr_name == "TIERS" and isinstance(default_val, list)
+                    and isinstance(override_val, dict)):
+                # TIERS特殊格式：default是list（screener.TIERS原生结构），
+                # override是按level分组的dict（params.json里的真实格式，
+                # 对齐backtest_engine.py），两者类型天然不同，必须在
+                # 下面的通用dict-dict分支之前单独处理，否则会被误判成
+                # "类型不匹配"而拒绝。
                 new_val = _merge_tiers_list(default_val, override_val)
+            elif isinstance(default_val, dict) and isinstance(override_val, dict):
+                new_val = _deep_merge_dict(default_val, override_val)
             elif isinstance(default_val, dict) != isinstance(override_val, dict):
                 reason = (f"类型不匹配：默认是{type(default_val).__name__}，"
                           f"JSON里是{type(override_val).__name__}")
