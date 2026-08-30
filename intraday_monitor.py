@@ -88,7 +88,8 @@
 #      MODE4_BOTTOM_CLOSE_POS_MIN/MODE4_BOTTOM_VOL_UPTICK_MIN——
 #      这两组常量源码注释此前写明必须手动跟daily_analysis.py同名/
 #      近义常量保持一致。现在两边都从params.json里
-#      PRODUCTION_RISK_PARAMS/PRODUCTION_PULLBACK_PARAMS这两段读取
+#      PRODUCTION_RISK_PARAMS段（新增，回测暂无对应机制）/已有的
+#      DAILY_HEALTH段（跟backtest_engine.py的调参入口打通）读取
 #      同一份配置，不再是"两份独立硬编码、必须手动保持一致"。
 #      VOL_SPIKE_RATIO_M1/MODE2_PULLBACK_MAX_DEPTH_PCT等本文件专属、
 #      不带"必须跟daily_analysis.py同步"约束的常量，放进新的
@@ -213,9 +214,10 @@ HEALTH_BELOW_MA50_GRACE_DAYS = 2
 # PULLBACK_LOOKBACK_DAYS）保持一致——两边是独立实现，不共享代码，
 # 改一处记得改另一处，否则两个文件对"什么算健康回调"的定义会
 # 逐渐不同步。
-# v3.3更新：这条"手动同步"提醒本身已经被params.json覆盖机制解决——
+# v3.4更新：这条"手动同步"提醒本身已经被params.json覆盖机制解决——
 # 见文件末尾PARAM_MAPPING，这五项现在跟daily_analysis.py共用同一段
-# PRODUCTION_PULLBACK_PARAMS配置。这里保留的硬编码值是两边各自的
+# DAILY_HEALTH配置（跟backtest_engine.py的回测调参入口是同一批key，
+# 不是生产内部另起的段落）。这里保留的硬编码值是两边各自的
 # 兜底默认值，值必须相等，但不再需要"记得手动改另一个文件"。
 MODE4_PULLBACK_MIN_DEPTH_PCT = 8.0
 MODE4_PULLBACK_MAX_DEPTH_PCT = 25.0
@@ -232,7 +234,7 @@ MODE4_BOTTOM_VOL_UPTICK_MIN = 1.0
 # 不共享代码，改一处记得改另一处。这是本次改动里第二个"需要
 # 手动同步"的常量组（第一个是MODE4_*），如果以后要消除这类
 # 手动同步风险，可以考虑抽一个两边都import的共享配置文件。
-# v3.3更新：同上，这七项现在跟daily_analysis.py共用同一段
+# v3.4更新：同上，这七项现在跟daily_analysis.py共用同一段
 # PRODUCTION_RISK_PARAMS配置，见文件末尾PARAM_MAPPING。
 TOTAL_CAPITAL        = 50_000
 RISK_PER_TRADE       = 0.008     # 0.8% = $400
@@ -1367,13 +1369,18 @@ def run_end_of_day_maintenance() -> None:
 # 9. 主入口
 # ════════════════════════════════════════════════════════════
 
-# v3.3新增：params.json运行时覆盖映射。与daily_analysis.py共用
-# PRODUCTION_RISK_PARAMS/PRODUCTION_PULLBACK_PARAMS这两段JSON路径
-# ——本地属性名（MODE4_PULLBACK_MIN_DEPTH_PCT等）跟daily_analysis.py
-# 那边（PULLBACK_MIN_DEPTH_PCT等）不同名，但指向同一份JSON配置，
-# 从根本上解决两边"必须手动保持一致"的注释所警示的风险。
+# v3.4修正（本轮，对照backtest_engine.py真实代码后修正）：MODE4_*
+# 系列不再映射到上一版自造的PRODUCTION_PULLBACK_PARAMS段，改成直接读
+# backtest_engine.py已有的"DAILY_HEALTH"段——跟daily_analysis.py读的
+# 是完全同一批JSON key（本地属性名MODE4_PULLBACK_MIN_DEPTH_PCT跟
+# daily_analysis.py那边的PULLBACK_MIN_DEPTH_PCT不同名，但指向同一段
+# JSON路径）。这样"回测调DAILY_HEALTH.PULLBACK_MIN_DEPTH_PCT"这个
+# 动作，会同时影响daily_analysis.py和intraday_monitor.py两边的生产
+# 行为，而不只是这两个生产文件互相同步、跟回测调参脱节。
 PARAM_MAPPING = {
-    # 与daily_analysis.py共用：PRODUCTION_RISK_PARAMS
+    # 与daily_analysis.py共用：backtest_engine.py没有对应机制，是
+    # 生产内部两个文件互相同步的新段落（回测目前没有账户级仓位
+    # 模拟，见handoff文档F1）
     "TOTAL_CAPITAL": "PRODUCTION_RISK_PARAMS.TOTAL_CAPITAL",
     "RISK_PER_TRADE": "PRODUCTION_RISK_PARAMS.RISK_PER_TRADE",
     "ATR_STOP_MULTIPLIER": "PRODUCTION_RISK_PARAMS.ATR_STOP_MULTIPLIER",
@@ -1381,14 +1388,16 @@ PARAM_MAPPING = {
     "MIN_POSITION_VALUE": "PRODUCTION_RISK_PARAMS.MIN_POSITION_VALUE",
     "CMC_RATE": "PRODUCTION_RISK_PARAMS.CMC_RATE",
     "CMC_MIN_FEE": "PRODUCTION_RISK_PARAMS.CMC_MIN_FEE",
-    # 与daily_analysis.py共用：PRODUCTION_PULLBACK_PARAMS
-    "MODE4_PULLBACK_MIN_DEPTH_PCT": "PRODUCTION_PULLBACK_PARAMS.MIN_DEPTH_PCT",
-    "MODE4_PULLBACK_MAX_DEPTH_PCT": "PRODUCTION_PULLBACK_PARAMS.MAX_DEPTH_PCT",
-    "MODE4_PULLBACK_LOOKBACK_DAYS": "PRODUCTION_PULLBACK_PARAMS.LOOKBACK_DAYS",
-    "MODE4_BOTTOM_CLOSE_POS_MIN": "PRODUCTION_PULLBACK_PARAMS.BOTTOM_CLOSE_POS_MIN",
-    "MODE4_BOTTOM_VOL_UPTICK_MIN": "PRODUCTION_PULLBACK_PARAMS.BOTTOM_VOL_UPTICK_MIN",
+    # 与daily_analysis.py共用、且跟backtest_engine.py的DAILY_HEALTH
+    # 回测调参入口打通
+    "MODE4_PULLBACK_MIN_DEPTH_PCT": "DAILY_HEALTH.PULLBACK_MIN_DEPTH_PCT",
+    "MODE4_PULLBACK_MAX_DEPTH_PCT": "DAILY_HEALTH.PULLBACK_MAX_DEPTH_PCT",
+    "MODE4_PULLBACK_LOOKBACK_DAYS": "DAILY_HEALTH.PULLBACK_LOOKBACK_DAYS",
+    "MODE4_BOTTOM_CLOSE_POS_MIN": "DAILY_HEALTH.BOTTOM_CLOSE_POS_MIN",
+    "MODE4_BOTTOM_VOL_UPTICK_MIN": "DAILY_HEALTH.BOTTOM_VOL_UPTICK_MIN",
     # intraday_monitor.py专属（不带"必须跟daily_analysis.py同步"
-    # 约束的常量，只有本文件读取）
+    # 约束的常量，只有本文件读取；backtest_intraday.py目前也不覆盖
+    # 这批常量，见backtest_intraday.py文档"已知限制"一节）
     "VOL_SPIKE_RATIO_M1": "PRODUCTION_INTRADAY_PARAMS.VOL_SPIKE_RATIO_M1",
     "VOL_SPIKE_RATIO_HIST": "PRODUCTION_INTRADAY_PARAMS.VOL_SPIKE_RATIO_HIST",
     "BREAKOUT_FAILURE_PCT": "PRODUCTION_INTRADAY_PARAMS.BREAKOUT_FAILURE_PCT",
