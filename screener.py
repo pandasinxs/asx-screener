@@ -631,54 +631,102 @@ def _norm(val: float, lo: float, hi: float) -> float:
     return max(0.0, min(1.0, (val - lo) / (hi - lo)))
 
 
+# v18.9新增（本轮，修复T1-T4跨层评分不可比bug）：
+# calc_trend_strength_score()原来6/7个子维度的归一化锚点是从tier自己
+# 的通过阈值（tier['vol_mult']/tier['adx_min']/tier['rs_min']/
+# tier['near_52w_hi']）派生出来的（例如volume_multiple用
+# vol_anchor=tier['vol_mult']做归一化区间，T1=2.0/T4=1.0）。
+#
+# 后果（baseline_v1_full_market回测4739条候选实测确认）：
+# trend_strength_score均值按tier分组是 T1=0.566 / T2=0.630 / T3=0.757
+# / T4=0.859——完全倒挂，T4（放宽层）分数最高、T1（精英层）分数最低，
+# 跟"T1是最优质层级"的设计意图相反。composite_score里trend_strength_
+# score权重0.50，TIER_BONUS（T1+0.15/T2+0.10）不足以抵消这个差距
+# （0.50×0.293≈0.146，几乎正好抵消掉T1全部bonus；T2的0.50×0.229≈0.114
+# 比T2自己的0.10 bonus还大），导致composite_score跨tier排序时，
+# T4的弱信号会系统性排在T1/T2的强信号前面进入Top10/Top3——这是当前
+# T2跑输T4这一异例的一部分成因（不是全部：全量候选、未经composite_
+# score排序前，T2胜率17.0%已经低于T4的21.3%，说明_passes_tier()的
+# 二元通过标准本身也存在有待进一步查证的问题，这次修复只解决评分
+# 排序这一层）。
+#
+# 修复：6个维度全部改成固定的绝对刻度锚点，不再依赖传入的tier参数
+# （tier参数仍保留在函数签名里，只是内部不再用它推导锚点——
+# _passes_tier()调用它的方式不变，TREND_SCORE_THRESHOLD这个"不同tier
+# 通过门槛不同"的设计不受影响，那是独立于本次修复的另一层）。
+#
+# 锚点校准依据（诚实标注哪些有真实数据支撑，哪些是原则性推算）：
+#   - relative_strength / near_52w_hi：用baseline_v1_full_market
+#     4739条候选的rs_vs_xjo/dist_52w_hi_pct真实分布校准过
+#     （rs_vs_xjo: P5=1.02, P95=1.32；dist_ratio: P5=0.875, 中位数0.970），
+#     锚点区间覆盖这个真实分布、留有余量，不会大面积贴地板/触天花板。
+#   - volume_multiple / ma_alignment / hh_hl_structure / ma50_trend：
+#     CSV导出schema里没有vol_ratio/ma_premium/hh_ratio/ma50_chg这几个
+#     原始值（只导出了归一化后的sub_score），无法用真实历史分布校准，
+#     这4项的锚点是根据TIERS配置本身的真实取值范围（T1-T4各档
+#     vol_mult/adx_min等，这是screener.py里的真实代码常量，不是训练
+#     记忆里的印象）做的原则性推算，取值跨越"T4最松门槛"到"T1最严
+#     门槛再留headroom"。这4项应视为第一版、未经真实历史分布验证，
+#     修复上线后必须用新的--param-set-name重新跑一次全市场回测，
+#     确认trend_strength_score不再跨层倒挂、且T2 vs T4的胜率差距是否
+#     缩小，再决定是否需要进一步微调。
+TREND_SUB_ANCHORS = {
+    # 格式：(lo, hi) —— 归一化下界/上界，全部tier共用同一套绝对刻度
+    "volume_multiple":   (1.0, 3.0),     # 未经真实分布验证，见上方说明
+    "near_52w_hi":        (0.70, 1.00),  # 已用dist_52w_hi_pct真实分布校准
+    "ma_alignment":       (-0.02, 0.05), # 未经真实分布验证
+    "relative_strength":  (0.95, 1.35),  # 已用rs_vs_xjo真实分布校准
+    "hh_hl_structure":    (-0.05, 0.10), # 未经真实分布验证
+    "ma50_trend":         (-0.02, 0.15), # 未经真实分布验证
+}
+
+
 def calc_trend_strength_score(tech: dict, tier: dict) -> dict:
     lc     = tech["price"]
     w52_hi = tech["w52_hi"]
 
     scores = {}
 
-    vol_anchor = tier["vol_mult"]
-    scores["volume_multiple"] = _norm(
-        tech.get("vol_ratio", 1.0), vol_anchor * 0.5, vol_anchor * 1.5
-    )
+    lo, hi = TREND_SUB_ANCHORS["volume_multiple"]
+    scores["volume_multiple"] = _norm(tech.get("vol_ratio", 1.0), lo, hi)
 
     dist_ratio = lc / w52_hi if w52_hi > 0 else 0.7
-    near_hi_anchor = 0.90 if tier["near_52w_hi"] else 0.75
-    scores["near_52w_hi"] = _norm(dist_ratio, near_hi_anchor - 0.15, near_hi_anchor + 0.10)
+    lo, hi = TREND_SUB_ANCHORS["near_52w_hi"]
+    scores["near_52w_hi"] = _norm(dist_ratio, lo, hi)
 
     ma20 = tech.get("ma20", 0)
     ma50 = tech.get("ma50", 1)
     ma_premium = (ma20 / ma50 - 1) if ma50 > 0 else 0
-    ma_anchor  = 0.02 if tier["level"] in ("T1", "T2") else 0.0
-    scores["ma_alignment"] = _norm(ma_premium, ma_anchor - 0.03, ma_anchor + 0.05)
+    lo, hi = TREND_SUB_ANCHORS["ma_alignment"]
+    scores["ma_alignment"] = _norm(ma_premium, lo, hi)
 
-    rs_anchor = tier["rs_min"]
-    scores["relative_strength"] = _norm(tech.get("rs_vs_xjo", 1.0), rs_anchor - 0.10, rs_anchor + 0.15)
+    lo, hi = TREND_SUB_ANCHORS["relative_strength"]
+    scores["relative_strength"] = _norm(tech.get("rs_vs_xjo", 1.0), lo, hi)
 
     high_s = tech["_high"]
     low_s  = tech["_low"]
-    hh_anchor = 0.02 if tier["level"] in ("T1", "T2") else -0.02
     if len(high_s) >= 40:
         recent_hi = float(high_s.iloc[-20:].max())
         prior_hi  = float(high_s.iloc[-40:-20].max())
         hh_ratio  = (recent_hi / prior_hi - 1) if prior_hi > 0 else 0
-        scores["hh_hl_structure"] = _norm(hh_ratio, hh_anchor - 0.05, hh_anchor + 0.10)
+        lo, hi = TREND_SUB_ANCHORS["hh_hl_structure"]
+        scores["hh_hl_structure"] = _norm(hh_ratio, lo, hi)
     else:
         scores["hh_hl_structure"] = 0.0
 
     close_s = tech["_close"]
-    slope_anchor = (tier["adx_min"] - 15) / 100
     if len(close_s) >= 61:
         ma50_now  = float(close_s.rolling(50).mean().iloc[-1])
         ma50_prev = float(close_s.rolling(50).mean().iloc[-11])
         ma50_chg  = (ma50_now / ma50_prev - 1) if ma50_prev > 0 else 0
-        scores["ma50_trend"] = _norm(ma50_chg, slope_anchor - 0.02, slope_anchor + 0.05)
+        lo, hi = TREND_SUB_ANCHORS["ma50_trend"]
+        scores["ma50_trend"] = _norm(ma50_chg, lo, hi)
     else:
         scores["ma50_trend"] = 0.0
 
     vwap20 = tech.get("vwap20", lc)
     vwap_premium = (lc / vwap20 - 1) if vwap20 > 0 else 0
-    scores["vwap_position"] = _norm(vwap_premium, -0.03, 0.05)
+    scores["vwap_position"] = _norm(vwap_premium, -0.03, 0.05)  # 本来就是固定锚点，未改动
 
     trend_strength_score = sum(scores[k] * TREND_SUB_WEIGHTS[k] for k in TREND_SUB_WEIGHTS)
 
