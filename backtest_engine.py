@@ -304,6 +304,44 @@ def send_telegram(text: str, logger: Optional[logging.Logger] = None) -> None:
     （只记一条warning日志，不影响回测本身运行），配置了但网络失败时重试，
     重试完还失败也只记日志，绝不能因为Telegram推送失败而让整个回测崩溃——
     推送是锦上添花，不是回测能不能跑的前提条件。
+
+    v2.6修复（本轮，真实故障排查后确认）：
+    此前固定带着"parse_mode": "HTML"发送，但本文件里所有消息内容
+    都是纯文字+emoji，从来没有真正用到<b>/<i>这类HTML格式化标签——
+    这个参数本身就是不必要的。而且它是一个真实的隐患来源：Telegram
+    在parse_mode=HTML下，任何未转义的字面"<"/">"/"&"都会被当成HTML
+    实体解析，解析失败就整条消息被拒收（400 Bad Request）。
+
+    真实故障案例（本轮排查确认，用curl复现拿到了Telegram的原始
+    响应体）：leaderboard()帮助文字里的"<名字>"占位符写法（意思是
+    "这里填实际的名字"，不是想用HTML标签）被解析成了一个不认识的
+    HTML开始标签"名字"，导致整条排行榜消息被拒收
+    （error_code=400, description="can't parse entities: Unsupported
+    start tag "名字" at byte offset 931"）。
+
+    更值得警惕的是：本文件的崩溃报警路径
+    （BacktestEngine.run()/run_queue()里catch Exception后）会把
+    Python的traceback.format_exc()原样塞进Telegram消息——Python
+    traceback里几乎必然出现"<module>"这类尖括号写法（脚本顶层调用
+    帧的标准表示），跟"<名字>"是完全一样的坑。也就是说，这套本该在
+    真正崩溃、最需要报警的时刻起作用的告警机制，本身有很高概率因为
+    同样的原因被Telegram拒收、静默失败——而且是"越需要报警的场景
+    （traceback越长越复杂）越容易触发"。
+
+    修复：直接去掉parse_mode参数（不传=Telegram默认按纯文本处理，
+    不解析任何实体，不会因为消息内容里出现"<"/">"/"&"而报错）。
+    这是最低风险的修法——本文件从未真正需要HTML格式化，去掉之后
+    所有消息显示效果不变，但这一整类"消息内容里偶然出现尖括号导致
+    发送失败"的bug被连根拔除，不用逐处转义、也不用担心未来新增的
+    动态内容（新的实验名字、报错信息、traceback）里再冒出同样的坑。
+
+    同时补上失败时的响应体日志（r.text）——此前只记录了
+    requests.HTTPError的通用异常信息（比如"400 Client Error: Bad
+    Request for url: ..."），把Telegram真正的错误描述（description
+    字段，比如"can't parse entities"具体是哪个字符）丢掉了，这也是
+    这次排查这个问题额外花了一轮来回、需要手动curl复现才能拿到根因
+    的原因。以后再出现推送失败，日志里会直接躺着Telegram的原始
+    响应体，不用再猜。
     """
     log = logger or logging.getLogger("backtest")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -314,19 +352,27 @@ def send_telegram(text: str, logger: Optional[logging.Logger] = None) -> None:
     chunks = [text[i:i + TELEGRAM_CHUNK_SIZE] for i in range(0, len(text), TELEGRAM_CHUNK_SIZE)] or [text]
 
     for chunk in chunks:
+        last_response_body = ""
         for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
             try:
                 r = requests.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID, "text": chunk,
-                    "parse_mode": "HTML", "disable_web_page_preview": True,
+                    "disable_web_page_preview": True,
                 }, timeout=10)
                 r.raise_for_status()
                 break
             except Exception as e:
+                try:
+                    last_response_body = r.text[:500]  # noqa: F821 (r可能未定义于连接类异常)
+                except Exception:
+                    last_response_body = "(无法读取响应体，可能是连接层异常，不是HTTP层错误)"
                 if attempt < TELEGRAM_MAX_RETRIES:
                     time.sleep(2 * attempt)
                 else:
-                    log.error(f"Telegram推送失败（已重试{TELEGRAM_MAX_RETRIES}次）: {e}")
+                    log.error(
+                        f"Telegram推送失败（已重试{TELEGRAM_MAX_RETRIES}次）: {e}\n"
+                        f"响应体: {last_response_body}"
+                    )
         time.sleep(0.4)
 
 
@@ -336,6 +382,10 @@ def send_telegram_document(file_path: str, caption: str = "",
     推送文件附件到Telegram（比如CSV导出），用于需要深挖分析的场景——
     纯文字摘要给日常查看用，文件附件给"要拿去做进一步定量分析"用。
     同样是配置了才推，失败了只记日志，不影响回测主流程。
+
+    caption字段本来就没有传parse_mode（走的是multipart/form-data的
+    data字段，不是sendMessage的json payload），不受v2.6那个bug影响，
+    这里不需要改。
     """
     log = logger or logging.getLogger("backtest")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -2722,7 +2772,15 @@ class StatsReporter:
         emit("=" * 70)
         emit("样本量差距较大的实验之间直接比胜率会有误导性，"
              "建议同时看样本数，样本差太多的先别下结论")
-        emit("用 --show-param-set <名字> 可以查看某个实验当时实际用的完整参数内容")
+        # v2.6修复：原来这里写的是"用 --show-param-set <名字> 可以..."，
+        # 字面尖括号"<名字>"在parse_mode=HTML下会被Telegram当成一个
+        # 未闭合的HTML开始标签解析，导致整条排行榜消息被拒收（400
+        # Bad Request: can't parse entities: Unsupported start tag
+        # "名字"）。这里改成方括号写法，规避尖括号；同时send_telegram()
+        # 本身也已经去掉了parse_mode=HTML（见该函数的v2.6注释），双重
+        # 保险：以后就算这里或别处又不小心写出字面尖括号，也不会再
+        # 触发HTML实体解析报错。
+        emit("用 --show-param-set [名字] 可以查看某个实验当时实际用的完整参数内容")
 
         if push_telegram:
             send_telegram("\n".join(buffer), self.logger)
@@ -2783,8 +2841,8 @@ class StatsReporter:
         "ASX200同期涨跌幅"这一行。
 
         v2.5改动：start/end现在由调用方（report()）显式传入,不再直接读
-        self.cfg.start_date/end_date——这两个字段v2.5起默认是None（"缓存
-        有多少用多少"),如果这里继续用cfg的值,None/None会让yf.download()
+        self.cfg.start_date/end_date——这两个字段v2.5起默认是None(“缓存
+        有多少用多少”),如果这里继续用cfg的值,None/None会让yf.download()
         退化成"下载全部可得历史",算出来的涨跌幅跟本次回测实际测试的
         交易日区间对不上,是一个没有意义的数字。report()会优先用cfg里
         手动指定的值（如果有),否则从combined实际的signal_date范围反推。
