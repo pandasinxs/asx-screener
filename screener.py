@@ -92,7 +92,47 @@
 #      会被静默破坏。放在main()里，backtest_engine.py的import行为
 #      完全不受影响。
 #
-# v18.8改动（本轮，Telegram报告新增T1/T2完整候选名单）：
+# v18.9改动（上一轮，修复T1-T4跨层评分不可比bug）：
+#   见calc_trend_strength_score()函数上方的详细注释。核心：把6/7个
+#   子维度的归一化锚点从"依赖tier自己的通过阈值"改成固定绝对刻度，
+#   composite_score不再因为跨tier打分不可比而系统性地把T4的弱信号
+#   排到T1/T2强信号前面。
+#
+# v18.10改动（本轮，方案B——补上被v18.9连带拆除的三项硬性门槛）：
+#   v18.9上线后用baseline_v1_full_market同等条件跑了一次新回测
+#   （param_set=fix_v1_tier_anchor）验证，发现T2 vs T4胜率差距确实
+#   收窄（全量候选：17.0%→19.3% vs T4的21.3%→21.0%，置信区间从基本
+#   不重叠变成大面积重叠），但同时T1候选数从161笔暴涨到499笔
+#   （3倍），T1全量候选胜率从23.0%掉到18.4%——T1被稀释。
+#
+#   根因：tier['vol_mult']/tier['near_52w_hi']/tier['rs_min']这三个
+#   字段，在真正生产用的_passes_tier()里从来没有被当作独立的二元
+#   硬性门槛检查过——它们唯一的用途就是v18.9修掉的那几个"按tier
+#   调整"的打分锚点。也就是说"T1要求2倍量能突破/贴近52周高点/
+#   跑赢大盘5%以上"这几条从来不是真正的硬性条件，只是通过打分公式
+#   间接施加影响；v18.9把打分锚点修成跨层可比之后，这个（虽然算法
+#   上有bug，但客观上在履行"T1需要在这几项上明显更强"把关职责的）
+#   机制被顺带拆除，而没有东西补上。
+#
+#   佐证：_passes_tier_diagnostic()（纯诊断用，不参与真实选股）里
+#   一直把这三项当独立二元检查在写，说明当初设计意图就是这三项
+#   应该被硬性把关，只是真正生产用的_passes_tier()里一直漏掉，全靠
+#   v18.9之前的打分锚点在"顶替"。
+#
+#   修复：在_passes_tier()里补上这三项独立二元检查（vol_ratio>=
+#   tier['vol_mult']；tier['near_52w_hi']为True时price>=w52_hi*0.90；
+#   rs_vs_xjo>=tier['rs_min']），逻辑跟_passes_tier_diagnostic()现有
+#   写法完全一致。calc_trend_strength_score()的跨层可比打分（v18.9）
+#   不受影响、不回退。
+#
+#   验证方式：py_compile通过；合成数据功能测试确认新增门槛能正确
+#   拒绝vol_ratio/rs_vs_xjo不达标的候选，且用_passes_tier_diagnostic()
+#   逐项排查确认失败原因确实来自新增门槛本身（不是误伤其他检查项）。
+#   跟v18.9一样，此次改动对T1真实通过率/胜率的实际影响，仍然需要
+#   用新的--param-set-name重新跑一次全市场回测验证，本地合成数据
+#   只能验证机制正确性，不能替代真实历史价格数据的回测结果。
+#
+# v18.8改动（上两轮，Telegram报告新增T1/T2完整候选名单）：
 #   9) select_top3()新增第5个返回值t1_t2_summary：在composite_score
 #      排序+截断到Top10之前，先留一份完整的T1/T2候选快照，并标注
 #      每只股票最终去向（selected入选Top3 / ranked_below_top3过了
@@ -2576,6 +2616,7 @@ def _passes_tier(tech: dict, tier: dict) -> bool:
     lc        = tech["price"]
     vol_ratio = tech["vol_ratio"]
     close_pos = tech["close_pos_pct"] / 100.0
+    w52_hi    = tech["w52_hi"]
     volume_s  = tech["_volume"]
     high_s    = tech["_high"]
     low_s     = tech["_low"]
@@ -2602,6 +2643,34 @@ def _passes_tier(tech: dict, tier: dict) -> bool:
         return False
 
     if close_pos < tier["close_pos"]:
+        return False
+
+    # v18.10新增（本轮，方案B）：补上tier['vol_mult']/tier['near_52w_hi']/
+    # tier['rs_min']三项独立二元硬性门槛。
+    #
+    # 背景：v18.9把calc_trend_strength_score()里依赖这三个tier字段的
+    # 打分锚点改成了跨层固定的绝对刻度（修复composite_score跨T1-T4
+    # 不可比的bug）。但审计发现，这三个字段在_passes_tier()里从来
+    # 没有被当作独立的二元门槛检查过——它们唯一的用途就是v18.9之前
+    # 那几个"按tier调整"的打分锚点。也就是说"T1要求2倍量能突破/
+    # 贴近52周高点/跑赢大盘5%以上"这几条从来不是真正的硬性条件，
+    # 只是通过打分公式间接施加影响，而v18.9修掉打分锚点之后，这个
+    # （虽然算法上有bug，但客观上在履行"T1需要在这几项上明显更强"
+    # 把关职责的）机制被顺带拆除，导致T1在实测中候选数从161暴涨到
+    # 499、全量候选胜率从23.0%降到18.4%——T1被稀释了。
+    #
+    # 佐证：_passes_tier_diagnostic()（纯诊断用，不参与真实选股）里
+    # 一直把这三项当独立二元检查在写，说明当初设计意图就是这三项
+    # 应该被硬性把关，只是真正生产用的_passes_tier()里一直漏掉，
+    # 全靠v18.9之前的打分锚点在"顶替"。这次把独立检查真正补上，
+    # 跟_passes_tier_diagnostic()现有逻辑保持一致。
+    if vol_ratio < tier["vol_mult"]:
+        return False
+
+    if tier["near_52w_hi"] and lc < w52_hi * 0.90:
+        return False
+
+    if tech["rs_vs_xjo"] < tier["rs_min"]:
         return False
 
     trend_result = calc_trend_strength_score(tech, tier)
