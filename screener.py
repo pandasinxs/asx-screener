@@ -132,6 +132,25 @@
 #   用新的--param-set-name重新跑一次全市场回测验证，本地合成数据
 #   只能验证机制正确性，不能替代真实历史价格数据的回测结果。
 #
+# v18.11改动（本轮，撤回v18.10 + 改用阈值调整）：
+#   用fix_v2_hard_gates实测验证v18.10新增的三项独立二元硬性门槛
+#   （vol_mult/near_52w_hi/rs_min）后，发现是一次倒退：T1候选数从
+#   fix_v1的499骤降到22（比未修复的baseline的161还少，样本小到
+#   没有统计意义）；T2候选数从972降到208，胜率从19.3%骤降到12.5%，
+#   跟T4的差距从收窄后的1.7pp反而拉大到8.8pp、置信区间完全不重叠，
+#   比最初要解决的T2异例本身还差。已把_passes_tier()里这三项独立
+#   门槛撤回，详见_passes_tier()函数内部的撤回说明。
+#
+#   T1候选被稀释这件事本身还是需要处理，改用另一个思路：不碰
+#   _passes_tier()的二元门槛结构（保留加权打分允许互相补偿这个
+#   机制），直接把T1的TREND_SCORE_THRESHOLD从0.45抬高到0.58——
+#   用fix_v1已收集数据做事后筛选，这个阈值下T1子集样本量(157)
+#   几乎精确对齐baseline原本的161，胜率23.6%还略高于baseline的
+#   23.0%。详见TREND_SCORE_THRESHOLD定义上方的注释。这个数字来自
+#   post-hoc筛选，不等价于真实改阈值后重跑回测的结果，需要用新的
+#   --param-set-name验证。T2没有找到类似的清晰改善方向，这次没动
+#   T2的阈值。
+#
 # v18.8改动（上两轮，Telegram报告新增T1/T2完整候选名单）：
 #   9) select_top3()新增第5个返回值t1_t2_summary：在composite_score
 #      排序+截断到Top10之前，先留一份完整的T1/T2候选快照，并标注
@@ -2605,8 +2624,36 @@ D. Do not explain your process—output only the final version of the copy.
 # 7. 选股筛选
 # ════════════════════════════════════════════════════════════
 
+# v18.11改动（本轮）：T1的阈值从0.45改成0.58。
+#
+# 背景：v18.9把calc_trend_strength_score()的锚点改成跨层固定绝对
+# 刻度之后（fix_v1_tier_anchor实测），T1候选数从baseline的161暴涨到
+# 499、全量候选胜率从23.0%掉到18.4%——同样的0.45阈值，在新的固定
+# 刻度下变得比原来宽松很多，让更多此前会被（有bug但客观上在把关的）
+# 旧锚点挡在外面的候选混了进来，稀释了T1的整体质量。
+#
+# v18.10曾尝试用三项独立二元硬性门槛来补救（已撤回，见_passes_tier()
+# 注释），效果是伤到T2、T1样本量也没修好（反而砍到22，比baseline
+# 还少）。
+#
+# 这次改用另一个思路：不动_passes_tier()的二元门槛结构（保留加权
+# 打分允许互相补偿这个机制），只是直接抬高T1需要达到的综合分数门槛。
+# 依据：用fix_v1_tier_anchor已收集的499条T1候选做事后筛选（不需要
+# 新回测），trend_strength_score>=0.58这个子集恰好n=157，跟baseline
+# 原本的161几乎精确对齐，胜率23.6%，比baseline的23.0%还略高，且这条
+# "阈值越高胜率越高"的曲线在此处之前完全单调、样本量也还没小到失真
+# （0.65之后样本骤降到51，胜率跌到15.7%，明显开始不稳定，故没有选
+# 更高的阈值）。
+#
+# 重要限制：0.58这个数字来自post-hoc筛选已收集数据，不等价于真的
+# 改阈值后完整跑一遍回测——市值过滤/Top10截断/composite_score排序
+# 这几层下游逻辑跟T1候选池变化后可能产生新的交互，具体表现需要用新
+# 的--param-set-name重新跑一次真实回测验证，不能只信这个筛选结果。
+# T2的同类分析没有找到类似的清晰改善（阈值调多高都逼近不了T4的
+# 21%水平，曲线接近噪音），T2的问题目前判断不是靠调这个阈值能解决的，
+# 这次没有动T2的阈值。
 TREND_SCORE_THRESHOLD = {
-    "T1": 0.45,
+    "T1": 0.58,
     "T2": 0.40,
     "T3": 0.35,
     "T4": 0.30,
@@ -2616,7 +2663,6 @@ def _passes_tier(tech: dict, tier: dict) -> bool:
     lc        = tech["price"]
     vol_ratio = tech["vol_ratio"]
     close_pos = tech["close_pos_pct"] / 100.0
-    w52_hi    = tech["w52_hi"]
     volume_s  = tech["_volume"]
     high_s    = tech["_high"]
     low_s     = tech["_low"]
@@ -2645,34 +2691,21 @@ def _passes_tier(tech: dict, tier: dict) -> bool:
     if close_pos < tier["close_pos"]:
         return False
 
-    # v18.10新增（本轮，方案B）：补上tier['vol_mult']/tier['near_52w_hi']/
-    # tier['rs_min']三项独立二元硬性门槛。
-    #
-    # 背景：v18.9把calc_trend_strength_score()里依赖这三个tier字段的
-    # 打分锚点改成了跨层固定的绝对刻度（修复composite_score跨T1-T4
-    # 不可比的bug）。但审计发现，这三个字段在_passes_tier()里从来
-    # 没有被当作独立的二元门槛检查过——它们唯一的用途就是v18.9之前
-    # 那几个"按tier调整"的打分锚点。也就是说"T1要求2倍量能突破/
-    # 贴近52周高点/跑赢大盘5%以上"这几条从来不是真正的硬性条件，
-    # 只是通过打分公式间接施加影响，而v18.9修掉打分锚点之后，这个
-    # （虽然算法上有bug，但客观上在履行"T1需要在这几项上明显更强"
-    # 把关职责的）机制被顺带拆除，导致T1在实测中候选数从161暴涨到
-    # 499、全量候选胜率从23.0%降到18.4%——T1被稀释了。
-    #
-    # 佐证：_passes_tier_diagnostic()（纯诊断用，不参与真实选股）里
-    # 一直把这三项当独立二元检查在写，说明当初设计意图就是这三项
-    # 应该被硬性把关，只是真正生产用的_passes_tier()里一直漏掉，
-    # 全靠v18.9之前的打分锚点在"顶替"。这次把独立检查真正补上，
-    # 跟_passes_tier_diagnostic()现有逻辑保持一致。
-    if vol_ratio < tier["vol_mult"]:
-        return False
-
-    if tier["near_52w_hi"] and lc < w52_hi * 0.90:
-        return False
-
-    if tech["rs_vs_xjo"] < tier["rs_min"]:
-        return False
-
+    # v18.11撤回（本轮）：v18.10在这里新增过tier['vol_mult']/
+    # tier['near_52w_hi']/tier['rs_min']三项独立二元硬性门槛（方案B），
+    # 用fix_v2_hard_gates实测验证后发现是一次倒退而不是改善——
+    # 把这三项从"参与trend_strength_score加权综合、允许互相补偿"
+    # 直接改成"必须逐项独立满足"，跟T1原有的其他门槛（consol收紧/
+    # close_pos≥0.88/RSI窄区间/ADX≥28/di_cross/vol_decline）叠加后，
+    # 变成十几个条件必须同时全部满足，比这套系统历史上任何一个版本
+    # 都更严苛。实测结果：T1候选数从fix_v1的499骤降到22（比未修复
+    # 的baseline的161还少，样本小到没有统计意义）；T2候选数从972降到
+    # 208，胜率从19.3%骤降到12.5%，跟T4的差距从收窄后的1.7pp反而
+    # 拉大到8.8pp、且置信区间完全不重叠——比最初要解决的T2异例本身
+    # 还要更差。结论：这套系统的tier区分度依赖"加权综合、允许补偿"，
+    # 不是"逐项卡死的硬性AND"，方案B的具体实现方式是错的，已撤回。
+    # calc_trend_strength_score()的跨层可比打分修复（v18.9）保留，
+    # 不受影响——只撤回这三项独立二元门槛。
     trend_result = calc_trend_strength_score(tech, tier)
     tech["trend_strength_score"] = trend_result["trend_strength_score"]
     tech["trend_sub_scores"]     = trend_result["sub_scores"]
