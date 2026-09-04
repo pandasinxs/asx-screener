@@ -827,6 +827,12 @@ def resolve_universe(cfg: BacktestConfig, logger: logging.Logger) -> list[str]:
 # 信号生成层 —— 完整复用 screener.py 的真实筛选/打分逻辑
 # ════════════════════════════════════════════════════════════
 
+# v2.7新增（本轮，性能修复）：SignalGenerator._slice()裁剪point-in-time
+# 切片时用到的固定回溯窗口天数。build_tech_summary()内部最长的回溯
+# 窗口是252天（52周高低点/price_pct_1y分位数），这里留48天余量，
+# 详见_slice()的完整说明。
+SIGNAL_SCAN_MAX_LOOKBACK_DAYS = 300
+
 class SignalGenerator:
     """
     严格复刻 screener.select_top3() 的核心逻辑（去掉Gemini/Telegram/GitHub/
@@ -851,10 +857,81 @@ class SignalGenerator:
         self.cfg = cfg
         self.logger = logger
         self._shares_cache: dict[str, float] = {}
+        # v2.7新增（本轮，性能排查）：统计本次进程实际发起了多少次
+        # 流通股数网络请求、总共花了多少秒——不是靠猜，下次运行结束
+        # 直接从summary里看到真实数字，用来验证"这是不是8小时里的
+        # 主要耗时来源"这个假设，而不是继续凭代码阅读推测。
+        self._shares_new_fetch_count = 0
+        self._shares_new_fetch_seconds = 0.0
+        self._load_shares_cache_from_db()
+
+    def _load_shares_cache_from_db(self) -> None:
+        """
+        v2.7新增（本轮，性能修复）：流通股数缓存跨进程持久化。
+
+        根因（本轮排查backtest_engine.py为什么全市场要跑8小时时发现）：
+        _get_shares_outstanding()里的yf.Ticker(ticker).info是一条真实
+        的网络请求——这是v2.5"消除运行期网络请求"那轮清理漏掉的一条。
+        v2.5的改动范围是DataLayer（OHLCV日线/60分钟/15分钟的下载），
+        没有覆盖到SignalGenerator这条完全独立的流通股数查询路径。
+
+        这条请求本身缓存在self._shares_cache里，但那只是进程内存，
+        每次重新运行backtest_engine.py（哪怕只是换个param_set、
+        universe完全一样），只要一只股票第一次在raw_top10里出现，
+        就要重新发一次网络请求——yfinance的.info接口本身偏慢（不是
+        专门优化过的价格接口），遇到限流时单次请求可能要好几秒，
+        外加最多3次重试、每次重试之间sleep 2/4/6秒的退避，一只股票
+        运气不好可能要花十几秒。全市场跑下来，只要有几百只股票在
+        某一天进过Top10候选池，这条路径累积起来可能是个不小的数字，
+        但目前手头没有VM上的真实profiling数据，无法确定具体占比，
+        这也是本次同时加上_shares_new_fetch_count/_seconds统计的原因
+        ——不确定的地方不装作确定，让下次运行自己说话。
+
+        股数这个量变化极其缓慢（正常情况下只有配股/回购/拆股才会变），
+        跨运行持久化完全合理，不像OHLCV价格那样需要point-in-time
+        精确性（回测本来就已经在用"当前股数×历史当日价格"这个近似，
+        不追求历史股数的精确复原，见_get_shares_outstanding()原有
+        文档说明）。存进跟其他回测结果同一个backtest_results.db里，
+        跟experiment_metadata表是同样的持久化模式，不引入新的存储
+        依赖。
+        """
+        try:
+            conn = sqlite3.connect(self.cfg.db_path)
+            conn.execute(SHARES_CACHE_SCHEMA_SQL)
+            rows = conn.execute("SELECT ticker, shares FROM shares_outstanding_cache").fetchall()
+            conn.close()
+            self._shares_cache = {t: s for t, s in rows}
+            if self._shares_cache:
+                self.logger.info(
+                    f"流通股数缓存已从本地加载: {len(self._shares_cache)} 只，"
+                    f"本次运行只需为新出现的股票发起网络请求"
+                )
+        except Exception as e:
+            self.logger.warning(
+                f"流通股数缓存加载失败（不影响运行，只是本次会重新联网获取全部股数）: {e}"
+            )
+
+    def _persist_shares_to_db(self, ticker: str, shares: float) -> None:
+        """把新获取到的股数立即落盘，即使这次运行中途崩溃/被--max-minutes
+        打断，已经成功查过的股票下次也不用重新联网。"""
+        try:
+            conn = sqlite3.connect(self.cfg.db_path)
+            conn.execute(SHARES_CACHE_SCHEMA_SQL)
+            conn.execute(
+                "INSERT OR REPLACE INTO shares_outstanding_cache "
+                "(ticker, shares, fetched_at) VALUES (?, ?, ?)",
+                (ticker, shares, datetime.now().isoformat()),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            self.logger.debug(f"流通股数缓存写入失败 [{ticker}]（不影响本次运行继续）: {e}")
 
     def _get_shares_outstanding(self, ticker: str) -> float:
         """
-        当前流通股数（缓存，整个回测期间只查一次）。
+        当前流通股数（跨运行持久化缓存，见_load_shares_cache_from_db()；
+        真正发起网络请求只会在这只股票从未被任何一次历史运行查过时
+        才会触发）。
 
         市值历史代理的改进：不用"当前总市值"直接套用到历史每一天
         （那样会把股价上涨/下跌的全部影响错误地摊到历史市值上），
@@ -868,6 +945,7 @@ class SignalGenerator:
         if ticker in self._shares_cache:
             return self._shares_cache[ticker]
 
+        fetch_start = time.time()
         shares = 0.0
         for attempt in range(1, 4):
             try:
@@ -879,11 +957,14 @@ class SignalGenerator:
             except Exception as e:
                 self.logger.debug(f"股数获取失败 [{ticker}] attempt={attempt}/3: {e}")
             time.sleep(2 * attempt)
+        self._shares_new_fetch_count += 1
+        self._shares_new_fetch_seconds += time.time() - fetch_start
 
         if shares <= 0:
             self.logger.warning(f"{ticker}: 3次重试后股数仍为0/获取失败，"
                                  f"该股票本次运行将无法通过市值门槛")
         self._shares_cache[ticker] = shares
+        self._persist_shares_to_db(ticker, shares)
         return shares
 
     def _market_cap_proxy(self, ticker: str, price_at_date: float) -> float:
@@ -1024,7 +1105,59 @@ class SignalGenerator:
 
     @staticmethod
     def _slice(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
-        return df[df.index <= as_of]
+        """
+        v2.7改动（本轮，性能修复——本次排查backtest_engine.py为什么
+        全市场要跑8小时找到的第二个问题，第一个是_get_shares_outstanding()
+        的网络请求，见该函数注释）：
+
+        原实现 `df[df.index <= as_of]` 有两层浪费，且随着回测往后跑
+        （point-in-time切片从约250天warmup一路涨到700-900+天）越跑
+        越明显：
+
+        1) 布尔掩码本身是O(n)：每次调用都要扫描df的全部长度——df就是
+           history[ticker]，也就是这只股票被本地缓存覆盖的全部历史，
+           2年多缓存下来大概700-900行，不管as_of落在哪里，每次都要
+           把这700-900行的index全部比较一遍。
+
+        2) 更关键的：build_tech_summary()内部最长的回溯窗口是252天
+           （52周高低点/price_pct_1y分位数），MA200次之，但原实现把
+           point-in-time切片整个传进去——回测越往后跑，这个切片越长
+           （从约250天涨到700-900+天），build_tech_summary()/calc_adx()
+           内部十来个rolling()操作，每一个都要在这个越来越长的数组上
+           重新算一遍，只为了取最后一个值。252天之前的数据对任何一个
+           指标的"当前值"都没有贡献，这部分重复计算纯粹是浪费，而且
+           是逐日累积的浪费——回测跑到后半段，每只股票每天的计算量
+           比刚开始时明显更大。
+
+        修复：
+        - 用df.index.searchsorted(as_of, side="right")做二分查找定位
+          位置（前提：df.index是从旧到新排序的DatetimeIndex，
+          market_data_cache.py的输出本来就是这样），开销是O(log n)
+          而不是O(n)。
+        - 定位到位置后只往前取最近SIGNAL_SCAN_MAX_LOOKBACK_DAYS天
+          （默认300，比252天最长窗口留了48天余量，保证
+          ma50.iloc[-20:]这类"二次切片"在窗口末尾依然有完整数据）。
+          数值结果与不设上限完全一致（因为原本也没有任何指标用到
+          252天以前的数据），纯粹是减少重复计算量，回测全程每天每
+          只股票的计算量基本恒定，不再随时间推进而越跑越慢。
+        - 安全网：如果这只股票的本地缓存index不是严格升序（不应该
+          发生，market_data_cache.py按理说输出的都是排好序的时间
+          序列，但searchsorted在乱序index上会静默给出错误结果而不是
+          报错，属于"错得不吭声"的风险），就退回原来的布尔掩码方式，
+          用一点点性能换正确性兜底。pandas会缓存is_monotonic_increasing
+          的判断结果在Index对象上，同一只股票在整个回测期间index对象
+          不变，这个检查实际上只会真正计算一次，之后都是O(1)读缓存，
+          不会抵消上面的性能收益。
+        """
+        if df.index.is_monotonic_increasing:
+            pos = df.index.searchsorted(as_of, side="right")
+            start = max(0, pos - SIGNAL_SCAN_MAX_LOOKBACK_DAYS)
+            return df.iloc[start:pos]
+
+        sliced = df[df.index <= as_of]
+        if len(sliced) > SIGNAL_SCAN_MAX_LOOKBACK_DAYS:
+            sliced = sliced.iloc[-SIGNAL_SCAN_MAX_LOOKBACK_DAYS:]
+        return sliced
 
 
 # ════════════════════════════════════════════════════════════
@@ -1814,6 +1947,16 @@ CREATE TABLE IF NOT EXISTS backtest_breakout_memory (
 )
 """
 
+# v2.7新增（本轮，性能修复）：流通股数跨运行持久化缓存，
+# 见SignalGenerator._load_shares_cache_from_db()的详细说明。
+SHARES_CACHE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS shares_outstanding_cache (
+    ticker      TEXT PRIMARY KEY,
+    shares      REAL NOT NULL,
+    fetched_at  TEXT
+)
+"""
+
 
 class BacktestEngine:
     def __init__(self, cfg: BacktestConfig):
@@ -2319,12 +2462,22 @@ class BacktestEngine:
         status_line = "🛑 因熔断提前停止" if circuit_broken else (
             "✅ 全部完成，可以看统计报告了" if left <= 0 else "⏸ 已按时间预算暂停"
         )
+        # v2.7新增（本轮，性能排查）：把本次运行实际发起了多少次流通
+        # 股数网络请求、总共花了多少秒直接打进summary——这是验证
+        # "网络请求是不是8小时里的主要耗时来源"这个假设最直接的证据，
+        # 不需要额外profiling工具，下次运行结束一眼就能看到真实数字。
+        shares_stat_line = (
+            f"流通股数网络请求: 本次新查{self.sig_gen._shares_new_fetch_count}只，"
+            f"共耗时{self.sig_gen._shares_new_fetch_seconds:.1f}秒"
+            f"（已缓存到本地db，下次同一只股票不会重复请求）"
+        )
         summary = (
             f"{status_line} [参数集: {self.cfg.param_set}]\n"
             f"本次新处理: {processed_count}天\n"
             f"写入候选记录: {total_written}条（其中Top3精选信号{total_selected}笔）\n"
             f"累计总进度: {total_done}/{len(trading_days)}天"
             + (f"，剩余{left}天，下次用相同参数重跑会自动续上" if left > 0 else "")
+            + f"\n{shares_stat_line}"
         )
         self.logger.info("=== " + summary.replace("\n", " | ") + " ===")
         return summary
