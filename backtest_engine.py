@@ -3245,16 +3245,29 @@ class StatsReporter:
 # 结果推Telegram，全程不需要SSH进去手动敲命令
 # ════════════════════════════════════════════════════════════
 
-def run_queue(queue_path: str, max_minutes: Optional[float], logger: logging.Logger) -> None:
+def run_queue(queue_path: str, max_minutes: Optional[float], logger: logging.Logger,
+              start_date: Optional[str] = None, end_date: Optional[str] = None) -> None:
     """
     读一个纯文本队列文件，依次跑里面的实验。
 
     队列文件格式（逗号分隔，#开头的行和空行忽略）：
         param_set_name,params_file,universe[,universe_file]
 
-    统一用标准测试窗口（今天倒推700天），不再支持每行单独指定
-    start_date/end_date——所有实验必须用同一个测试窗口，只有参数
-    在变，这样排行榜上的胜率对比才有意义。
+    v2.8改动（本轮，配合样本外验证纪律修复）：新增start_date/end_date
+    参数，从main()的--start/--end透传进来，统一应用到队列里的**每一个**
+    实验。修复前，run_queue()内部固定调用
+    `resolve_standard_window(cfg, logger, explicitly_overridden=False)`，
+    main()处理--run-queue分支时也完全没有把args.start/args.end传进来
+    ——也就是说，就算在命令行上加了--end，队列里的实验依然会用"本地
+    缓存有多少用多少"，--end形同虚设，会悄悄把holdout窗口也吃进去。
+    这是一个真实的疏漏，不是设计如此：队列机制存在的目的就是"反复改
+    参数、批量对比"，而Vincent的实际工作流现在需要"批量对比，但全部
+    限定在样本内数据"这个组合，缺了这一环就没法安全地用--run-queue
+    做样本内的批量实验。
+
+    修复后：--end/--start对队列里每一个实验都生效，含义跟单次运行
+    时完全一致——"在本地缓存基础上再做一次人工裁剪"，不影响
+    --run-queue本来的断点续跑/熔断/参数重置这些机制。
 
     params_file留空表示用screener.py当前默认值(baseline)。
     params_file写相对路径时，相对的是队列文件所在目录（方便你把
@@ -3266,7 +3279,8 @@ def run_queue(queue_path: str, max_minutes: Optional[float], logger: logging.Log
       2. VM这边crontab定时跑：
              cd ~/asx-backtest-configs && git pull
              cd ~/asx && python3 backtest_engine.py \\
-                 --run-queue ~/asx-backtest-configs/queue.txt --max-minutes 700
+                 --run-queue ~/asx-backtest-configs/queue.txt \\
+                 --end 2026-05-31 --max-minutes 700
       3. 每个实验跑完（或者达到整体时间预算）都会推一条Telegram，
          内容就是这个实验的完整统计报告
       4. 全程不需要SSH进VM手动敲命令，只需要设置好这一条crontab
@@ -3281,6 +3295,13 @@ def run_queue(queue_path: str, max_minutes: Optional[float], logger: logging.Log
         if TELEGRAM_TOKEN:
             send_telegram(f"🔴 队列文件不存在: {queue_path}", logger)
         return
+
+    if start_date or end_date:
+        logger.info(
+            f"⚠️ --run-queue已指定裁剪窗口：{start_date or '(不限下限)'}~"
+            f"{end_date or '(不限上限)'}，队列里全部实验统一应用这个裁剪"
+            f"（在本地缓存基础上的人工裁剪，不触发任何网络请求）"
+        )
 
     queue_dir = os.path.dirname(os.path.abspath(queue_path))
     entries = []
@@ -3328,8 +3349,9 @@ def run_queue(queue_path: str, max_minutes: Optional[float], logger: logging.Log
 
         cfg = BacktestConfig(
             universe_source=entry["universe"], universe_file=entry["universe_file"],
+            start_date=start_date, end_date=end_date,
         )
-        resolve_standard_window(cfg, logger, explicitly_overridden=False)
+        resolve_standard_window(cfg, logger, explicitly_overridden=bool(start_date or end_date))
 
         overrides = {}
         if entry["params_file"]:
@@ -3482,7 +3504,8 @@ def main():
             return
 
         if args.run_queue:
-            run_queue(args.run_queue, args.max_minutes, logger)
+            run_queue(args.run_queue, args.max_minutes, logger,
+                      start_date=args.start, end_date=args.end)
             return
 
         # 参数覆盖必须在任何BacktestEngine/SignalGenerator/OutcomeSimulator/
