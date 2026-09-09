@@ -71,7 +71,7 @@
       "near_52w_hi": false
     }
   },
-  "BT_STOP_ATR_MULT": 2,
+  "BT_STOP_ATR_MULT": 2.5,
   "BT_TARGET_ATR_MULT": 4,
   "BT_TIMEOUT_DAYS": 20,
   "DAILY_HEALTH": {
