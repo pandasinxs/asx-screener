@@ -2599,7 +2599,7 @@ D. Do not explain your process—output only the final version of the copy.
 
     instruction = instructions.get(platform, instructions["twitter"])
 
-    return f"""请先仔细阅读我现在发的全部输入内容，深度消化输出任务的要求，再直接给出最终回复。如果有疑问，请自己解决，我不会再给出更多解释。以下是具体prompt。
+    return f"""请先完整阅读我现在发的全部输入内容，深度消化"输出任务"里面的要求，特别是其中"先回测再输出"的要求更是重中之重。最后直接给出最终回复。如果有疑问，自行查找prompt里面的要求来解决，我不会再给出更多解释。以下是具体prompt。
     
     Prompt — {platform.upper()} — {market_snap.get('date','')}
 
@@ -2612,8 +2612,8 @@ D. Do not explain your process—output only the final version of the copy.
 {stocks_block}
 
 === 补全TOP 3 数据包 ===
-根据上述3只精选股票，搜索他们各自的公司背景，行业背景，近期新闻。
-尽可能全面地掌握你做分析需要的相关资料。
+根据上述3只精选股票，搜索他们各自的公司背景，行业背景，近期新闻等。尽可能全面地掌握你做分析所需要的相关资料。
+这些搜索结果是补充和辅助，用来配合全部的数据包，按照下面的输出任务来给出分析和文案。
 
 === 输出任务 ===
 {instruction}
