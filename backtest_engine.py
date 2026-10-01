@@ -2,7 +2,7 @@
 """
 backtest_engine.py
 ====================
-ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.5：纯本地缓存，消除运行期网络请求）
+ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.10：净收益报告 + 排行榜改版）
 
 核心设计:
     本脚本不重新实现打分逻辑，而是直接 `import screener`，复用其中的
@@ -12,6 +12,38 @@ ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.5：纯本地�
 
     这意味着回测用的止盈止损/超时规则和你线上 signals_history 表完全一致，
     两者理论上可以合并统计（本脚本提供 --merge-live 选项做这件事）。
+
+v2.10改动（本轮，排行榜改版——让参数实验的比较不再被胜率排序误导）：
+    StatsReporter.leaderboard()重写，原来按Top3胜率排序的版本被取代：
+      - 按Top3「净均值」排序（净=扣除v2.9交易成本后；Top3是生产实际在用的池子）
+      - Top3与全量候选两个池子并列：n、净均值、按signal_date聚类bootstrap的
+        90% CI、净PF；全量候选池另给LOSS/TIMEOUT/WIN占比与平均持仓天数，
+        Top3池保留原WIN标签胜率（只展示，不用于排序）
+      - --baseline [名字]：输出每个实验相对基线的净均值差(实验-基线)+90% CI。
+        用"按signal_date整日重抽样的均值之差"，不要求两边是同一批信号，
+        所以对只改出场的实验(止损止盈)和改选股的实验(TIER_BONUS/门槛)都适用；
+        同时给出信号重合比例，接近100%=只改了出场，明显更低=改变了选股
+      - 覆盖范围含HOLDOUT_START_DATE(2026-06-01)及以后数据的行标⚠️，
+        提醒该实验不应再作为调参依据
+      - 页脚给出已测试参数集个数与多重比较提醒
+      - --leaderboard --export-csv：导出完整精度的排行榜CSV(并推送Telegram)，
+        供直接读表，避免手抄数字出错
+    注意：这是对旧leaderboard()的替换，不是追加。旧版的WIN标签胜率排序已移除。
+
+v2.9改动（净收益报告标准化）：
+    StatsReporter.report()新增「扣除交易成本后」段落，每次--stats-only/
+    --run-queue自动输出，不再需要手写一次性脚本。目标是给不同参数实验一个
+    公平、一致的成本调整基准，不是模拟真实仓位/执行（止盈止损在真实交易里
+    只是指导位，由人工判断）。
+      - 固定名义仓位（cfg.net_cost_notional_aud，默认8000澳元，--notional可改），
+        不用ATR反推仓位，避免仓位大小随止损倍数变化污染跨实验比较
+      - 佣金 = max(commission_pct×成交额, commission_min_aud)，买卖各一次
+      - slippage_bps为「单边」滑点（买入价上浮、卖出价下压），往返合计2倍
+        （--slippage-bps可改）。这三个cfg字段此前有定义但从未被读取过
+      - 输出：净平均单笔收益（含按signal_date聚类bootstrap的90% CI）、净PF、
+        净累计/净最大回撤（与毛口径同一累加顺序）、净收益>0占比、
+        成本敏感性（多档滑点）、盈亏平衡滑点
+      - 原有WIN/LOSS/TIMEOUT标签胜率完全不动（口径不变，跟历史实验可比）
 
 v2.5改动（本轮，性能修复——回测运行期彻底消除网络请求）：
     根因诊断（详见对话里贴出的backtest.log分析）：v2.4及之前的标准
@@ -558,6 +590,12 @@ class BacktestConfig:
     commission_pct: float = 0.0011
     commission_min_aud: float = 7.0
     slippage_bps: float = 5.0
+    # v2.9新增：净收益报告（StatsReporter._emit_net_cost_section）与排行榜
+    # （StatsReporter.leaderboard）用的固定名义仓位。上面三个成本字段此前有定义
+    # 但从未被任何代码读取，v2.9起正式被使用。
+    # 口径：佣金=max(commission_pct×成交额, commission_min_aud)，买卖各收一次；
+    # slippage_bps是「单边」滑点（买入价上浮、卖出价下压各bps个基点），往返=2倍。
+    net_cost_notional_aud: float = 8000.0
 
     # 稳定性：连续多少个交易日算信号失败就熔断停止（避免系统性bug时空跑一整晚）
     max_consecutive_errors: int = 5
@@ -2790,6 +2828,119 @@ def show_param_set(db_path: str, param_set: str) -> None:
 # 统计报告层
 # ════════════════════════════════════════════════════════════
 
+# v2.10新增：项目约定的样本外(holdout)起始日——signal_date在这天及之后的数据
+# 只留给"参数真正锁定"时做一次性最终检验。排行榜用它标记哪些实验的覆盖范围
+# 已经碰到了holdout。如果以后holdout窗口的约定变了，只需要改这一个常量。
+HOLDOUT_START_DATE = "2026-06-01"
+
+
+def compute_trade_costs(gross_pct, notional: float, comm_rate: float,
+                        comm_min: float, slip_bps_per_side: float) -> np.ndarray:
+    """
+    v2.9新增：逐笔往返交易成本，单位=占名义仓位的百分比（0.32代表0.32%）。
+
+    买入：成交额=notional；卖出：成交额=notional×(1+毛收益率)。
+    每边佣金=max(comm_rate×成交额, comm_min)；单边滑点=成交额×bps/1e4，
+    买卖各一次。毛收益为负时卖出成交额更小，成本随之略低，这是真实行为。
+    """
+    g = np.asarray(gross_pct, dtype=float) / 100.0
+    exit_val = notional * (1.0 + g)
+    fee_in = max(comm_rate * notional, comm_min)
+    fee_out = np.maximum(comm_rate * exit_val, comm_min)
+    slip = slip_bps_per_side / 1e4 * (notional + exit_val)
+    return (fee_in + fee_out + slip) / notional * 100.0
+
+
+def cluster_bootstrap_mean_ci(values, cluster_keys, n_iter: int = 2000,
+                              seed: int = 42, lo: float = 5.0, hi: float = 95.0):
+    """
+    v2.9新增：按cluster_keys（这里传signal_date）整簇重抽样的均值置信区间。
+    同一天的多笔信号共享同一天的市场环境，不是独立样本，逐笔iid bootstrap
+    会把区间算得过窄。注意：这只处理了"同日相关"，相邻交易日的重叠持仓
+    （最长20天）和同一只股票的重复入选仍未处理，所以区间依然偏乐观。
+    簇数<2时返回None。
+    """
+    s = pd.Series(np.asarray(values, dtype=float)).groupby(np.asarray(cluster_keys)).agg(["sum", "count"])
+    sums = s["sum"].to_numpy(dtype=float)
+    counts = s["count"].to_numpy(dtype=float)
+    n = len(sums)
+    if n < 2:
+        return None
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n, size=(n_iter, n))
+    means = sums[idx].sum(axis=1) / counts[idx].sum(axis=1)
+    return float(np.percentile(means, lo)), float(np.percentile(means, hi))
+
+
+def cluster_bootstrap_diff_ci(values_a, keys_a, values_b, keys_b, n_iter: int = 2000,
+                              seed: int = 42, lo: float = 5.0, hi: float = 95.0):
+    """
+    v2.10新增：两组交易「均值之差(b-a)」的按日期聚类bootstrap置信区间。
+
+    做法：把a、b两组都按日期(keys)汇总成"当日收益合计/当日笔数"，在两组日期的
+    并集上整日重抽样，每次重抽样都同时重算两组的均值再相减。同一天在a、b里
+    共享同一次抽样，所以两组共有的日期效应会互相抵消——这就是"配对"的来源。
+    不要求两组是同一批信号：只改出场(止损止盈)的实验两边信号几乎一样，抵消
+    得很彻底；改选股(TIER_BONUS/门槛)的实验两边信号不同，也依然有效，只是
+    抵消得少一些、区间会更宽。某组在某天没有交易时，该天对那一组计0笔。
+    返回(点估计, 下界, 上界)；任一组为空或日期簇<2返回None。
+    同样只处理了同日相关，相邻日重叠持仓未处理，区间依然偏乐观。
+    """
+    va = np.asarray(values_a, dtype=float)
+    vb = np.asarray(values_b, dtype=float)
+    if len(va) == 0 or len(vb) == 0:
+        return None
+    sa = pd.Series(va).groupby(np.asarray(keys_a).astype(str)).agg(["sum", "count"])
+    sb = pd.Series(vb).groupby(np.asarray(keys_b).astype(str)).agg(["sum", "count"])
+    union = sa.index.union(sb.index)
+    sa = sa.reindex(union, fill_value=0)
+    sb = sb.reindex(union, fill_value=0)
+    sum_a, cnt_a = sa["sum"].to_numpy(dtype=float), sa["count"].to_numpy(dtype=float)
+    sum_b, cnt_b = sb["sum"].to_numpy(dtype=float), sb["count"].to_numpy(dtype=float)
+    n = len(union)
+    if n < 2 or cnt_a.sum() == 0 or cnt_b.sum() == 0:
+        return None
+    point = float(sum_b.sum() / cnt_b.sum() - sum_a.sum() / cnt_a.sum())
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n, size=(n_iter, n))
+    ca = cnt_a[idx].sum(axis=1)
+    cb = cnt_b[idx].sum(axis=1)
+    ok = (ca > 0) & (cb > 0)
+    if not ok.any():
+        return None
+    diffs = (sum_b[idx].sum(axis=1)[ok] / cb[ok]) - (sum_a[idx].sum(axis=1)[ok] / ca[ok])
+    return point, float(np.percentile(diffs, lo)), float(np.percentile(diffs, hi))
+
+
+def summarize_pool_for_leaderboard(sub: pd.DataFrame) -> dict:
+    """
+    v2.10新增：排行榜里单个实验、单个池子(Top3或全量候选)的汇总指标。
+    sub需要有列：gross(毛收益%)、net(净收益%)、signal_date、outcome、holding_days。
+    空池子返回n=0、其余为NaN。
+    """
+    nan = float("nan")
+    out = {"n": int(len(sub)), "gross_mean": nan, "net_mean": nan, "ci_lo": nan,
+           "ci_hi": nan, "net_pf": nan, "win_rate": nan, "loss_share": nan,
+           "timeout_share": nan, "avg_hold": nan}
+    if len(sub) == 0:
+        return out
+    net = sub["net"].to_numpy(dtype=float)
+    gross = sub["gross"].to_numpy(dtype=float)
+    gp = float(net[net > 0].sum())
+    gl = float(-net[net < 0].sum())
+    out["gross_mean"] = float(gross.mean())
+    out["net_mean"] = float(net.mean())
+    out["net_pf"] = gp / gl if gl > 0 else float("inf")
+    out["win_rate"] = float((sub["outcome"] == "WIN").mean())
+    out["loss_share"] = float((sub["outcome"] == "LOSS").mean())
+    out["timeout_share"] = float((sub["outcome"] == "TIMEOUT").mean())
+    out["avg_hold"] = float(pd.to_numeric(sub["holding_days"], errors="coerce").mean())
+    ci = cluster_bootstrap_mean_ci(net, sub["signal_date"].astype(str).to_numpy())
+    if ci is not None:
+        out["ci_lo"], out["ci_hi"] = ci
+    return out
+
+
 class StatsReporter:
     def __init__(self, cfg: BacktestConfig, logger: logging.Logger):
         self.cfg = cfg
@@ -2866,10 +3017,21 @@ class StatsReporter:
         if push_telegram:
             send_telegram("\n".join(buffer), self.logger)
 
-    def leaderboard(self, push_telegram: bool = False):
+    def leaderboard(self, push_telegram: bool = False, baseline: Optional[str] = None,
+                    export_csv: Optional[str] = None):
         """
-        一次性列出db里所有跑过的参数集实验，按胜率排序——
-        这是支撑"反复改参数、每次都想知道谁更好"这个工作流的核心视图。
+        v2.10改版（取代原来按Top3胜率排序的版本）：列出db里所有跑过的参数集实验，
+        按Top3「净均值」排序——净=扣除v2.9交易成本后。
+
+        为什么不再按胜率排序：WIN标签胜率会随止盈距离机械变化（止盈越近胜率越高，
+        跟信号质量无关），按它排序会得出反向结论。为什么只看净均值也不够：
+        Top3池子只有~1300笔，净均值的90% CI半宽约±0.5%，两个实验的点估计差
+        常常小于这个噪音，所以每个池子都带CI，并提供--baseline配对差值。
+
+        每个实验输出Top3与全量候选两个池子（全量候选是Top3的超集、样本更大，
+        用来做稳定性检查：两个池子排名分歧大时，榜首结论要打折扣）。
+        baseline：基线参数集名，给出每个实验相对基线的净均值差+90% CI。
+        export_csv：导出完整精度的排行榜CSV（同时推送Telegram），供直接读表。
         """
         buffer: list[str] = []
 
@@ -2877,66 +3039,185 @@ class StatsReporter:
             print(text)
             buffer.append(text)
 
-        if not os.path.exists(self.cfg.db_path):
-            emit("回测数据库还不存在，先跑一次backtest_engine.py")
+        def push_all() -> None:
             if push_telegram:
                 send_telegram("\n".join(buffer), self.logger)
+
+        def sg(v, spec: str = "+.2f", suffix: str = "%") -> str:
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return "n/a"
+            return format(v, spec) + suffix
+
+        if not os.path.exists(self.cfg.db_path):
+            emit("回测数据库还不存在，先跑一次backtest_engine.py")
+            push_all()
             return
         conn = sqlite3.connect(self.cfg.db_path)
         conn.execute(EXPERIMENT_METADATA_SCHEMA_SQL)  # 确保表存在，旧db也不会查询报错
         try:
-            df = pd.read_sql_query("""
-                SELECT t.param_set,
-                       COUNT(*) AS n,
-                       SUM(CASE WHEN t.outcome='WIN' THEN 1 ELSE 0 END) AS wins,
-                       AVG(t.outcome_pct) AS avg_pct,
-                       MIN(t.signal_date) AS date_from,
-                       MAX(t.signal_date) AS date_to,
-                       MAX(m.git_commit) AS git_commit
-                FROM signals_history_backtest t
-                LEFT JOIN experiment_metadata m ON t.param_set = m.param_set
-                WHERE t.outcome != 'PENDING' AND t.is_selected = 1
-                GROUP BY t.param_set
-                ORDER BY (wins * 1.0 / n) DESC
-            """, conn)
+            raw = pd.read_sql_query(
+                "SELECT param_set, ticker, signal_date, is_selected, outcome, "
+                "outcome_pct, holding_days FROM signals_history_backtest "
+                "WHERE outcome != 'PENDING' AND outcome_pct IS NOT NULL", conn)
+            meta = pd.read_sql_query("SELECT param_set, git_commit FROM experiment_metadata", conn)
         except Exception as e:
             emit(f"排行榜查询失败（可能是旧表结构还没跑过新参数系统）: {e}")
             conn.close()
-            if push_telegram:
-                send_telegram("\n".join(buffer), self.logger)
+            push_all()
             return
         conn.close()
 
-        if df.empty:
+        if raw.empty:
             emit("暂无已完成的实验记录（outcome全是PENDING，或者还没跑过任何数据）")
-            if push_telegram:
-                send_telegram("\n".join(buffer), self.logger)
+            push_all()
             return
 
+        notional = float(self.cfg.net_cost_notional_aud)
+        rate = float(self.cfg.commission_pct)
+        fee_min = float(self.cfg.commission_min_aud)
+        slip = float(self.cfg.slippage_bps)
+
+        raw["gross"] = raw["outcome_pct"].astype(float)
+        raw["net"] = raw["gross"] - compute_trade_costs(raw["gross"].to_numpy(), notional, rate, fee_min, slip)
+        raw["signal_date"] = raw["signal_date"].astype(str)
+        commit_map = dict(zip(meta["param_set"], meta["git_commit"]))
+
+        pools: dict = {}
+        for ps, g in raw.groupby("param_set"):
+            pools[ps] = {"top3": g[g["is_selected"] == 1], "all": g}
+
+        if baseline and baseline not in pools:
+            emit(f"⚠️ 找不到基线参数集 {baseline}，本次不输出配对差值。已有参数集: "
+                 + ", ".join(sorted(pools)))
+            baseline = None
+
+        rows: list[dict] = []
+        for ps, p in pools.items():
+            st_top = summarize_pool_for_leaderboard(p["top3"])
+            st_all = summarize_pool_for_leaderboard(p["all"])
+            d_from = str(p["all"]["signal_date"].min())
+            d_to = str(p["all"]["signal_date"].max())
+            row: dict = {
+                "param_set": ps, "date_from": d_from, "date_to": d_to,
+                "includes_holdout": bool(d_to >= HOLDOUT_START_DATE),
+                "git_commit": commit_map.get(ps, "") or "",
+            }
+            for k, v in st_top.items():
+                row["top3_" + k] = v
+            for k, v in st_all.items():
+                row["all_" + k] = v
+            if baseline is not None and ps != baseline:
+                for name in ("top3", "all"):
+                    a = pools[baseline][name]
+                    b = p[name]
+                    res = cluster_bootstrap_diff_ci(
+                        a["net"].to_numpy(), a["signal_date"].to_numpy(),
+                        b["net"].to_numpy(), b["signal_date"].to_numpy())
+                    nan = float("nan")
+                    row[name + "_delta"] = res[0] if res else nan
+                    row[name + "_delta_lo"] = res[1] if res else nan
+                    row[name + "_delta_hi"] = res[2] if res else nan
+                    keys_a = set(zip(a["ticker"], a["signal_date"]))
+                    keys_b = list(zip(b["ticker"], b["signal_date"]))
+                    row[name + "_overlap"] = (sum(1 for k in keys_b if k in keys_a) / len(keys_b)
+                                              if keys_b else nan)
+            rows.append(row)
+
+        def sort_key(r: dict):
+            v = r["top3_net_mean"]
+            return (1, 0.0) if np.isnan(v) else (0, -v)
+
+        rows.sort(key=sort_key)
+
+        def pool_line(label: str, r: dict, p: str) -> str:
+            n = int(r[p + "_n"])
+            if n == 0:
+                return f"   {label} 无已结算交易"
+            warn = "(n<30,仅供参考)" if n < 30 else ""
+            return (f"   {label} n{n}{warn} 净{sg(r[p + '_net_mean'])} "
+                    f"[{sg(r[p + '_ci_lo'], '+.2f', '')},{sg(r[p + '_ci_hi'], '+.2f', '')}] "
+                    f"PF{sg(r[p + '_net_pf'], '.2f', '')}")
+
+        def delta_mark(lo: float, hi: float) -> str:
+            if np.isnan(lo) or np.isnan(hi):
+                return ""
+            if lo > 0:
+                return "✅"
+            if hi < 0:
+                return "❌"
+            return "≈"
+
         emit("\n" + "=" * 70)
-        emit("参数实验排行榜（按Top3精选信号胜率排序，只统计有结果的交易）")
+        emit("参数实验排行榜（v2.10：按Top3净均值排序；净=扣除交易成本后）")
+        emit(f"成本假设: 每笔固定A${notional:,.0f} | 佣金{rate:.2%}/边(最低A${fee_min:g}) | "
+             f"滑点{slip:g}bps/边")
         emit("=" * 70)
-        for _, row in df.iterrows():
-            wr = row["wins"] / row["n"] if row["n"] else 0
-            commit_note = f"  commit:{row['git_commit']}" if row.get("git_commit") else ""
-            emit(f"  {row['param_set']:<24s} 样本{int(row['n']):>4d}笔  "
-                 f"胜率{wr:>6.1%}  平均单笔{row['avg_pct']:>+6.2f}%  "
-                 f"覆盖{row['date_from']}~{row['date_to']}{commit_note}")
+        for i, r in enumerate(rows, 1):
+            flags = ""
+            if r["includes_holdout"]:
+                flags += " ⚠️含holdout"
+            if baseline is not None and r["param_set"] == baseline:
+                flags += " (基线)"
+            emit(f"{i}. {r['param_set']}  {r['date_from']}~{r['date_to']}{flags}")
+            top_win = f" WIN{sg(r['top3_win_rate'], '.0%', '')}" if int(r["top3_n"]) > 0 else ""
+            emit(pool_line("Top3", r, "top3") + top_win)
+            if int(r["all_n"]) > 0:
+                extra = (f" | LOSS{sg(r['all_loss_share'], '.0%', '')}"
+                         f" TMO{sg(r['all_timeout_share'], '.0%', '')}"
+                         f" WIN{sg(r['all_win_rate'], '.0%', '')}"
+                         f" 持仓{sg(r['all_avg_hold'], '.1f', '')}天")
+            else:
+                extra = ""
+            emit(pool_line("全量", r, "all") + extra)
+            if baseline is not None and r["param_set"] != baseline:
+                d3 = (f"Top3 {sg(r['top3_delta'])} [{sg(r['top3_delta_lo'], '+.2f', '')},"
+                      f"{sg(r['top3_delta_hi'], '+.2f', '')}]"
+                      f"{delta_mark(r['top3_delta_lo'], r['top3_delta_hi'])}")
+                da = (f"全量 {sg(r['all_delta'])} [{sg(r['all_delta_lo'], '+.2f', '')},"
+                      f"{sg(r['all_delta_hi'], '+.2f', '')}]"
+                      f"{delta_mark(r['all_delta_lo'], r['all_delta_hi'])}")
+                ov = (f"信号重合 Top3 {sg(r['top3_overlap'], '.0%', '')}"
+                      f" 全量 {sg(r['all_overlap'], '.0%', '')}")
+                emit(f"   Δ基线 {d3} | {da} | {ov}")
+
         emit("=" * 70)
-        emit("样本量差距较大的实验之间直接比胜率会有误导性，"
-             "建议同时看样本数，样本差太多的先别下结论")
-        # v2.6修复：原来这里写的是"用 --show-param-set <名字> 可以..."，
-        # 字面尖括号"<名字>"在parse_mode=HTML下会被Telegram当成一个
-        # 未闭合的HTML开始标签解析，导致整条排行榜消息被拒收（400
-        # Bad Request: can't parse entities: Unsupported start tag
-        # "名字"）。这里改成方括号写法，规避尖括号；同时send_telegram()
-        # 本身也已经去掉了parse_mode=HTML（见该函数的v2.6注释），双重
-        # 保险：以后就算这里或别处又不小心写出字面尖括号，也不会再
-        # 触发HTML实体解析报错。
+        emit(f"共{len(rows)}个参数集。已测试的参数集越多，榜首越可能只是运气（多重比较）；"
+             "采纳改动前优先看配对差值CI是否不含0、改动有没有逻辑支撑，最终以holdout为准")
+        emit("CI=按signal_date聚类bootstrap的90%区间，只处理同日相关，相邻日重叠持仓/同票重复"
+             "入选未处理，仍偏乐观；n<30的池子仅供参考")
+        emit(f"⚠️含holdout=该实验覆盖到signal_date>={HOLDOUT_START_DATE}，不应再作为调参依据")
+        if baseline is not None:
+            emit("Δ=实验减基线的净均值差（按日期整日重抽样的均值之差，只改出场与改选股的实验都适用）；"
+                 "✅=CI全为正 ❌=CI全为负 ≈=CI含0；信号重合=该实验的信号有多大比例也出现在基线里"
+                 "（接近100%=只改了出场，明显更低=改变了选股）")
+        else:
+            emit("加 --baseline [名字] 可输出每个实验相对基线的净均值差+CI")
+        # v2.6修复遗留说明：这里一律用方括号占位符，避免字面尖括号（见send_telegram()的v2.6注释）
         emit("用 --show-param-set [名字] 可以查看某个实验当时实际用的完整参数内容")
 
-        if push_telegram:
-            send_telegram("\n".join(buffer), self.logger)
+        if export_csv:
+            try:
+                out_df = pd.DataFrame(rows)
+                out_df.insert(0, "rank_top3_net", range(1, len(out_df) + 1))
+                out_df["baseline"] = baseline or ""
+                out_df["notional_aud"] = notional
+                out_df["commission_pct"] = rate
+                out_df["commission_min_aud"] = fee_min
+                out_df["slippage_bps_per_side"] = slip
+                out_df.to_csv(export_csv, index=False, encoding="utf-8-sig")
+                self.logger.info(f"排行榜CSV已导出: {export_csv}（{len(out_df)}行）")
+                emit(f"\n📄 排行榜CSV已导出: {export_csv}（{len(out_df)}行，完整精度，适合直接读表）")
+                if push_telegram:
+                    send_telegram_document(
+                        export_csv,
+                        caption=f"参数实验排行榜（{len(out_df)}个参数集，净均值排序）",
+                        logger=self.logger,
+                    )
+            except Exception as e:
+                self.logger.error(f"排行榜CSV导出失败: {e}")
+                emit(f"⚠️ 排行榜CSV导出失败: {e}")
+
+        push_all()
 
     def _bootstrap_ci(self, wins: np.ndarray, n_iter: int = 2000) -> tuple[float, float]:
         if len(wins) == 0:
@@ -3117,6 +3398,13 @@ class StatsReporter:
         self._emit(report_text)
         self.logger.info(report_text)
 
+        # v2.9新增：净收益段落（固定名义仓位+佣金+滑点），紧跟毛口径主报告
+        try:
+            self._emit_net_cost_section(combined)
+        except Exception as e:
+            self.logger.warning(f"净收益段落计算失败（不影响其余统计）: {e}")
+            self._emit(f"\n⚠️ 净收益段落计算失败: {e}")
+
         if "outcome" in combined.columns:
             self._emit("\n【按出场原因拆解】WIN=触发止盈 / LOSS=触发止损 / TIMEOUT=到期强平（都没触发）")
             for oc in ["WIN", "LOSS", "TIMEOUT"]:
@@ -3169,6 +3457,85 @@ class StatsReporter:
 
         if push_telegram:
             send_telegram("\n".join(self._buffer), self.logger)
+
+    def _emit_net_cost_section(self, combined: pd.DataFrame) -> None:
+        """
+        v2.9新增：扣除交易成本后的统计段落。
+
+        设计目的（Vincent 2026-10-01澄清）：止盈止损在真实交易里只是指导位，
+        所以这里不模拟真实仓位/执行，只给所有实验一个"公平、一致的成本
+        调整基准"——每笔固定名义仓位，成本占名义仓位的比例对所有实验相同，
+        跨实验比较时成本不会成为混杂因素。
+
+        跨实验比较优先看：净平均单笔收益(+CI)、净PF。WIN标签胜率会随止盈
+        距离机械变化（止盈越近胜率越高，跟信号质量无关），不适合单独排序。
+        """
+        cfg = self.cfg
+        notional = float(cfg.net_cost_notional_aud)
+        rate = float(cfg.commission_pct)
+        fee_min = float(cfg.commission_min_aud)
+        slip = float(cfg.slippage_bps)
+
+        self._emit("\n【扣除交易成本后】（固定名义仓位，用于跨实验公平比较，不是真实仓位模拟）")
+
+        gross_all = combined["outcome_pct"].astype(float).to_numpy()
+        keep = ~np.isnan(gross_all)
+        gross = gross_all[keep]
+        n = len(gross)
+        if n == 0 or notional <= 0:
+            self._emit("  ⚠️ 无有效交易，或名义仓位<=0，跳过")
+            return
+        if "signal_date" in combined.columns:
+            keys = combined["signal_date"].astype(str).to_numpy()[keep]
+        else:
+            keys = np.arange(n)
+
+        def _pf(x: np.ndarray) -> float:
+            gp = float(x[x > 0].sum())
+            gl = float(-x[x < 0].sum())
+            return gp / gl if gl > 0 else float("inf")
+
+        cost = compute_trade_costs(gross, notional, rate, fee_min, slip)
+        net = gross - cost
+        gross_mean, net_mean, cost_mean = float(gross.mean()), float(net.mean()), float(cost.mean())
+        ci = cluster_bootstrap_mean_ci(net, keys)
+        cum_net = np.cumsum(net)
+        net_dd = float((cum_net - np.maximum.accumulate(cum_net)).min())
+        flipped = int(((gross > 0) & (net <= 0)).sum())
+
+        self._emit(f"  假设: 每笔固定A${notional:,.0f} | 佣金{rate:.2%}/边(最低A${fee_min:g}) | "
+                   f"滑点{slip:g}bps/边 → 平均往返成本{cost_mean:.3f}%/笔")
+        if n < 30:
+            self._emit(f"  ⚠️ 样本仅{n}笔(<30)，以下数字方向仅供参考")
+        self._emit(f"  平均单笔收益: 毛{gross_mean:+.3f}% → 净{net_mean:+.3f}%")
+        if ci is not None:
+            self._emit(f"  净均值90% CI: {ci[0]:+.2f}% ~ {ci[1]:+.2f}%（按signal_date聚类bootstrap）")
+        share_txt = f"{cost_mean / gross_mean:.1%}" if gross_mean > 0 else "n/a(毛均值<=0)"
+        self._emit(f"  成本占毛收益: {share_txt} | 毛赚净亏: {flipped}笔({flipped / n:.1%})")
+        self._emit(f"  盈亏比PF: 毛{_pf(gross):.2f} → 净{_pf(net):.2f}")
+        self._emit(f"  累计(等权累加,非复利): 毛{gross.sum():+.2f}% → 净{net.sum():+.2f}% | "
+                   f"净最大回撤: {net_dd:+.2f}%")
+        self._emit(f"  单笔为正占比: 毛{(gross > 0).mean():.1%} → 净{(net > 0).mean():.1%}"
+                   f"（原WIN标签胜率见上方主报告，口径不变）")
+
+        sens = []
+        for sp in sorted({slip, 15.0, 30.0}):
+            nt = gross - compute_trade_costs(gross, notional, rate, fee_min, sp)
+            sens.append(f"{sp:g}bps→净{nt.mean():+.2f}%/PF{_pf(nt):.2f}")
+        self._emit("  成本敏感性(每边滑点): " + " | ".join(sens))
+
+        a = float((gross - compute_trade_costs(gross, notional, rate, fee_min, 0.0)).mean())
+        b = float((gross - compute_trade_costs(gross, notional, rate, fee_min, 10.0)).mean())
+        slope = (b - a) / 10.0  # 净均值对单边滑点bps是严格线性的（佣金不依赖滑点）
+        if a <= 0:
+            self._emit("  盈亏平衡滑点: 即使零滑点，净平均收益也<=0")
+        elif slope < 0:
+            self._emit(f"  盈亏平衡滑点: 每边约{a / -slope:.0f}bps（往返约{2 * a / -slope:.0f}bps，另加佣金）时净平均收益=0")
+
+        self._emit("  → 跨实验比较请看「净均值+CI」和「净PF」；WIN标签胜率会随止盈距离机械变化，"
+                   "不适合单独当排序依据")
+        self._emit("  → 聚类只处理同日相关，相邻日重叠持仓/同票重复入选未处理，CI仍偏窄；"
+                   "5bps/边对小盘股可能偏乐观（未验证），以敏感性一行为准")
 
     def _analyze_score_predictiveness(self, combined: pd.DataFrame, n_buckets: int = 4):
         """
@@ -3432,7 +3799,12 @@ def main():
     parser.add_argument("--export-params", default="",
                         help="导出当前screener.py默认参数为JSON模板到指定路径，导出后直接退出，不跑回测")
     parser.add_argument("--leaderboard", action="store_true",
-                        help="列出db里所有参数集实验的胜率对比排行榜，不跑新回测")
+                        help="列出db里所有参数集实验的对比排行榜（v2.10起按Top3净均值排序，含聚类CI、"
+                             "净PF、全量候选并列；配合--baseline出配对差值，配合--export-csv导出CSV），"
+                             "不跑新回测")
+    parser.add_argument("--baseline", default="",
+                        help="[v2.10] 配合--leaderboard使用：指定基线参数集名，每个实验输出相对它的"
+                             "净均值差值+90% CI（按signal_date聚类bootstrap，Top3与全量候选两个池子）")
     parser.add_argument("--health-status", default="",
                         help="只看某个跨日健康度状态的交易，如 ready/watch/caution/accumulating，"
                              "用来验证daily_analysis.py这层健康度过滤到底有没有增量价值")
@@ -3455,6 +3827,13 @@ def main():
                              "backtest_intraday.py取代的60分钟近似策略，独立研究性质，"
                              "不是intraday_monitor.py的验证。只在你明确想临时复现旧行为、"
                              "或者对比新旧两种方法时才需要打开这个flag。")
+    parser.add_argument("--notional", type=float, default=None,
+                        help="[v2.9] 净收益报告/排行榜用的固定名义仓位（澳元），默认8000。"
+                             "名义仓位高于约6364澳元（最低佣金7÷费率0.0011）时佣金按比例收取，"
+                             "净收益率基本不随它变化；只在低于这个值时最低佣金才开始起作用")
+    parser.add_argument("--slippage-bps", type=float, default=None,
+                        help="[v2.9] 净收益报告/排行榜的单边滑点假设（基点），默认5，买入和卖出各算一次"
+                             "（往返=2倍）。注意--run-queue路径不读这个flag，队列里的实验用默认值")
     args = parser.parse_args()
 
     cfg = BacktestConfig(
@@ -3467,6 +3846,10 @@ def main():
     logger = setup_logging(cfg.log_path)
 
     resolve_standard_window(cfg, logger, explicitly_overridden=bool(args.start or args.end))
+    if args.notional is not None:
+        cfg.net_cost_notional_aud = args.notional
+    if args.slippage_bps is not None:
+        cfg.slippage_bps = args.slippage_bps
 
     # v2.5备注：这个校验原本是为了防止"--start早于60分钟线可用窗口"时
     # 现场触发一次注定失败的网络请求。现在DataLayer.fetch_60m_cached_only()
@@ -3500,7 +3883,11 @@ def main():
             return
 
         if args.leaderboard:
-            StatsReporter(cfg, logger).leaderboard(push_telegram=cfg.push_telegram)
+            StatsReporter(cfg, logger).leaderboard(
+                push_telegram=cfg.push_telegram,
+                baseline=args.baseline or None,
+                export_csv=args.export_csv or None,
+            )
             return
 
         if args.run_queue:
