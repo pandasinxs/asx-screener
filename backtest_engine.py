@@ -2,7 +2,7 @@
 """
 backtest_engine.py
 ====================
-ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.10：净收益报告 + 排行榜改版）
+ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.11：净收益报告 + 排行榜改版 + 差值限制到共同窗口）
 
 核心设计:
     本脚本不重新实现打分逻辑，而是直接 `import screener`，复用其中的
@@ -12,6 +12,18 @@ ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.10：净收益
 
     这意味着回测用的止盈止损/超时规则和你线上 signals_history 表完全一致，
     两者理论上可以合并统计（本脚本提供 --merge-live 选项做这件事）。
+
+v2.11改动（本轮，排行榜差值限制到共同日期窗口）：
+    leaderboard(--baseline)的差值此前在两边signal_date的"并集"上计算：当实验的覆盖
+    范围比基线长或短（旧实验没带--end而多出2026年6-8月的数据；右删失使不同实验的
+    最后几个信号日不同），多出来的那段表现会混进差值，把"窗口差异"误读成"参数差异"。
+    现在只在两边都覆盖的signal_date窗口[max(起), min(止)]内比较（Top3与全量两个池子
+    用同一个窗口）；窗口被缩短的行在行尾标出窗口，CSV新增delta_window_from/
+    delta_window_to/delta_window_trimmed/top3_delta_n/top3_delta_base_n/
+    all_delta_n/all_delta_base_n列。只影响--baseline的差值列；各实验自己的
+    n/净均值/CI/⚠️标记不变。
+    已知未处理：右删失（信号离数据末尾不足超时天数、又未触发止盈止损时被排除）会让
+    末尾约20个信号日的样本偏少且偏差，各实验程度不同，窗口限制不消除它。
 
 v2.10改动（本轮，排行榜改版——让参数实验的比较不再被胜率排序误导）：
     StatsReporter.leaderboard()重写，原来按Top3胜率排序的版本被取代：
@@ -3030,7 +3042,8 @@ class StatsReporter:
 
         每个实验输出Top3与全量候选两个池子（全量候选是Top3的超集、样本更大，
         用来做稳定性检查：两个池子排名分歧大时，榜首结论要打折扣）。
-        baseline：基线参数集名，给出每个实验相对基线的净均值差+90% CI。
+        baseline：基线参数集名，给出每个实验相对基线的净均值差+90% CI。v2.11起差值只在
+        两边都覆盖的signal_date窗口内计算（见差值计算处的说明）。
         export_csv：导出完整精度的排行榜CSV（同时推送Telegram），供直接读表。
         """
         buffer: list[str] = []
@@ -3107,20 +3120,37 @@ class StatsReporter:
             for k, v in st_all.items():
                 row["all_" + k] = v
             if baseline is not None and ps != baseline:
+                # v2.11：差值只在两边都覆盖的signal_date窗口内计算。否则当实验的覆盖
+                # 范围比基线长/短（旧实验没带--end、多出2026年6-8月数据；或右删失使
+                # 末尾几天不同），多出来的那段表现会直接混进差值，变成"窗口差异"
+                # 而不是"参数差异"。日期是ISO字符串，字典序即时间序。
+                nan = float("nan")
+                base_all = pools[baseline]["all"]
+                win_from = max(str(base_all["signal_date"].min()), d_from)
+                win_to = min(str(base_all["signal_date"].max()), d_to)
+                trimmed = False
                 for name in ("top3", "all"):
-                    a = pools[baseline][name]
-                    b = p[name]
+                    a_full = pools[baseline][name]
+                    b_full = p[name]
+                    a = a_full[(a_full["signal_date"] >= win_from) & (a_full["signal_date"] <= win_to)]
+                    b = b_full[(b_full["signal_date"] >= win_from) & (b_full["signal_date"] <= win_to)]
+                    if name == "all":
+                        trimmed = (len(a) < len(a_full)) or (len(b) < len(b_full))
                     res = cluster_bootstrap_diff_ci(
                         a["net"].to_numpy(), a["signal_date"].to_numpy(),
                         b["net"].to_numpy(), b["signal_date"].to_numpy())
-                    nan = float("nan")
                     row[name + "_delta"] = res[0] if res else nan
                     row[name + "_delta_lo"] = res[1] if res else nan
                     row[name + "_delta_hi"] = res[2] if res else nan
+                    row[name + "_delta_n"] = int(len(b))
+                    row[name + "_delta_base_n"] = int(len(a))
                     keys_a = set(zip(a["ticker"], a["signal_date"]))
                     keys_b = list(zip(b["ticker"], b["signal_date"]))
                     row[name + "_overlap"] = (sum(1 for k in keys_b if k in keys_a) / len(keys_b)
                                               if keys_b else nan)
+                row["delta_window_from"] = win_from if win_from <= win_to else ""
+                row["delta_window_to"] = win_to if win_from <= win_to else ""
+                row["delta_window_trimmed"] = bool(trimmed)
             rows.append(row)
 
         def sort_key(r: dict):
@@ -3178,7 +3208,9 @@ class StatsReporter:
                       f"{delta_mark(r['all_delta_lo'], r['all_delta_hi'])}")
                 ov = (f"信号重合 Top3 {sg(r['top3_overlap'], '.0%', '')}"
                       f" 全量 {sg(r['all_overlap'], '.0%', '')}")
-                emit(f"   Δ基线 {d3} | {da} | {ov}")
+                win_note = (f" | 窗口{r['delta_window_from']}~{r['delta_window_to']}"
+                            if r.get("delta_window_trimmed") else "")
+                emit(f"   Δ基线 {d3} | {da} | {ov}{win_note}")
 
         emit("=" * 70)
         emit(f"共{len(rows)}个参数集。已测试的参数集越多，榜首越可能只是运气（多重比较）；"
@@ -3187,7 +3219,7 @@ class StatsReporter:
              "入选未处理，仍偏乐观；n<30的池子仅供参考")
         emit(f"⚠️含holdout=该实验覆盖到signal_date>={HOLDOUT_START_DATE}，不应再作为调参依据")
         if baseline is not None:
-            emit("Δ=实验减基线的净均值差（按日期整日重抽样的均值之差，只改出场与改选股的实验都适用）；"
+            emit("Δ=实验减基线的净均值差（按日期整日重抽样的均值之差，只改出场与改选股的实验都适用；只比较两边都覆盖的signal_date窗口，窗口被缩短的行尾部标出）；"
                  "✅=CI全为正 ❌=CI全为负 ≈=CI含0；信号重合=该实验的信号有多大比例也出现在基线里"
                  "（接近100%=只改了出场，明显更低=改变了选股）")
         else:
