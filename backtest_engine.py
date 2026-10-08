@@ -2,7 +2,7 @@
 """
 backtest_engine.py
 ====================
-ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.11：净收益报告 + 排行榜改版 + 差值限制到共同窗口）
+ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.12：净收益报告 + 排行榜改版 + 导出原始指标）
 
 核心设计:
     本脚本不重新实现打分逻辑，而是直接 `import screener`，复用其中的
@@ -12,6 +12,25 @@ ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.11：净收益
 
     这意味着回测用的止盈止损/超时规则和你线上 signals_history 表完全一致，
     两者理论上可以合并统计（本脚本提供 --merge-live 选项做这件事）。
+
+v2.12改动（本轮，回测导出新增原始指标列——为离线因子/门槛诊断提供数据）：
+    背景：此前导出只有归一化后的7个子分数，原始指标（量比、RSI、±DI、均线溢价、
+    ATR%等）和筛选门槛用到的中间量（15日振幅、量能质量比值）都没有保存，导致
+    "T2为什么表现差""哪个门槛有区分力"这类问题没法用已有数据回答。
+    本版给signals_history_backtest新增31个x_开头的列（只对Top10候选行写入）：
+      - 原始技术指标：量比、收盘位、RSI、+DI/-DI、ATR%、当日涨跌、6个月最大回撤、
+        VWAP斜率/溢价、MA20/MA50溢价、MA50/MA200溢价、MA50 10日变化、高点抬升比、
+        距52周高点比
+      - 筛选门槛中间量：15日振幅、20日平均成交额、量能质量比值与是否通过、
+        hh_hl/ma_aligned/ma50_up/vwap_up四个布尔
+      - 当日市场环境：ASX200的20日涨幅、偏离50日均线、当日涨跌；当日通过任一层级
+        筛选的股票总数及T1-T4各层数量（信号供给度量，在Top10截断之前统计）
+    实现方式：纯新增。已有数据库用ALTER TABLE按需加列（旧行为NULL，旧实验数据和
+    排行榜完全不受影响；REQUIRED_COLUMNS未改，不会触发旧表改名备份）。新列的值是在
+    导出时用与screener.py相同的公式重算的副本，只用于分析，不参与任何选股/打分/
+    出场判断；新增列只读point-in-time切片，不引入未来信息。
+    验收方式：同一份参数用新的--param-set-name重跑后，Top3的笔数/净均值必须与
+    旧实验逐笔一致（本版不改变任何选股和出场结果）。
 
 v2.11改动（本轮，排行榜差值限制到共同日期窗口）：
     leaderboard(--baseline)的差值此前在两边signal_date的"并集"上计算：当实验的覆盖
@@ -1136,6 +1155,15 @@ class SignalGenerator:
             return [], [], error_count, attempted_count
 
         raw_signals = list(seen.values())
+        # v2.12新增：当日通过任一层级筛选的股票总数及各层数量，在Top10截断之前统计，
+        # 随候选一起导出（信号供给/市场环境的度量）。只往tech字典里加两个键，
+        # 不改变任何筛选、打分、排序逻辑。
+        _tier_counts_today: dict = {}
+        for _s in seen.values():
+            _tier_counts_today[_s["tier_level"]] = _tier_counts_today.get(_s["tier_level"], 0) + 1
+        for _s in seen.values():
+            _s["n_passers_today"] = len(seen)
+            _s["n_by_tier"] = dict(_tier_counts_today)
         for s in raw_signals:
             s["composite_score"] = screener.calc_composite_score(s)
         raw_signals.sort(key=lambda x: x["composite_score"], reverse=True)
@@ -2008,6 +2036,27 @@ CREATE TABLE IF NOT EXISTS shares_outstanding_cache (
 """
 
 
+# v2.12新增：导出到signals_history_backtest的原始指标列（名称, SQL类型）。
+# 全部以x_开头，只对Top10候选行写入；旧数据库用ALTER TABLE按需加列，旧行为NULL。
+# 顺序必须与BacktestEngine._export_extras()返回的元组顺序一致。
+EXTRA_EXPORT_COLUMNS = [
+    ("x_vol_ratio", "REAL"), ("x_close_pos_pct", "REAL"), ("x_rsi14", "REAL"),
+    ("x_plus_di", "REAL"), ("x_minus_di", "REAL"), ("x_atr14_pct", "REAL"),
+    ("x_change_pct", "REAL"), ("x_max_dd_6m_pct", "REAL"),
+    ("x_vwap_slope", "REAL"), ("x_vwap_premium_pct", "REAL"),
+    ("x_ma_premium_pct", "REAL"), ("x_ma50_vs_ma200_pct", "REAL"),
+    ("x_ma50_chg10_pct", "REAL"), ("x_hh_ratio_pct", "REAL"),
+    ("x_dist_ratio", "REAL"), ("x_consol_range15_pct", "REAL"),
+    ("x_dollar_vol20", "REAL"), ("x_vq_ratio", "REAL"), ("x_vq_pass", "INTEGER"),
+    ("x_hh_hl", "INTEGER"), ("x_ma_aligned", "INTEGER"),
+    ("x_ma50_up", "INTEGER"), ("x_vwap_up", "INTEGER"),
+    ("x_xjo_ret20_pct", "REAL"), ("x_xjo_dev_ma50_pct", "REAL"), ("x_xjo_chg1d_pct", "REAL"),
+    ("x_n_passers", "INTEGER"), ("x_n_t1", "INTEGER"), ("x_n_t2", "INTEGER"),
+    ("x_n_t3", "INTEGER"), ("x_n_t4", "INTEGER"),
+]
+EXTRA_EXPORT_COLUMN_LIST = ", ".join(c for c, _ in EXTRA_EXPORT_COLUMNS)
+
+
 class BacktestEngine:
     def __init__(self, cfg: BacktestConfig):
         self.cfg = cfg
@@ -2040,6 +2089,15 @@ class BacktestEngine:
         conn.execute(PROGRESS_SCHEMA_SQL)
         conn.execute(HTF_SCHEMA_SQL)
         conn.execute(BREAKOUT_MEMORY_SCHEMA_SQL)
+        # v2.12：为导出新增的原始指标列做"按需加列"迁移。SQLite的ADD COLUMN只改元数据，
+        # 不重写数据；已有行的新列为NULL，旧实验数据与排行榜不受影响。
+        # 注意：这些列故意不放进REQUIRED_COLUMNS——放进去会让旧表被当成"过期schema"
+        # 整体改名备份，旧实验结果就从排行榜里消失了。
+        existing_now = {row[1] for row in conn.execute(
+            "PRAGMA table_info(signals_history_backtest)").fetchall()}
+        for col_name, col_type in EXTRA_EXPORT_COLUMNS:
+            if col_name not in existing_now:
+                conn.execute(f"ALTER TABLE signals_history_backtest ADD COLUMN {col_name} {col_type}")
         conn.commit()
 
     def _run_key(self) -> str:
@@ -2078,6 +2136,119 @@ class BacktestEngine:
         df = self.data_layer.fetch_60m_cached_only(ticker)
         self._hourly_cache[ticker] = df
         return df
+
+    @staticmethod
+    def _xjo_features(xjo_series, day) -> dict:
+        """v2.12新增：当日ASX200环境指标（point-in-time，只用<=day的数据），单位%。"""
+        feats = {"ret20": None, "dev": None, "chg1d": None}
+        try:
+            if xjo_series is None:
+                return feats
+            xs = xjo_series[xjo_series.index <= day]
+            if len(xs) >= 51:
+                last = float(xs.iloc[-1])
+                feats["ret20"] = (last / float(xs.iloc[-21]) - 1) * 100
+                feats["dev"] = (last / float(xs.iloc[-50:].mean()) - 1) * 100
+                feats["chg1d"] = (last / float(xs.iloc[-2]) - 1) * 100
+        except Exception:
+            pass
+        return feats
+
+    def _export_extras(self, s: dict, xjo_feats: dict) -> tuple:
+        """
+        v2.12新增：为一条Top10候选计算要导出的原始指标，返回与EXTRA_EXPORT_COLUMNS
+        同序的元组。每一项独立try/except，失败记None，绝不影响主流程。
+
+        这些值是用与screener.py相同的公式在导出时重算的副本，只用于离线分析：
+        s里的序列(_close/_high/_low/_volume)是scan_day()里已经做过point-in-time
+        切片的数据，没有未来信息。公式来源：
+          - 量比/收盘位/RSI/DI/ATR%/涨跌/回撤/VWAP斜率：build_tech_summary()的原始输出
+          - 各类溢价/比值：calc_trend_strength_score()内部的中间量
+          - 15日振幅/20日成交额：_passes_tier()里的consol与流动性门槛
+          - 量能质量比值：_check_volume_quality()的第一步(近10日均量/前10日均量)
+        """
+        out: dict = {}
+
+        def put(key: str, fn) -> None:
+            try:
+                v = fn()
+                if v is None:
+                    out[key] = None
+                elif isinstance(v, (bool, np.bool_)):
+                    out[key] = int(v)
+                elif isinstance(v, (int, np.integer)):
+                    out[key] = int(v)
+                else:
+                    v = float(v)
+                    out[key] = None if v != v else v
+            except Exception:
+                out[key] = None
+
+        lc = s.get("price")
+        close_s, high_s, low_s, vol_s = s.get("_close"), s.get("_high"), s.get("_low"), s.get("_volume")
+
+        put("x_vol_ratio", lambda: s["vol_ratio"])
+        put("x_close_pos_pct", lambda: s["close_pos_pct"])
+        put("x_rsi14", lambda: s["rsi14"])
+        put("x_plus_di", lambda: s["plus_di"])
+        put("x_minus_di", lambda: s["minus_di"])
+        put("x_atr14_pct", lambda: s["atr14_pct"])
+        put("x_change_pct", lambda: s["change_pct"])
+        put("x_max_dd_6m_pct", lambda: s["max_dd_6m_pct"])
+        put("x_vwap_slope", lambda: s["vwap_slope"])
+        put("x_vwap_premium_pct", lambda: (lc / s["vwap20"] - 1) * 100 if s["vwap20"] > 0 else None)
+        put("x_ma_premium_pct", lambda: (s["ma20"] / s["ma50"] - 1) * 100 if s["ma50"] > 0 else None)
+        put("x_ma50_vs_ma200_pct",
+            lambda: (s["ma50"] / s["ma200"] - 1) * 100 if s.get("ma200") else None)
+
+        def _ma50_chg10():
+            if len(close_s) < 61:
+                return None
+            roll = close_s.rolling(50).mean()
+            prev = float(roll.iloc[-11])
+            return (float(roll.iloc[-1]) / prev - 1) * 100 if prev > 0 else None
+        put("x_ma50_chg10_pct", _ma50_chg10)
+
+        def _hh_ratio():
+            if len(high_s) < 40:
+                return None
+            prior_hi = float(high_s.iloc[-40:-20].max())
+            return (float(high_s.iloc[-20:].max()) / prior_hi - 1) * 100 if prior_hi > 0 else None
+        put("x_hh_ratio_pct", _hh_ratio)
+
+        put("x_dist_ratio", lambda: lc / s["w52_hi"] if s["w52_hi"] > 0 else None)
+
+        def _consol():
+            r15 = pd.concat([high_s, low_s], axis=1).iloc[-15:]
+            return (float(r15.iloc[:, 0].max()) - float(r15.iloc[:, 1].min())) / lc * 100
+        put("x_consol_range15_pct", _consol)
+
+        put("x_dollar_vol20", lambda: float(vol_s.iloc[-20:].mean()) * lc)
+
+        def _vq_ratio():
+            if len(vol_s) < 20:
+                return None
+            prior = float(vol_s.iloc[-20:-10].mean())
+            return float(vol_s.iloc[-10:].mean()) / prior if prior > 0 else None
+        put("x_vq_ratio", _vq_ratio)
+        put("x_vq_pass", lambda: screener._check_volume_quality(vol_s))
+        put("x_hh_hl", lambda: s.get("hh_hl"))
+        put("x_ma_aligned", lambda: s.get("ma_aligned"))
+        put("x_ma50_up", lambda: s["ma50_up"])
+        put("x_vwap_up", lambda: s["vwap_up"])
+
+        put("x_xjo_ret20_pct", lambda: xjo_feats.get("ret20"))
+        put("x_xjo_dev_ma50_pct", lambda: xjo_feats.get("dev"))
+        put("x_xjo_chg1d_pct", lambda: xjo_feats.get("chg1d"))
+
+        by_tier = s.get("n_by_tier") or {}
+        put("x_n_passers", lambda: s.get("n_passers_today"))
+        put("x_n_t1", lambda: by_tier.get("T1", 0) if by_tier else None)
+        put("x_n_t2", lambda: by_tier.get("T2", 0) if by_tier else None)
+        put("x_n_t3", lambda: by_tier.get("T3", 0) if by_tier else None)
+        put("x_n_t4", lambda: by_tier.get("T4", 0) if by_tier else None)
+
+        return tuple(out.get(col) for col, _ in EXTRA_EXPORT_COLUMNS)
 
     def run(self, tickers: list[str], max_minutes: Optional[float] = None):
         """
@@ -2320,6 +2491,7 @@ class BacktestEngine:
             selected_tickers = {s["ticker"] for s in selected}
             health_by_ticker: dict[str, dict] = {}  # 供下面htf检测复用，避免重复计算
             rows = []
+            xjo_feats = self._xjo_features(xjo_series, day)  # v2.12：当日ASX200环境，导出用
             for s in raw_top10:
                 ticker = s["ticker"]
                 entry_price = float(s["price"])
@@ -2362,6 +2534,7 @@ class BacktestEngine:
                 sub_hh_hl = sub_scores.get("hh_hl_structure")
                 sub_rs = sub_scores.get("relative_strength")
                 sub_vwap = sub_scores.get("vwap_position")
+                extras = self._export_extras(s, xjo_feats)  # v2.12：新增原始指标，纯导出用
 
                 if outcome_result is None:
                     # 右侧数据不足，无法评估结果，仍然把信号本身记下来（outcome=PENDING），
@@ -2400,7 +2573,7 @@ class BacktestEngine:
                         sub_ma50_trend, sub_hh_hl, sub_rs, sub_vwap,
                         self.cfg.param_set, run_ts,
                     )
-                rows.append(row)
+                rows.append(row + extras)
 
             if rows:
                 conn.executemany(f"""
@@ -2415,8 +2588,8 @@ class BacktestEngine:
                         trend_strength_score, trend_sub_volume_multiple, trend_sub_near_52w_hi,
                         trend_sub_ma_alignment, trend_sub_ma50_trend, trend_sub_hh_hl_structure,
                         trend_sub_relative_strength, trend_sub_vwap_position,
-                        param_set, run_timestamp
-                    ) VALUES ({",".join(["?"] * 38)})
+                        param_set, run_timestamp, {EXTRA_EXPORT_COLUMN_LIST}
+                    ) VALUES ({",".join(["?"] * (38 + len(EXTRA_EXPORT_COLUMNS)))})
                 """, rows)
                 total_written += len(rows)
                 total_selected += len(selected)
