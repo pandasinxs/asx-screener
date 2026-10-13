@@ -2,7 +2,7 @@
 """
 backtest_engine.py
 ====================
-ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.12：净收益报告 + 排行榜改版 + 导出原始指标）
+ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.13：净收益报告 + 排行榜 + 导出原始指标 + 分档滑点与R倍数）
 
 核心设计:
     本脚本不重新实现打分逻辑，而是直接 `import screener`，复用其中的
@@ -12,6 +12,23 @@ ASX Screener 系统 —— EOD选股逻辑历史回测引擎（v2.12：净收益
 
     这意味着回测用的止盈止损/超时规则和你线上 signals_history 表完全一致，
     两者理论上可以合并统计（本脚本提供 --merge-live 选项做这件事）。
+
+v2.13改动（本轮，修正比较"尺子"：按流动性分档滑点 + 波动中性R倍数）：
+    背景：用v2.12导出的原始指标分析发现，统一的5bps滑点和纯百分比收益会系统性地
+    偏向"高波动、低流动"的股票——(1)各层级T1-T4的百分比收益差异主要来自ATR%不同，
+    换成R倍数(净收益%÷初始止损距离%)后基本消失；(2)回测"优势"集中在20日成交额
+    最低的三分之一(统一5bps下净+1.80%)，最高的三分之一几乎为0(+0.01%)，而流动性
+    差的股票真实滑点更大。不修这把尺子，任何让组合偏向小盘/高波动的参数改动在回测里
+    都会虚高。
+      - 单边滑点按20日平均成交额(x_dollar_vol20)分档，默认 >=300万:5bps、
+        100-300万:15bps、30-100万:30bps、<30万:60bps。【档位数值是假设，没有用真实
+        成交数据校准】可用--slippage-tiers修改，传none则不分档
+      - 没有x_dollar_vol20的老实验行(v2.12之前)退回统一滑点；排行榜在每个实验标题上
+        标[成本:分档]/[成本:统一]/[成本:部分分档]，标记不同的实验之间净均值不可直接比较
+      - 净收益报告：新增分档滑点净均值/CI/PF，以及波动中性R倍数(均值+CI+平均止损距离)
+      - 排行榜：Top3/全量两个池子各增加R均值+CI；--baseline时增加ΔR行(配对差值)
+      - 排序仍按Top3净均值；R只展示，用来识别"净收益提高只是因为波动更大"
+    只改报告/排行榜的计算与展示，不改任何选股、打分、出场逻辑，数据库结构不变。
 
 v2.12改动（本轮，回测导出新增原始指标列——为离线因子/门槛诊断提供数据）：
     背景：此前导出只有归一化后的7个子分数，原始指标（量比、RSI、±DI、均线溢价、
@@ -627,6 +644,10 @@ class BacktestConfig:
     # 口径：佣金=max(commission_pct×成交额, commission_min_aud)，买卖各收一次；
     # slippage_bps是「单边」滑点（买入价上浮、卖出价下压各bps个基点），往返=2倍。
     net_cost_notional_aud: float = 8000.0
+    # v2.13：单边滑点按20日平均成交额分档，元素是(最低成交额澳元, 单边bps)，成交额>=最低
+    # 成交额的最高一档生效。【数值是假设，没有用真实成交数据校准】。没有成交额数据的行
+    # (v2.12之前的实验)退回上面的slippage_bps统一值。
+    slippage_tiers: tuple = ((3_000_000.0, 5.0), (1_000_000.0, 15.0), (300_000.0, 30.0), (0.0, 60.0))
 
     # 稳定性：连续多少个交易日算信号失败就熔断停止（避免系统性bug时空跑一整晚）
     max_consecutive_errors: int = 5
@@ -3036,6 +3057,34 @@ def compute_trade_costs(gross_pct, notional: float, comm_rate: float,
     return (fee_in + fee_out + slip) / notional * 100.0
 
 
+def tiered_slippage_bps(adv, flat_bps: float, tiers) -> np.ndarray:
+    """
+    v2.13新增：逐行单边滑点(bps)，按20日平均成交额(澳元)分档。tiers是
+    ((最低成交额, bps), ...)：成交额>=最低成交额的"最高一档"生效。adv为NaN
+    （v2.12之前的实验没有这一列）的行退回统一的flat_bps。
+    档位数值是假设，没有用真实成交数据校准。
+    """
+    arr = np.asarray(adv, dtype=float)
+    out = np.full(arr.shape, float(flat_bps))
+    done = np.zeros(arr.shape, dtype=bool)
+    for min_adv, bps in sorted(tiers, key=lambda t: -float(t[0])):
+        hit = (~np.isnan(arr)) & (~done) & (arr >= float(min_adv))
+        out[hit] = float(bps)
+        done |= hit
+    return out
+
+
+def parse_slippage_tiers(text: str) -> tuple:
+    """v2.13新增：解析--slippage-tiers，格式"最低成交额:bps,最低成交额:bps"；none=不分档。"""
+    t = (text or "").strip().lower()
+    if t in ("", "none"):
+        return ()
+    try:
+        return tuple((float(a), float(b)) for a, b in (p.split(":") for p in t.split(",")))
+    except Exception:
+        raise SystemExit(f"--slippage-tiers格式不对: {text!r}，应形如 3000000:5,1000000:15,300000:30,0:60 或 none")
+
+
 def cluster_bootstrap_mean_ci(values, cluster_keys, n_iter: int = 2000,
                               seed: int = 42, lo: float = 5.0, hi: float = 95.0):
     """
@@ -3106,7 +3155,8 @@ def summarize_pool_for_leaderboard(sub: pd.DataFrame) -> dict:
     nan = float("nan")
     out = {"n": int(len(sub)), "gross_mean": nan, "net_mean": nan, "ci_lo": nan,
            "ci_hi": nan, "net_pf": nan, "win_rate": nan, "loss_share": nan,
-           "timeout_share": nan, "avg_hold": nan}
+           "timeout_share": nan, "avg_hold": nan, "r_mean": nan, "r_ci_lo": nan,
+           "r_ci_hi": nan, "adv_cover": nan}
     if len(sub) == 0:
         return out
     net = sub["net"].to_numpy(dtype=float)
@@ -3123,6 +3173,17 @@ def summarize_pool_for_leaderboard(sub: pd.DataFrame) -> dict:
     ci = cluster_bootstrap_mean_ci(net, sub["signal_date"].astype(str).to_numpy())
     if ci is not None:
         out["ci_lo"], out["ci_hi"] = ci
+    # v2.13：波动中性R倍数(净收益%/初始止损距离%)与"成本是否按流动性分档"的覆盖率
+    if "R" in sub.columns:
+        rv = sub[["signal_date", "R"]].dropna()
+        if len(rv) > 0:
+            out["r_mean"] = float(rv["R"].mean())
+            ci_r = cluster_bootstrap_mean_ci(rv["R"].to_numpy(dtype=float),
+                                             rv["signal_date"].astype(str).to_numpy())
+            if ci_r is not None:
+                out["r_ci_lo"], out["r_ci_hi"] = ci_r
+    if "cost_tiered" in sub.columns:
+        out["adv_cover"] = float(sub["cost_tiered"].mean())
     return out
 
 
@@ -3241,9 +3302,11 @@ class StatsReporter:
         conn = sqlite3.connect(self.cfg.db_path)
         conn.execute(EXPERIMENT_METADATA_SCHEMA_SQL)  # 确保表存在，旧db也不会查询报错
         try:
+            cols_have = {r_[1] for r_ in conn.execute("PRAGMA table_info(signals_history_backtest)").fetchall()}
+            extra_sel = ", entry_price, stop_loss_atr" + (", x_dollar_vol20" if "x_dollar_vol20" in cols_have else "")
             raw = pd.read_sql_query(
                 "SELECT param_set, ticker, signal_date, is_selected, outcome, "
-                "outcome_pct, holding_days FROM signals_history_backtest "
+                "outcome_pct, holding_days" + extra_sel + " FROM signals_history_backtest "
                 "WHERE outcome != 'PENDING' AND outcome_pct IS NOT NULL", conn)
             meta = pd.read_sql_query("SELECT param_set, git_commit FROM experiment_metadata", conn)
         except Exception as e:
@@ -3264,7 +3327,15 @@ class StatsReporter:
         slip = float(self.cfg.slippage_bps)
 
         raw["gross"] = raw["outcome_pct"].astype(float)
-        raw["net"] = raw["gross"] - compute_trade_costs(raw["gross"].to_numpy(), notional, rate, fee_min, slip)
+        # v2.13：单边滑点按20日成交额分档（没有成交额数据的老实验行退回统一slip）；
+        # 同时算波动中性R = 净收益% / 初始止损距离%。
+        adv_col = (pd.to_numeric(raw["x_dollar_vol20"], errors="coerce").to_numpy()
+                   if "x_dollar_vol20" in raw.columns else np.full(len(raw), np.nan))
+        raw["cost_tiered"] = ~np.isnan(adv_col)
+        slip_arr = tiered_slippage_bps(adv_col, slip, self.cfg.slippage_tiers)
+        raw["net"] = raw["gross"] - compute_trade_costs(raw["gross"].to_numpy(), notional, rate, fee_min, slip_arr)
+        stop_dist = ((raw["entry_price"] - raw["stop_loss_atr"]) / raw["entry_price"] * 100).astype(float)
+        raw["R"] = np.where(stop_dist > 0, raw["net"] / stop_dist.replace(0, np.nan), np.nan)
         raw["signal_date"] = raw["signal_date"].astype(str)
         commit_map = dict(zip(meta["param_set"], meta["git_commit"]))
 
@@ -3317,6 +3388,13 @@ class StatsReporter:
                     row[name + "_delta_hi"] = res[2] if res else nan
                     row[name + "_delta_n"] = int(len(b))
                     row[name + "_delta_base_n"] = int(len(a))
+                    ar_, br_ = a.dropna(subset=["R"]), b.dropna(subset=["R"])
+                    res_r = cluster_bootstrap_diff_ci(
+                        ar_["R"].to_numpy(), ar_["signal_date"].to_numpy(),
+                        br_["R"].to_numpy(), br_["signal_date"].to_numpy())
+                    row[name + "_delta_r"] = res_r[0] if res_r else nan
+                    row[name + "_delta_r_lo"] = res_r[1] if res_r else nan
+                    row[name + "_delta_r_hi"] = res_r[2] if res_r else nan
                     keys_a = set(zip(a["ticker"], a["signal_date"]))
                     keys_b = list(zip(b["ticker"], b["signal_date"]))
                     row[name + "_overlap"] = (sum(1 for k in keys_b if k in keys_a) / len(keys_b)
@@ -3339,7 +3417,9 @@ class StatsReporter:
             warn = "(n<30,仅供参考)" if n < 30 else ""
             return (f"   {label} n{n}{warn} 净{sg(r[p + '_net_mean'])} "
                     f"[{sg(r[p + '_ci_lo'], '+.2f', '')},{sg(r[p + '_ci_hi'], '+.2f', '')}] "
-                    f"PF{sg(r[p + '_net_pf'], '.2f', '')}")
+                    f"PF{sg(r[p + '_net_pf'], '.2f', '')} "
+                    f"R{sg(r[p + '_r_mean'], '+.3f', '')}"
+                    f"[{sg(r[p + '_r_ci_lo'], '+.2f', '')},{sg(r[p + '_r_ci_hi'], '+.2f', '')}]")
 
         def delta_mark(lo: float, hi: float) -> str:
             if np.isnan(lo) or np.isnan(hi):
@@ -3352,8 +3432,12 @@ class StatsReporter:
 
         emit("\n" + "=" * 70)
         emit("参数实验排行榜（v2.10：按Top3净均值排序；净=扣除交易成本后）")
+        tiers_txt = (" / ".join(f"≥{int(m_ / 1000)}k:{b_:g}" for m_, b_ in
+                                sorted(self.cfg.slippage_tiers, key=lambda t: -t[0]))
+                     if self.cfg.slippage_tiers else "无")
         emit(f"成本假设: 每笔固定A${notional:,.0f} | 佣金{rate:.2%}/边(最低A${fee_min:g}) | "
-             f"滑点{slip:g}bps/边")
+             f"滑点：有成交额数据的行按20日成交额分档(每边bps，{tiers_txt}；档位为假设未验证)，"
+             f"其余行统一{slip:g}bps")
         emit("=" * 70)
         for i, r in enumerate(rows, 1):
             flags = ""
@@ -3361,6 +3445,10 @@ class StatsReporter:
                 flags += " ⚠️含holdout"
             if baseline is not None and r["param_set"] == baseline:
                 flags += " (基线)"
+            cov = r.get("all_adv_cover")
+            if cov is not None and not np.isnan(cov):
+                flags += (" [成本:分档]" if cov >= 0.99 else
+                          (" [成本:统一]" if cov <= 0.01 else f" [成本:部分分档{cov:.0%}]"))
             emit(f"{i}. {r['param_set']}  {r['date_from']}~{r['date_to']}{flags}")
             top_win = f" WIN{sg(r['top3_win_rate'], '.0%', '')}" if int(r["top3_n"]) > 0 else ""
             emit(pool_line("Top3", r, "top3") + top_win)
@@ -3384,6 +3472,13 @@ class StatsReporter:
                 win_note = (f" | 窗口{r['delta_window_from']}~{r['delta_window_to']}"
                             if r.get("delta_window_trimmed") else "")
                 emit(f"   Δ基线 {d3} | {da} | {ov}{win_note}")
+                dr3 = (f"Top3 {sg(r['top3_delta_r'], '+.3f', '')} [{sg(r['top3_delta_r_lo'], '+.3f', '')},"
+                       f"{sg(r['top3_delta_r_hi'], '+.3f', '')}]"
+                       f"{delta_mark(r['top3_delta_r_lo'], r['top3_delta_r_hi'])}")
+                dra = (f"全量 {sg(r['all_delta_r'], '+.3f', '')} [{sg(r['all_delta_r_lo'], '+.3f', '')},"
+                       f"{sg(r['all_delta_r_hi'], '+.3f', '')}]"
+                       f"{delta_mark(r['all_delta_r_lo'], r['all_delta_r_hi'])}")
+                emit(f"   ΔR   {dr3} | {dra}")
 
         emit("=" * 70)
         emit(f"共{len(rows)}个参数集。已测试的参数集越多，榜首越可能只是运气（多重比较）；"
@@ -3391,6 +3486,8 @@ class StatsReporter:
         emit("CI=按signal_date聚类bootstrap的90%区间，只处理同日相关，相邻日重叠持仓/同票重复"
              "入选未处理，仍偏乐观；n<30的池子仅供参考")
         emit(f"⚠️含holdout=该实验覆盖到signal_date>={HOLDOUT_START_DATE}，不应再作为调参依据")
+        emit("R=净收益%除以初始止损距离%（波动中性：消除'波动大的股票百分比收益天然更大'的影响）；"
+             "[成本:分档/统一]标明该实验是否用上了按流动性分档的滑点，标记不同的实验之间净均值不可直接比较")
         if baseline is not None:
             emit("Δ=实验减基线的净均值差（按日期整日重抽样的均值之差，只改出场与改选股的实验都适用；只比较两边都覆盖的signal_date窗口，窗口被缩短的行尾部标出）；"
                  "✅=CI全为正 ❌=CI全为负 ≈=CI含0；信号重合=该实验的信号有多大比例也出现在基线里"
@@ -3409,6 +3506,7 @@ class StatsReporter:
                 out_df["commission_pct"] = rate
                 out_df["commission_min_aud"] = fee_min
                 out_df["slippage_bps_per_side"] = slip
+                out_df["slippage_tiers"] = ";".join(f"{m_:g}:{b_:g}" for m_, b_ in self.cfg.slippage_tiers)
                 out_df.to_csv(export_csv, index=False, encoding="utf-8-sig")
                 self.logger.info(f"排行榜CSV已导出: {export_csv}（{len(out_df)}行）")
                 emit(f"\n📄 排行榜CSV已导出: {export_csv}（{len(out_df)}行，完整精度，适合直接读表）")
@@ -3737,6 +3835,39 @@ class StatsReporter:
         elif slope < 0:
             self._emit(f"  盈亏平衡滑点: 每边约{a / -slope:.0f}bps（往返约{2 * a / -slope:.0f}bps，另加佣金）时净平均收益=0")
 
+        # v2.13：按流动性分档滑点（档位为假设、未验证）+ 波动中性R倍数
+        try:
+            adv_all = (pd.to_numeric(combined["x_dollar_vol20"], errors="coerce").to_numpy()
+                       if "x_dollar_vol20" in combined.columns else np.full(len(combined), np.nan))
+            adv = adv_all[keep]
+            cover = float(np.mean(~np.isnan(adv)))
+            net_primary = net
+            if cover > 0:
+                slip_arr = tiered_slippage_bps(adv, slip, cfg.slippage_tiers)
+                net_t = gross - compute_trade_costs(gross, notional, rate, fee_min, slip_arr)
+                ci_t = cluster_bootstrap_mean_ci(net_t, keys)
+                ci_t_txt = f" [{ci_t[0]:+.2f},{ci_t[1]:+.2f}]" if ci_t is not None else ""
+                self._emit(f"  分档滑点(按20日成交额，档位数值为假设未验证): 覆盖{cover:.0%} | "
+                           f"平均每边{float(slip_arr.mean()):.1f}bps | 净均值{net_t.mean():+.3f}%{ci_t_txt} | "
+                           f"净PF{_pf(net_t):.2f}")
+                net_primary = net_t
+            else:
+                self._emit("  分档滑点: 本数据没有成交额列（v2.12之前的实验），不分档")
+            if "entry_price" in combined.columns and "stop_loss_atr" in combined.columns:
+                ep = pd.to_numeric(combined["entry_price"], errors="coerce").to_numpy()[keep]
+                sp_ = pd.to_numeric(combined["stop_loss_atr"], errors="coerce").to_numpy()[keep]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    stop_pct = (ep - sp_) / ep * 100
+                    r_net = np.where(stop_pct > 0, net_primary / stop_pct, np.nan)
+                ok_r = ~np.isnan(r_net)
+                if ok_r.any():
+                    ci_r = cluster_bootstrap_mean_ci(r_net[ok_r], np.asarray(keys)[ok_r])
+                    ci_r_txt = f" [{ci_r[0]:+.3f},{ci_r[1]:+.3f}]" if ci_r is not None else ""
+                    self._emit(f"  波动中性R(净收益÷初始止损距离，1R=止损距离): 均值{np.nanmean(r_net):+.3f}{ci_r_txt}"
+                               f" | 平均止损距离{np.nanmean(stop_pct[ok_r]):.1f}%")
+        except Exception as e:
+            self._emit(f"  ⚠️ 分档滑点/R倍数计算失败（不影响其余统计）: {e}")
+
         self._emit("  → 跨实验比较请看「净均值+CI」和「净PF」；WIN标签胜率会随止盈距离机械变化，"
                    "不适合单独当排序依据")
         self._emit("  → 聚类只处理同日相关，相邻日重叠持仓/同票重复入选未处理，CI仍偏窄；"
@@ -4039,6 +4170,11 @@ def main():
     parser.add_argument("--slippage-bps", type=float, default=None,
                         help="[v2.9] 净收益报告/排行榜的单边滑点假设（基点），默认5，买入和卖出各算一次"
                              "（往返=2倍）。注意--run-queue路径不读这个flag，队列里的实验用默认值")
+    parser.add_argument("--slippage-tiers", default=None,
+                        help="[v2.13] 按20日平均成交额分档的单边滑点，格式 最低成交额:bps 逗号分隔，如 "
+                             "3000000:5,1000000:15,300000:30,0:60（默认即此值，数值为假设未验证）；"
+                             "传none表示不分档、全部用--slippage-bps的统一值。只影响带x_dollar_vol20列的行"
+                             "（v2.12及之后的实验）")
     args = parser.parse_args()
 
     cfg = BacktestConfig(
@@ -4055,6 +4191,8 @@ def main():
         cfg.net_cost_notional_aud = args.notional
     if args.slippage_bps is not None:
         cfg.slippage_bps = args.slippage_bps
+    if args.slippage_tiers is not None:
+        cfg.slippage_tiers = parse_slippage_tiers(args.slippage_tiers)
 
     # v2.5备注：这个校验原本是为了防止"--start早于60分钟线可用窗口"时
     # 现场触发一次注定失败的网络请求。现在DataLayer.fetch_60m_cached_only()
